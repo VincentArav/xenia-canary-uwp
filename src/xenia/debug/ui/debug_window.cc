@@ -477,10 +477,12 @@ void DebugWindow::DrawGuestFunctionSource() {
   //     click code address to jump to code
   //     click memory address to jump to memory browser
   //     if historical data for memory/etc present, show combo boxes
-  auto memory = emulator_->memory();
   auto function = static_cast<cpu::GuestFunction*>(state_.function);
   auto& source_map = function->source_map();
   uint32_t source_map_index = 0;
+  const cpu::ppc::GuestCodeReader* guest_code_reader =
+      processor_->frontend()->guest_code_reader(
+          function->translation_domain_key());
 
   bool draw_hir = false;
   bool draw_hir_opt = false;
@@ -539,11 +541,15 @@ void DebugWindow::DrawGuestFunctionSource() {
     ImGui::Text(" %c ", is_current_instr ? '>' : ' ');
     ImGui::SameLine();
 
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
-    cpu::ppc::DisasmPPC(address, code, &str);
-    ImGui::Text("%.8X %.8X   %s", address, code, str.buffer());
-    str.Reset();
+    uint32_t code;
+    if (guest_code_reader &&
+        guest_code_reader->TryReadInstruction(address, &code)) {
+      cpu::ppc::DisasmPPC(address, code, &str);
+      ImGui::Text("%.8X %.8X   %s", address, code, str.buffer());
+      str.Reset();
+    } else {
+      ImGui::Text("%.8X --------   <instruction fetch failed>", address);
+    }
 
     if (is_current_instr) {
       ImGui::PopStyleColor();

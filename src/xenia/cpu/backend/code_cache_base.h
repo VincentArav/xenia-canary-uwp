@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -115,13 +116,69 @@ class CodeCacheBase : public CodeCache {
     indirection_default_value_ = default_value;
   }
 
-  void AddIndirection(uint32_t guest_address, uint32_t host_address) {
-    if (!indirection_table_base_) {
-      return;
+  // Whether AddIndirection would accept the target. Checked before generated
+  // code is attached to its function.
+  bool CanPublishIndirection(TranslationDomainKey translation_domain_key,
+                             uint32_t guest_address) const {
+    return GetGuestCallDispatchMode(translation_domain_key) !=
+               GuestCallDispatchMode::kDirectLinkAndGlobalIndirection ||
+           IsValidIndirectionAddress(guest_address);
+  }
+
+  // Publishes the finished host code of a guest address.
+  bool AddIndirection(TranslationDomainKey translation_domain_key,
+                      uint32_t guest_address, uint32_t host_address) {
+    if (!CanPublishIndirection(translation_domain_key, guest_address)) {
+      return false;
     }
+    if (GetGuestCallDispatchMode(translation_domain_key) ==
+        GuestCallDispatchMode::kResolverOnly) {
+      // Resolver-only domains have no entry in the global address-only table.
+      return true;
+    }
+    if (!indirection_table_base_) {
+      return true;
+    }
+    auto global_lock = global_critical_region_.Acquire();
     uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
         indirection_table_base_ + (guest_address - kIndirectionTableBase));
-    *indirection_slot = host_address;
+    std::atomic_ref<uint32_t>(*indirection_slot)
+        .store(host_address, std::memory_order_release);
+    return true;
+  }
+
+  bool ResetGuestIndirections(
+      TranslationDomainKey translation_domain_key,
+      std::span<const uint32_t> guest_addresses) override {
+    if (GetGuestCallDispatchMode(translation_domain_key) !=
+        GuestCallDispatchMode::kDirectLinkAndGlobalIndirection) {
+      return false;
+    }
+    if (guest_addresses.empty()) {
+      return true;
+    }
+    // Validate every address before changing any slot.
+    for (uint32_t guest_address : guest_addresses) {
+      if (!IsValidIndirectionAddress(guest_address)) {
+        return false;
+      }
+    }
+
+    if (!indirection_table_base_) {
+      // Without an indirection table there is nothing to reset.
+      return true;
+    }
+
+    auto global_lock = global_critical_region_.Acquire();
+
+    for (uint32_t guest_address : guest_addresses) {
+      auto* indirection_slot = reinterpret_cast<uint32_t*>(
+          indirection_table_base_ +
+          (guest_address - uint32_t(kIndirectionTableBase)));
+      std::atomic_ref<uint32_t>(*indirection_slot)
+          .store(indirection_default_value_, std::memory_order_release);
+    }
+    return true;
   }
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) {
@@ -175,6 +232,12 @@ class CodeCacheBase : public CodeCache {
           generated_code_write_base_ + generated_code_offset_;
 
       size_t high_mark = generated_code_offset_;
+      if (high_mark > kGeneratedCodeSize) {
+        // Retired translations are never reclaimed.
+        xe::FatalError(fmt::format(
+            "The {} MiB JIT code cache is full ({} functions placed)",
+            (kGeneratedCodeSize + 1) >> 20, generated_code_map_.size()));
+      }
 
       generated_code_map_.emplace_back(
           (uint64_t(code_execute_address - generated_code_execute_base_)
@@ -209,14 +272,6 @@ class CodeCacheBase : public CodeCache {
     // Post-placement hook (e.g. VTune notification).
     self().OnCodePlaced(guest_address, function_info, code_execute_address,
                         func_info.code_size.total);
-
-    // Fix up indirection table.
-    if (guest_address && indirection_table_base_) {
-      uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
-          indirection_table_base_ + (guest_address - kIndirectionTableBase));
-      *indirection_slot =
-          uint32_t(reinterpret_cast<uint64_t>(code_execute_address));
-    }
   }
 
   uint32_t PlaceData(const void* data, size_t length) {
@@ -234,6 +289,7 @@ class CodeCacheBase : public CodeCache {
   }
 
   GuestFunction* LookupFunction(uint64_t host_pc) override {
+    auto global_lock = global_critical_region_.Acquire();
     if (generated_code_map_.empty()) {
       return nullptr;
     }
@@ -269,7 +325,9 @@ class CodeCacheBase : public CodeCache {
   }
 
  protected:
-  static constexpr size_t kIndirectionTableSize = 0x1FFFFFFF;
+  // One 32-bit slot for every aligned guest address in
+  // [0x80000000, 0xA0000000).
+  static constexpr size_t kIndirectionTableSize = 0x20000000;
   static constexpr uintptr_t kIndirectionTableBase = 0x80000000;
   static constexpr size_t kGeneratedCodeSize = 0x0FFFFFFF;
   static constexpr uintptr_t kGeneratedCodeExecuteBase = 0xA0000000;
@@ -369,6 +427,16 @@ class CodeCacheBase : public CodeCache {
 
  private:
   Derived& self() { return static_cast<Derived&>(*this); }
+
+  static bool IsValidIndirectionAddress(uint32_t guest_address) {
+    if ((guest_address & (sizeof(uint32_t) - 1)) != 0 ||
+        guest_address < kIndirectionTableBase) {
+      return false;
+    }
+    const uint64_t offset =
+        uint64_t(guest_address) - uint64_t(kIndirectionTableBase);
+    return offset <= kIndirectionTableSize - sizeof(uint32_t);
+  }
 
   void EnsureCommitted(size_t high_mark) {
     using namespace xe::literals;

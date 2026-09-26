@@ -277,6 +277,17 @@ dword_result_t NetDll_XNetCleanup_entry(dword_t caller) {
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetCleanup, kNetworking, kStub);
 
+// Fills an XNetConfigParams (0x1EC bytes). No persisted network configuration
+// exists, so report an empty one.
+dword_result_t NetDll_XnpLoadConfigParams_entry(dword_t caller,
+                                                lpvoid_t config_params) {
+  if (config_params) {
+    std::memset(config_params, 0, 0x1EC);
+  }
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XnpLoadConfigParams, kNetworking, kStub);
+
 dword_result_t XNetLogonGetMachineID_entry(lpqword_t machine_id_ptr) {
   *machine_id_ptr = GetLocalMachineId(GetConsoleMacAddress());
 

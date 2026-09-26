@@ -64,10 +64,12 @@ static void FreeContext(void* ctx) {
 }
 
 ThreadState::ThreadState(Processor* processor, uint32_t thread_id,
-                         uint32_t stack_base, uint32_t pcr_address)
+                         uint32_t stack_base, uint32_t pcr_address,
+                         TranslationDomainKey translation_domain_key)
     : processor_(processor),
       memory_(processor->memory()),
-      thread_id_(thread_id) {
+      thread_id_(thread_id),
+      translation_domain_key_(translation_domain_key) {
   if (thread_id_ == UINT_MAX) {
     // System thread. Assign the system thread ID with a high bit
     // set so people know what's up.

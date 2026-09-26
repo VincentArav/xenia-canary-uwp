@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <mutex>
 #include <vector>
 
 #include "xenia/base/bit_map.h"
@@ -175,6 +176,26 @@ class KernelState {
   Memory* memory() const { return memory_; }
   cpu::Processor* processor() const { return processor_; }
   vfs::VirtualFileSystem* file_system() const { return file_system_; }
+  UserModeGuestCodeDomainCoordinator*
+  user_mode_guest_code_domain_coordinator() {
+    return user_mode_guest_code_domain_coordinator_.get();
+  }
+  const UserModeGuestCodeDomainCoordinator*
+  user_mode_guest_code_domain_coordinator() const {
+    return user_mode_guest_code_domain_coordinator_.get();
+  }
+  UserModeManager* user_mode_manager() { return user_mode_manager_.get(); }
+  const UserModeManager* user_mode_manager() const {
+    return user_mode_manager_.get();
+  }
+  UserModeKernelRuntime* user_mode_kernel_runtime() {
+    return user_mode_kernel_runtime_.get();
+  }
+  const UserModeKernelRuntime* user_mode_kernel_runtime() const {
+    return user_mode_kernel_runtime_.get();
+  }
+  // Whether user-mode state prevents saving, at the time of the call.
+  UserModeSaveStatePreflightResult CheckSaveStatePreconditions() const;
 
   uint32_t title_id() const;
   bool is_title_open() const;
@@ -273,6 +294,9 @@ class KernelState {
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
+  // Finishes a user-mode title reset deferred by a terminating guest thread,
+  // once that thread has exited.
+  void FinalizeDeferredUserModeTitleReset();
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
@@ -327,6 +351,12 @@ class KernelState {
   uint32_t CreateKeTimestampBundle();
   void UpdateKeTimestampBundle();
 
+  // Queues a guest KDPC for a KTIMER expiry. Timer callbacks fire on host
+  // threads, so the DPC runs on a dedicated guest-capable thread. Returns
+  // false, leaving the queued arguments unchanged, if that DPC is already
+  // queued (KeInsertQueueDpc semantics).
+  bool QueueTimerDpc(uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2);
+
   void BeginDPCImpersonation(cpu::ppc::PPCContext* context,
                              DPCImpersonationScope& scope);
   void EndDPCImpersonation(cpu::ppc::PPCContext* context,
@@ -367,6 +397,15 @@ class KernelState {
   std::unique_ptr<SystemManagementController> smc_;
   std::unique_ptr<XmpVolumePatch> xmp_volume_patch_;
   std::unique_ptr<XConfig> xconfig_;
+  // Declared before the manager so reverse-order destruction retires mapping
+  // tokens while their domain coordinator is still alive.
+  std::unique_ptr<UserModeGuestCodeDomainCoordinator>
+      user_mode_guest_code_domain_coordinator_;
+  std::unique_ptr<UserModeManager> user_mode_manager_;
+  // Declared after both dependencies so it unregisters and clears live state
+  // before manager/coordinator reverse-order destruction.
+  std::unique_ptr<UserModeKernelRuntime> user_mode_kernel_runtime_;
+  std::atomic<bool> deferred_user_mode_title_reset_{false};
 
   KernelVersion kernel_version_;
 
@@ -391,6 +430,17 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+
+  struct QueuedTimerDpc {
+    uint32_t dpc_ptr;
+    uint32_t arg1;
+    uint32_t arg2;
+  };
+  std::mutex timer_dpc_mutex_;
+  std::condition_variable timer_dpc_cond_;
+  std::list<QueuedTimerDpc> timer_dpc_queue_;
+  bool timer_dpc_thread_running_ = false;
+  object_ref<XHostThread> timer_dpc_thread_;
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;

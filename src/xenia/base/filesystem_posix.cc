@@ -15,6 +15,7 @@
 
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <pwd.h>
@@ -23,6 +24,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if XE_PLATFORM_LINUX
+#include <sys/syscall.h>
+#endif
 #if XE_PLATFORM_MAC
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -142,6 +146,32 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
   return false;
 }
 
+bool IsSymlinkOrReparsePoint(const std::filesystem::path& path) {
+  struct stat status;
+  return lstat(path.c_str(), &status) == 0 && S_ISLNK(status.st_mode);
+}
+
+std::error_code RenameFileNoReplace(const std::filesystem::path& source,
+                                    const std::filesystem::path& destination) {
+#if XE_PLATFORM_LINUX && defined(SYS_renameat2)
+  // Claims the destination atomically, unlike link() and unlink().
+  constexpr unsigned int kRenameNoReplace = 1;
+  if (syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD,
+              destination.c_str(), kRenameNoReplace) == 0) {
+    return {};
+  }
+  return std::error_code(errno, std::generic_category());
+#elif XE_PLATFORM_MAC
+  if (renamex_np(source.c_str(), destination.c_str(), RENAME_EXCL) == 0) {
+    return {};
+  }
+  return std::error_code(errno, std::generic_category());
+#else
+  // There is no portable atomic no-replace rename.
+  return std::make_error_code(std::errc::operation_not_supported);
+#endif
+}
+
 class PosixFileHandle : public FileHandle {
  public:
   PosixFileHandle(std::filesystem::path path, int handle)
@@ -181,38 +211,43 @@ class PosixFileHandle : public FileHandle {
   int handle_ = -1;
 };
 
-std::unique_ptr<FileHandle> FileHandle::OpenExisting(
-    const std::filesystem::path& path, uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    // Unsupported
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericRead &&
-      desired_access & FileAccess::kGenericWrite) {
-    open_access = O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData &&
-      desired_access & FileAccess::kFileWriteData) {
-    open_access = O_RDWR;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access = O_RDWR;
-  }
+namespace {
+
+int GetPosixFileAccess(uint32_t desired_access) {
+  const bool wants_all = (desired_access & FileAccess::kGenericAll) != 0;
+  const bool wants_read =
+      wants_all || (desired_access & (FileAccess::kGenericRead |
+                                      FileAccess::kFileReadData)) != 0;
+  const bool wants_write =
+      wants_all || (desired_access &
+                    (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                     FileAccess::kFileAppendData)) != 0;
+
+  // O_RDONLY is zero, so pick the access mode explicitly instead of OR-ing.
+  int open_access =
+      wants_read && wants_write ? O_RDWR : (wants_write ? O_WRONLY : O_RDONLY);
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
   }
+  return open_access;
+}
+
+}  // namespace
+
+std::unique_ptr<FileHandle> FileHandle::CreateNew(
+    const std::filesystem::path& path, uint32_t desired_access) {
+  int handle = open(
+      path.c_str(),
+      GetPosixFileAccess(desired_access) | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (handle == -1) {
+    return nullptr;
+  }
+  return std::make_unique<PosixFileHandle>(path, handle);
+}
+
+std::unique_ptr<FileHandle> FileHandle::OpenExisting(
+    const std::filesystem::path& path, uint32_t desired_access) {
+  int open_access = GetPosixFileAccess(desired_access);
   int handle = open(path.c_str(), open_access);
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
@@ -223,8 +258,15 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
 
 std::optional<FileInfo> GetInfo(const std::filesystem::path& path) {
   FileInfo info{};
-  struct stat st;
-  if (stat(path.c_str(), &st) == 0) {
+  struct stat link_status{};
+  if (lstat(path.c_str(), &link_status) == 0) {
+    info.is_symlink_or_reparse_point = S_ISLNK(link_status.st_mode);
+    struct stat resolved_status = link_status;
+    if (info.is_symlink_or_reparse_point &&
+        stat(path.c_str(), &resolved_status) != 0) {
+      resolved_status = link_status;
+    }
+    const struct stat& st = resolved_status;
     if (S_ISDIR(st.st_mode)) {
       info.type = FileInfo::Type::kDirectory;
       // On Linux st.st_size can have non-zero size (generally 4096) so make 0
@@ -256,16 +298,25 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
       continue;
     }
 
-    FileInfo info;
+    FileInfo info{};
 
     info.name = ent->d_name;
-    struct stat st;
-    stat((path / info.name).c_str(), &st);
+    struct stat link_status{};
+    if (lstat((path / info.name).c_str(), &link_status) != 0) {
+      continue;
+    }
+    info.is_symlink_or_reparse_point = S_ISLNK(link_status.st_mode);
+    struct stat resolved_status = link_status;
+    if (info.is_symlink_or_reparse_point &&
+        stat((path / info.name).c_str(), &resolved_status) != 0) {
+      resolved_status = link_status;
+    }
+    const struct stat& st = resolved_status;
     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
     info.path = path;
-    if (ent->d_type == DT_DIR) {
+    if (S_ISDIR(st.st_mode)) {
       info.type = FileInfo::Type::kDirectory;
       info.total_size = 0;
     } else {

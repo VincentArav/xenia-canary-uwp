@@ -97,6 +97,12 @@ dword_result_t XamUserGetIndexFromXUID_entry(qword_t xuid, dword_t flags,
 }
 DECLARE_XAM_EXPORT1(XamUserGetIndexFromXUID, kUserProfiles, kImplemented);
 
+// Sign-ins complete synchronously here, so there is no queued logon work.
+dword_result_t XamUserFlushLogonQueue_entry(dword_t unknown) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamUserFlushLogonQueue, kUserProfiles, kStub);
+
 dword_result_t XamUserGetSigninState_entry(dword_t user_index) {
   X_USER_SIGNIN_STATE signin_state = X_USER_SIGNIN_STATE::NotSignedIn;
   if (user_index >= XUserMaxUserCount) {

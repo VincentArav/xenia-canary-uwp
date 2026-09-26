@@ -10,7 +10,6 @@
 #include "xenia/cpu/ppc/ppc_scanner.h"
 
 #include "xenia/base/logging.h"
-#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -33,20 +32,22 @@ PPCScanner::PPCScanner(PPCFrontend* frontend) : frontend_(frontend) {}
 
 PPCScanner::~PPCScanner() {}
 
-bool PPCScanner::IsRestGprLr(uint32_t address) {
-  auto function = frontend_->processor()->QueryFunction(address);
+bool PPCScanner::IsRestGprLr(TranslationDomainKey translation_domain_key,
+                             uint32_t address) {
+  auto function =
+      frontend_->processor()->QueryFunction(translation_domain_key, address);
   return function && function->behavior() == Function::Behavior::kEpilogReturn;
 }
 
-bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
+bool PPCScanner::Scan(GuestFunction* function,
+                      const GuestCodeReader& guest_code_reader,
+                      FunctionDebugInfo* debug_info) {
   // This is a simple basic block analyizer. It walks the start address to the
   // end address looking for branches. Each span of instructions between
   // branches is considered a basic block. When the last blr (that has no
   // branches to after it) is found the function is considered ended. If this
   // is before the expected end address then the function address range is
   // split up and the second half is treated as another function.
-
-  Memory* memory = frontend_->memory();
 
   LOGPPC("Analyzing function {:08X}...", function->address());
 
@@ -56,14 +57,26 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
 
   uint32_t start_address = static_cast<uint32_t>(function->address());
   uint32_t end_address = static_cast<uint32_t>(function->end_address());
+  const TranslationDomainKey translation_domain_key =
+      function->translation_domain_key();
+  // In a checked domain calls are tail calls, so the code after an
+  // unconditional call is entered at its return address as a function of its
+  // own. Ending the function there keeps the rest of the caller from being
+  // translated again for each return address in it.
+  const bool calls_end_function =
+      translation_domain_key != TranslationDomainKey::DefaultDirect();
   uint32_t address = start_address;
   uint32_t furthest_target = start_address;
   size_t blocks_found = 0;
   bool in_block = false;
   bool starts_with_mfspr_lr = false;
   while (true) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code;
+    if (!guest_code_reader.TryReadInstruction(address, &code)) {
+      XELOGE("Failed to fetch PPC instruction at {:08X} while scanning",
+             address);
+      return false;
+    }
 
     // If we fetched 0 assume that we somehow hit one of the awesome
     // 'no really we meant to end after that bl' functions.
@@ -139,6 +152,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
         LOGPPC("bl {:08X} -> {:08X}", address, target);
         // Queue call target if needed.
         // GetOrInsertFunction(target);
+        ends_fn = calls_end_function;
       } else {
         LOGPPC("b {:08X} -> {:08X}", address, target);
 
@@ -162,7 +176,8 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
         // Note that sometimes functions stick this in a basic block *inside*
         // of the function somewhere, so ensure we don't have any branches over
         // it.
-        if (!ends_fn && furthest_target <= address && IsRestGprLr(target)) {
+        if (!ends_fn && furthest_target <= address &&
+            IsRestGprLr(translation_domain_key, target)) {
           LOGPPC("function end {:08X} (__restgprlr_*)", address);
           ends_fn = true;
         }
@@ -198,7 +213,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
         }
         */
 
-        if (!ends_fn && !IsRestGprLr(target)) {
+        if (!ends_fn && !IsRestGprLr(translation_domain_key, target)) {
           furthest_target = std::max(furthest_target, target);
 
           // TODO(benvanik): perhaps queue up for a speculative check? I think
@@ -223,7 +238,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
 
         // TODO(benvanik): GetOrInsertFunction? it's likely a BB
 
-        if (!IsRestGprLr(target)) {
+        if (!IsRestGprLr(translation_domain_key, target)) {
           furthest_target = std::max(furthest_target, target);
         }
       }
@@ -232,6 +247,8 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
       // bclr/bclrl
       if (d.XL.LK()) {
         LOGPPC("bclrl {:08X}", address);
+        // BO 1z1zz: branch always.
+        ends_fn = calls_end_function && (d.XL.BO() & 0x14) == 0x14;
       } else {
         LOGPPC("bclr {:08X}", address);
       }
@@ -240,6 +257,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
       // bcctr/bcctrl
       if (d.XL.LK()) {
         LOGPPC("bcctrl {:08X}", address);
+        ends_fn = calls_end_function && (d.XL.BO() & 0x14) == 0x14;
       } else {
         LOGPPC("bcctr {:08X}", address);
       }
@@ -289,9 +307,13 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
   return true;
 }
 
-std::vector<BlockInfo> PPCScanner::FindBlocks(GuestFunction* function) {
-  Memory* memory = frontend_->memory();
-
+bool PPCScanner::FindBlocks(GuestFunction* function,
+                            const GuestCodeReader& guest_code_reader,
+                            std::vector<BlockInfo>* blocks_out) {
+  if (!blocks_out) {
+    return false;
+  }
+  blocks_out->clear();
   std::map<uint32_t, BlockInfo> block_map;
 
   uint32_t start_address = function->address();
@@ -299,8 +321,12 @@ std::vector<BlockInfo> PPCScanner::FindBlocks(GuestFunction* function) {
   bool in_block = false;
   uint32_t block_start = 0;
   for (uint32_t address = start_address; address <= end_address; address += 4) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code;
+    if (!guest_code_reader.TryReadInstruction(address, &code)) {
+      XELOGE("Failed to fetch PPC instruction at {:08X} while finding blocks",
+             address);
+      return false;
+    }
     if (!code) {
       continue;
     }
@@ -354,11 +380,10 @@ std::vector<BlockInfo> PPCScanner::FindBlocks(GuestFunction* function) {
     };
   }
 
-  std::vector<BlockInfo> blocks;
   for (auto it = block_map.begin(); it != block_map.end(); ++it) {
-    blocks.push_back(it->second);
+    blocks_out->push_back(it->second);
   }
-  return blocks;
+  return true;
 }
 
 }  // namespace ppc

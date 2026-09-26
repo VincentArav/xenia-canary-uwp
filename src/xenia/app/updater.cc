@@ -740,8 +740,8 @@ bool Updater::UpdateAndRestart(const std::filesystem::path& zip_path) {
   const auto update_script_path = executable_parent / update_script_filename;
   const auto zip_filename = zip_path.filename().string();
 
-  const auto update_log_filename = "xenia_canary_update.log";
-  const auto backup_folder_name = "canary_netplay_old";
+  const auto update_log_filename = "xenia_fusion_update.log";
+  const auto backup_folder_name = "fusion_netplay_old";
 
   if (std::filesystem::exists(update_script_path, ec) && !ec) {
     std::filesystem::remove(update_script_path, ec);
@@ -826,7 +826,7 @@ bool Updater::UpdateAndRestart(const std::filesystem::path& zip_path) {
       "EXECUTABLE_NAME=\"{0}\"                    # final executable name\n"
       "EXECUTABLE_PATH=\"$(dirname \"$(realpath \"$0\")\")/$EXECUTABLE_NAME\"\n"
       "ARCHIVE_FILE=\"{1}\"          # archive file\n"
-      "INNER_PATH=\"build/bin/Linux/Release/xenia_canary_netplay\" # path "
+      "INNER_PATH=\"build/bin/Linux/Release/xenia_fusion_netplay\" # path "
       "inside archive\n"
       "LOG_FILE=\"$(dirname \"$(realpath \"$0\")\")/{2}\"\n"
       "BACKUP_DIR=\"$(dirname \"$(realpath \"$0\")\")/{3}\"\n"

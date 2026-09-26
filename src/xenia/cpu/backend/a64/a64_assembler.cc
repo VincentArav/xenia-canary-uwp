@@ -68,6 +68,13 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
                             std::unique_ptr<FunctionDebugInfo> debug_info) {
   SCOPE_profile_cpu_f("cpu");
 
+  auto* const code_cache =
+      reinterpret_cast<A64CodeCache*>(backend_->code_cache());
+  if (!code_cache->CanPublishIndirection(function->translation_domain_key(),
+                                         function->address())) {
+    return false;
+  }
+
   // Reset when we leave.
   xe::make_reset_scope(this);
 
@@ -94,9 +101,11 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
   // Install into indirection table.
   uint64_t host_address = reinterpret_cast<uint64_t>(machine_code);
   assert_true((host_address >> 32) == 0);
-  reinterpret_cast<A64CodeCache*>(backend_->code_cache())
-      ->AddIndirection(function->address(),
-                       static_cast<uint32_t>(host_address));
+  if (!code_cache->AddIndirection(function->translation_domain_key(),
+                                  function->address(),
+                                  static_cast<uint32_t>(host_address))) {
+    return false;
+  }
 
   return true;
 }

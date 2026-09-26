@@ -10,9 +10,14 @@
 #ifndef XENIA_CPU_PROCESSOR_H_
 #define XENIA_CPU_PROCESSOR_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
+#include <shared_mutex>
+#include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -27,6 +32,7 @@
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/thread_debug_info.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/cpu/translation_domain_registry.h"
 #include "xenia/memory.h"
 
 DECLARE_bool(debug);
@@ -39,6 +45,66 @@ constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
 class Breakpoint;
 class StackWalker;
 class XexModule;
+struct GuestMemoryAccessRequest;
+struct GuestMemoryAccessResult;
+
+// Authorizes one domain switch, from expected_source_domain_key to
+// target_domain_key. Its owner keeps the domains from retiring until the
+// switch commits.
+class TranslationDomainTransitionPermit {
+ public:
+  virtual ~TranslationDomainTransitionPermit() = default;
+  virtual TranslationDomainKey expected_source_domain_key() const noexcept = 0;
+  virtual TranslationDomainKey target_domain_key() const noexcept = 0;
+};
+
+// Receives the checked-memory faults of guest code. Leaves the guest call
+// nonlocally and never returns (not noexcept: POSIX reentry unwinds).
+class CheckedGuestMemoryFaultHandler {
+ public:
+  virtual ~CheckedGuestMemoryFaultHandler() = default;
+  [[noreturn]] virtual void HandleGuestMemoryFault(
+      ppc::PPCContext* context, TranslationDomainKey translation_domain_key,
+      const GuestMemoryAccessRequest& request,
+      const GuestMemoryAccessResult& result) = 0;
+  // Raises an instruction storage fault for a branch to an address whose
+  // instruction cannot be fetched, with the branch's LR and CTR updates in the
+  // context. Leaves nonlocally when the fault is delivered; returns false when
+  // nothing takes it.
+  virtual bool DispatchGuestInstructionStorageFault(
+      ppc::PPCContext* context, TranslationDomainKey translation_domain_key,
+      const ppc::GuestInstructionFetchFault& fault) {
+    return false;
+  }
+};
+
+// Takes an interrupt on a thread whose ThreadState::guest_interrupt_pending
+// was set. Called by checked-domain code at a branch, with the guest state
+// complete in the context; resume_address is the branch target. May leave
+// nonlocally (to run kernel code and later resume there) or return to take
+// the branch normally.
+class GuestInterruptPoller {
+ public:
+  virtual ~GuestInterruptPoller() = default;
+  virtual void PollGuestInterrupt(ppc::PPCContext* context,
+                                  uint32_t resume_address) = 0;
+};
+
+// Authorizes checked-domain execution and domain switches, and receives
+// checked-memory faults; installed by the runtime that owns checked domains.
+class CheckedGuestMemoryDispatcher : public CheckedGuestMemoryFaultHandler {
+ public:
+  ~CheckedGuestMemoryDispatcher() override = default;
+
+  virtual bool IsDomainExecutionAuthorized(
+      TranslationDomainKey translation_domain_key,
+      const TranslationDomainDescriptor& descriptor) const noexcept = 0;
+  virtual bool IsDomainTransitionAuthorized(
+      TranslationDomainKey current_domain_key,
+      TranslationDomainKey target_domain_key,
+      const TranslationDomainDescriptor* target_descriptor,
+      const TranslationDomainTransitionPermit& permit) const noexcept = 0;
+};
 
 enum class Irql : uint32_t {
   PASSIVE = 0,
@@ -61,6 +127,28 @@ enum class ExecutionState {
   kEnded,
 };
 
+enum class GuestCodeInvalidationStatus : uint8_t {
+  kSuccess,
+  kUnsupportedTranslationDomain,
+  kExecutionNotQuiescent,
+  kLiveGuestThreads,
+  kCompilationInProgress,
+  kBackendResetFailed,
+  kFunctionReplacementFailed,
+};
+
+struct GuestCodeInvalidationResult {
+  GuestCodeInvalidationStatus status =
+      GuestCodeInvalidationStatus::kBackendResetFailed;
+  uint64_t generation = 0;
+  size_t retired_function_count = 0;
+  size_t invalidated_entry_count = 0;
+
+  explicit operator bool() const {
+    return status == GuestCodeInvalidationStatus::kSuccess;
+  }
+};
+
 class Processor {
  public:
   Processor(Memory* memory, ExportResolver* export_resolver);
@@ -71,6 +159,52 @@ class Processor {
   ppc::PPCFrontend* frontend() const { return frontend_.get(); }
   backend::Backend* backend() const { return backend_.get(); }
   ExportResolver* export_resolver() const { return export_resolver_; }
+  TranslationDomainRegistry* translation_domain_registry() {
+    return &translation_domain_registry_;
+  }
+  const TranslationDomainRegistry* translation_domain_registry() const {
+    return &translation_domain_registry_;
+  }
+
+  // Set and cleared while checked guest code is quiesced.
+  void set_guest_interrupt_poller(GuestInterruptPoller* poller) {
+    guest_interrupt_poller_.store(poller, std::memory_order_release);
+  }
+  GuestInterruptPoller* guest_interrupt_poller() const {
+    return guest_interrupt_poller_.load(std::memory_order_acquire);
+  }
+
+  // Install fails while another dispatcher is installed; uninstall removes
+  // only this one.
+  bool InstallCheckedGuestMemoryDispatcher(
+      CheckedGuestMemoryDispatcher* dispatcher);
+  bool UninstallCheckedGuestMemoryDispatcher(
+      CheckedGuestMemoryDispatcher* dispatcher);
+  CheckedGuestMemoryDispatcher* checked_guest_memory_dispatcher() const {
+    return checked_guest_memory_dispatcher_.load(std::memory_order_acquire);
+  }
+
+  // Changes whenever checked-domain code may stop running as resolved: a
+  // translation retires, or a domain's execution authorization changes.
+  // Resolutions cached under one value stay valid while it holds.
+  uint64_t checked_execution_epoch() const {
+    return checked_execution_epoch_.load(std::memory_order_acquire);
+  }
+  void AdvanceCheckedExecutionEpoch() {
+    checked_execution_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  // DefaultDirect always; a checked domain while it is registered and the
+  // installed dispatcher authorizes it.
+  bool CanExecuteTranslationDomain(
+      TranslationDomainKey translation_domain_key) const;
+
+  // Switches the thread's domain once XThread has unwound the old frames,
+  // updating ThreadState and its debugger mirror together. A switch needs a
+  // matching permit; staying in the domain doesn't.
+  bool CommitThreadTranslationDomain(
+      ThreadState* thread_state, TranslationDomainKey target_domain_key,
+      const TranslationDomainTransitionPermit* permit = nullptr);
 
   bool Setup(std::unique_ptr<backend::Backend> backend);
 
@@ -102,7 +236,11 @@ class Processor {
 
   bool AddModule(std::unique_ptr<Module> module);
   void RemoveModule(const std::string_view name);
+  void RemoveModule(TranslationDomainKey translation_domain_key,
+                    const std::string_view name);
   Module* GetModule(const std::string_view name);
+  Module* GetModule(TranslationDomainKey translation_domain_key,
+                    const std::string_view name);
   std::vector<Module*> GetModules();
 
   Module* builtin_module() const { return builtin_module_; }
@@ -111,13 +249,63 @@ class Processor {
                           void* arg1);
 
   Function* QueryFunction(uint32_t address);
+  Function* QueryFunction(TranslationDomainKey translation_domain_key,
+                          uint32_t address);
   std::vector<Function*> FindFunctionsWithAddress(uint32_t address);
+  std::vector<Function*> FindFunctionsWithAddress(
+      TranslationDomainKey translation_domain_key, uint32_t address);
   void RemoveFunctionByAddress(uint32_t address);
+  void RemoveFunctionByAddress(TranslationDomainKey translation_domain_key,
+                               uint32_t address);
 
   Function* LookupFunction(uint32_t address);
+  Function* LookupFunction(TranslationDomainKey translation_domain_key,
+                           uint32_t address);
   Module* LookupModule(uint32_t address);
+  Module* LookupModule(TranslationDomainKey translation_domain_key,
+                       uint32_t address);
   Function* LookupFunction(Module* module, uint32_t address);
+  Function* LookupFunction(Module* module,
+                           TranslationDomainKey translation_domain_key,
+                           uint32_t address);
   Function* ResolveFunction(uint32_t address);
+  Function* ResolveFunction(TranslationDomainKey translation_domain_key,
+                            uint32_t address);
+  // Also reports why a checked-domain address cannot be resolved because its
+  // instruction cannot be fetched. Such a failure is never cached: the next
+  // resolution fetches again.
+  Function* ResolveFunction(TranslationDomainKey translation_domain_key,
+                            uint32_t address,
+                            ppc::GuestInstructionFetchFault* fetch_fault_out);
+  // Delivers an instruction storage fault in a checked domain through the
+  // installed dispatcher. Returns only when nothing takes it.
+  bool DispatchGuestInstructionStorageFault(
+      ppc::PPCContext* context, TranslationDomainKey translation_domain_key,
+      const ppc::GuestInstructionFetchFault& fault);
+
+  // Retires every translation of a domain and advances its generation.
+  // DefaultDirect code may hold direct calls between translations, so it is
+  // flushed only with no guest thread alive; a checked domain, with no thread
+  // in it. Native code and unwind records stay.
+  GuestCodeInvalidationResult InvalidateGuestCodeDomain(
+      TranslationDomainKey translation_domain_key);
+
+  // Live invalidations of checked domains, while threads run in them: a
+  // running thread reaches new code at its next branch out of a retired
+  // function. The caller must hold neither the global nor the resolution lock.
+  //
+  // Retires the translations that read any guest physical byte in
+  // [source_begin, source_end), plus failed ones.
+  GuestCodeInvalidationResult InvalidateCheckedGuestCodeSources(
+      uint32_t source_begin, uint32_t source_end);
+  // A TB flush of checked domains: changes the address translation, not the
+  // code bytes (icache sweeps retire those). Retires only the translations
+  // whose instructions no longer fetch from the physical bytes they were
+  // translated from, and the domains' failed entries.
+  GuestCodeInvalidationResult InvalidateRemappedCheckedGuestCodeDomains(
+      std::span<const TranslationDomainKey> translation_domain_keys);
+  bool HasLiveThreadInTranslationDomains(
+      std::span<const TranslationDomainKey> translation_domain_keys);
 
   bool Execute(ThreadState* thread_state, uint32_t address);
   bool ExecuteRaw(ThreadState* thread_state, uint32_t address);
@@ -126,6 +314,9 @@ class Processor {
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
+
+  // Whether save states can represent every live thread's domain.
+  bool CanSaveActiveTranslationDomains();
 
   // Returns a list of debugger info for all threads that have ever existed.
   // This is the preferred way to sample thread state vs. attempting to ask
@@ -174,8 +365,10 @@ class Processor {
 
   // Steps the given thread to the target of the branch at the specified guest
   // address. The address must specify a branch instruction.
-  // Returns the new PC guest address.
-  uint32_t StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc);
+  // Writes the new PC guest address and returns true on success. Returns false
+  // without stepping if the branch instruction cannot be fetched.
+  bool StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc,
+                                 uint32_t* new_pc_out);
 
   // Steps the thread to a point where it's safe to terminate or read its
   // context. Returns the PC after we've finished stepping.
@@ -212,6 +405,41 @@ class Processor {
   uint8_t* AllocateFunctionTraceData(size_t size);
 
  private:
+  bool IsCheckedResolverOnlyDomainLocked(
+      TranslationDomainKey translation_domain_key);
+  // Shared by the two live checked invalidations. select chooses the defined
+  // or failed functions to retire. A whole-domain invalidation tombstones
+  // every entry; otherwise only the retired functions' entries and the
+  // domain's failed entries, whose function may never have been declared.
+  GuestCodeInvalidationResult InvalidateCheckedGuestCode(
+      const std::function<bool(TranslationDomainKey)>& include_domain,
+      const Module::GuestFunctionInvalidationFilter& select,
+      bool invalidate_whole_domains);
+  // Where each checked page fetched from during one flush, keyed by domain
+  // and page: functions share pages, so each is read only once.
+  using CheckedPageSources =
+      std::map<std::pair<TranslationDomainKey, uint32_t>, uint32_t>;
+  // Whether every page of a checked translation still fetches from the
+  // physical bytes it was translated from.
+  bool CheckedGuestCodeSourcesCurrent(const GuestFunction& function,
+                                      CheckedPageSources* page_sources) const;
+  // Records the pages a new checked translation fetched from.
+  void RecordCheckedCodePages(const GuestFunction& function);
+  void ForgetCheckedCodePages(TranslationDomainKey translation_domain_key);
+
+  // Resolves address in the thread's domain and calls it, re-resolving when a
+  // concurrent checked-domain invalidation retired the function first.
+  // With deliver_fetch_faults, an address whose instruction cannot be fetched
+  // raises an instruction storage fault, as when reentering at it.
+  bool ResolveAndCall(ThreadState* thread_state, uint32_t address,
+                      uint32_t return_address,
+                      bool deliver_fetch_faults = false);
+  // Whether a checked-domain instruction fetch at address faults for a guest
+  // reason, reported in fault_out.
+  bool ProbeCheckedInstructionFetch(
+      TranslationDomainKey translation_domain_key, uint32_t address,
+      ppc::GuestInstructionFetchFault* fault_out) const;
+
   // Synchronously demands a debug listener.
   void DemandDebugListener();
 
@@ -244,8 +472,9 @@ class Processor {
   // Calculates the next guest instruction based on the current thread state and
   // current PC. This will look for branches and other control flow
   // instructions.
-  uint32_t CalculateNextGuestInstruction(ThreadDebugInfo* thread_info,
-                                         uint32_t current_pc);
+  bool CalculateNextGuestInstruction(ThreadDebugInfo* thread_info,
+                                     uint32_t current_pc,
+                                     uint32_t* next_pc_out);
 
   bool DemandFunction(Function* function);
 
@@ -266,11 +495,35 @@ class Processor {
   ExportResolver* export_resolver_ = nullptr;
 
   EntryTable entry_table_;
+  // Shared by resolvers, held exclusively by invalidations.
+  mutable std::shared_mutex guest_code_resolution_mutex_;
+  std::atomic<uint64_t> default_guest_code_generation_{0};
+  std::unordered_map<TranslationDomainKey, uint64_t>
+      checked_guest_code_generations_;
+  std::atomic<uint64_t> checked_execution_epoch_{1};
+  // Per checked domain, where each effective 4 KiB page holding translated
+  // code fetched from, so a TB flush probes pages rather than every
+  // translation. kUnknownInstructionSource marks a page whose source is
+  // unknown; a flush treats it as moved. Also counts each domain's failed
+  // entries, which a flush retries.
+  std::mutex checked_code_pages_mutex_;
+  std::unordered_map<TranslationDomainKey,
+                     std::unordered_map<uint32_t, uint32_t>>
+      checked_code_pages_;
+  std::unordered_map<TranslationDomainKey, size_t> checked_failed_entry_counts_;
+  TranslationDomainRegistry translation_domain_registry_;
+  std::atomic<GuestInterruptPoller*> guest_interrupt_poller_{nullptr};
+  std::atomic<CheckedGuestMemoryDispatcher*> checked_guest_memory_dispatcher_{
+      nullptr};
   xe::global_critical_region global_critical_region_;
   ExecutionState execution_state_ = ExecutionState::kPaused;
   std::vector<std::unique_ptr<Module>> modules_;
+  // Removed modules retain Function objects referenced by append-only native
+  // code metadata and by already-generated direct calls.
+  std::vector<std::unique_ptr<Module>> retired_modules_;
   Module* builtin_module_ = nullptr;
-  uint32_t next_builtin_address_ = 0xFFFF0000u;
+  static constexpr uint32_t kBuiltinAddressBase = 0xFFFF0000u;
+  uint32_t next_builtin_address_ = kBuiltinAddressBase;
 
   // Maps thread ID to state. Updated on thread create, and threads are never
   // removed. Must be guarded with the global lock.

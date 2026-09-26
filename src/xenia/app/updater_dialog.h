@@ -20,9 +20,9 @@ namespace app {
 class EmulatorWindow;  // Forward declaration due to circular dependency
 
 constexpr std::string_view windows_artifact_name_ =
-    "xenia_canary_netplay_windows.zip";
+    "xenia_fusion_netplay_windows.zip";
 constexpr std::string_view linux_artifact_name_ =
-    "xenia_canary_netplay_linux.tar.xz";
+    "xenia_fusion_netplay_linux.tar.xz";
 
 class UpdaterDialog final : public ui::ImGuiDialog {
  public:
@@ -105,7 +105,7 @@ class UpdaterCompletionDialog final : public ui::ImGuiDialog {
   bool show_update_log_ = false;
   bool updated_ = false;
   std::string artifact_name_ = "";
-  std::string_view update_log_filename_ = "xenia_canary_update.log";
+  std::string_view update_log_filename_ = "xenia_fusion_update.log";
   EmulatorWindow* emulator_window_;
 };
 

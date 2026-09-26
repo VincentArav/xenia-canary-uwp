@@ -14,10 +14,8 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 
-#include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
-#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -72,6 +70,61 @@ PPCHIRBuilder::~PPCHIRBuilder() = default;
 
 PPCBuiltins* PPCHIRBuilder::builtins() const { return frontend_->builtins(); }
 
+bool PPCHIRBuilder::is_checked_user_mode() const {
+  return translation_domain_key() != TranslationDomainKey::DefaultDirect();
+}
+
+void PPCHIRBuilder::RaiseProgramException(uint32_t address,
+                                          GuestProgramExceptionKind kind) {
+  // The handler reads the interrupted state from the context.
+  ContextBarrier();
+  StoreContext(offsetof(PPCContext, guest_system_call_cia),
+               LoadConstantUint32(address));
+  CallExtern(kind == GuestProgramExceptionKind::kTrap
+                 ? builtins()->trap_handler
+                 : builtins()->illegal_instruction_handler);
+}
+
+namespace {
+
+// Load and store with update forms are invalid with RA=0.
+bool IsInvalidUpdateForm(PPCOpcode opcode, uint32_t code) {
+  switch (opcode) {
+    case PPCOpcode::lbzu:
+    case PPCOpcode::lbzux:
+    case PPCOpcode::ldu:
+    case PPCOpcode::ldux:
+    case PPCOpcode::lfdu:
+    case PPCOpcode::lfdux:
+    case PPCOpcode::lfsu:
+    case PPCOpcode::lfsux:
+    case PPCOpcode::lhau:
+    case PPCOpcode::lhaux:
+    case PPCOpcode::lhzu:
+    case PPCOpcode::lhzux:
+    case PPCOpcode::lwaux:
+    case PPCOpcode::lwzu:
+    case PPCOpcode::lwzux:
+    case PPCOpcode::stbu:
+    case PPCOpcode::stbux:
+    case PPCOpcode::stdu:
+    case PPCOpcode::stdux:
+    case PPCOpcode::stfdu:
+    case PPCOpcode::stfdux:
+    case PPCOpcode::stfsu:
+    case PPCOpcode::stfsux:
+    case PPCOpcode::sthu:
+    case PPCOpcode::sthux:
+    case PPCOpcode::stwu:
+    case PPCOpcode::stwux:
+      return ((code >> 16) & 0x1F) == 0;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
 void PPCHIRBuilder::Reset() {
   function_ = nullptr;
   start_address_ = 0;
@@ -82,12 +135,13 @@ void PPCHIRBuilder::Reset() {
   HIRBuilder::Reset();
 }
 
-bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
+bool PPCHIRBuilder::Emit(GuestFunction* function,
+                         const GuestCodeReader& guest_code_reader,
+                         uint32_t flags) {
   SCOPE_profile_cpu_f("cpu");
 
-  Memory* memory = frontend_->memory();
-
   function_ = function;
+  set_translation_domain_key(function_->translation_domain_key());
   start_address_ = function_->address();
   // chrispy: i've seen this one happen, not sure why but i think from trying to
   // precompile twice i've also seen ones with a start and end address that are
@@ -122,8 +176,12 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
     trace_info_.dest_count = 0;
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code;
+    if (!guest_code_reader.TryReadInstruction(address, &code)) {
+      XELOGE("Failed to fetch PPC instruction at {:08X} while emitting HIR",
+             address);
+      return false;
+    }
     auto opcode = LookupOpcode(code);
     auto& opcode_info = GetOpcodeInfo(opcode);
 
@@ -158,9 +216,22 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
     instr_offset_list_[offset] = first_instr;
 
     if (opcode == PPCOpcode::kInvalid) {
-      XELOGE("Invalid instruction {:08X} {:08X}", address, code);
       Comment("INVALID!");
+      if (is_checked_user_mode()) {
+        XELOGD("Invalid instruction {:08X} {:08X} raises a program exception",
+               address, code);
+        RaiseProgramException(address,
+                              GuestProgramExceptionKind::kIllegalInstruction);
+      } else {
+        XELOGE("Invalid instruction {:08X} {:08X}", address, code);
+      }
       // TraceInvalidInstruction(i);
+      continue;
+    }
+    if (is_checked_user_mode() && IsInvalidUpdateForm(opcode, code)) {
+      Comment("INVALID FORM!");
+      RaiseProgramException(address,
+                            GuestProgramExceptionKind::kIllegalInstruction);
       continue;
     }
     ++opcode_translation_counts[static_cast<int>(opcode)];
@@ -179,7 +250,16 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
     i.code = code;
     i.opcode = opcode;
     i.opcode_info = &opcode_info;
-    if (!opcode_info.emit || opcode_info.emit(*this, i)) {
+    current_instruction_address_ = address;
+    current_instruction_code_ = code;
+    const int emit_result = opcode_info.emit ? opcode_info.emit(*this, i)
+                                             : kInstructionEmitUnimplemented;
+    if (emit_result == kInstructionEmitTranslationFailed) {
+      XELOGE("Translation rejected at instruction {:08X} {:08X}", address,
+             code);
+      return false;
+    }
+    if (emit_result != kInstructionEmitSuccess) {
       auto& disasm_info = GetOpcodeDisasmInfo(opcode);
       XELOGE(
           "Unimplemented instr {:08X} {:08X} {} - report the game to Xenia "
@@ -256,7 +336,8 @@ void PPCHIRBuilder::AnnotateLabel(uint32_t address, Label* label) {
 }
 
 Function* PPCHIRBuilder::LookupFunction(uint32_t address) {
-  return frontend_->processor()->LookupFunction(address);
+  return frontend_->processor()->LookupFunction(translation_domain_key(),
+                                                address);
 }
 
 Label* PPCHIRBuilder::LookupLabel(uint32_t address) {
@@ -414,8 +495,9 @@ void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, Value* rhs,
   Value* eq = CompareEQ(lhs, rhs);
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 2, eq);
 
-  // Value* so = AllocValue(UINT8_TYPE);
-  // StoreContext(offsetof(PPCContext, cr) + (4 * n) + 3, so);
+  // Compares and record forms copy XER[SO] into the field's SO bit.
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
+               LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE));
 
   // TOOD(benvanik): trace CR.
 }
@@ -502,14 +584,33 @@ void PPCHIRBuilder::CopyFPSCRToCR1() {
 }
 
 Value* PPCHIRBuilder::LoadXER() {
-  Value* v = Shl(ZeroExtend(LoadCA(), INT64_TYPE), 29);
-  // TODO(benvanik): construct with other flags; overflow, etc?
+  // SO, OV and CA are XER bits 31, 30 and 29. The string-instruction byte
+  // count is not modelled.
+  Value* v =
+      Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
+                     INT64_TYPE),
+          31);
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_ov), INT8_TYPE),
+                           INT64_TYPE),
+                30));
+  v = Or(v, Shl(ZeroExtend(LoadCA(), INT64_TYPE), 29));
   return v;
 }
 
 void PPCHIRBuilder::StoreXER(Value* value) {
-  // TODO(benvanik): use other fields? For now, just pull out CA.
+  StoreContext(offsetof(PPCContext, xer_so),
+               Truncate(And(Shr(value, 31), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_ov),
+               Truncate(And(Shr(value, 30), LoadConstantInt64(1)), INT8_TYPE));
   StoreCA(Truncate(And(Shr(value, 29), LoadConstantInt64(1)), INT8_TYPE));
+}
+
+void PPCHIRBuilder::StoreOV(Value* value) {
+  assert_true(value->type == INT8_TYPE);
+  StoreContext(offsetof(PPCContext, xer_ov), value);
+  // SO is sticky; only an explicit XER write (mtxer, mcrxr) clears it.
+  StoreContext(offsetof(PPCContext, xer_so),
+               Or(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE), value));
 }
 
 Value* PPCHIRBuilder::LoadCA() {

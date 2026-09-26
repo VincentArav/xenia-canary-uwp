@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <ranges>
 
 #include "xenia/kernel/kernel_state.h"
@@ -15,6 +16,9 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/user_mode_guest_code_domains.h"
+#include "xenia/kernel/user_mode_kernel_runtime.h"
+#include "xenia/kernel/user_mode_manager.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
@@ -54,16 +58,29 @@ KernelState* shared_kernel_state_ = nullptr;
 
 KernelState* kernel_state() { return shared_kernel_state_; }
 
+UserModeSaveStatePreflightResult KernelState::CheckSaveStatePreconditions()
+    const {
+  return user_mode_manager_->CheckSaveStatePreconditions();
+}
+
 KernelState::KernelState(Emulator* emulator)
     : emulator_(emulator),
       memory_(emulator->memory()),
+      processor_(emulator->processor()),
+      file_system_(emulator->file_system()),
+      user_mode_guest_code_domain_coordinator_(
+          std::make_unique<UserModeGuestCodeDomainCoordinator>(
+              *emulator->memory(),
+              *emulator->processor()->translation_domain_registry(),
+              UserModeGuestCodeDomainCoordinatorMode::kExecutionEnabled)),
+      user_mode_manager_(std::make_unique<UserModeManager>(
+          UserModeManagerMode::kExecutionEnabled)),
+      user_mode_kernel_runtime_(std::make_unique<UserModeKernelRuntime>(this)),
       dispatch_thread_running_(false),
       dpc_list_(emulator->memory()),
       kernel_trampoline_group_(emulator->processor()->backend()) {
   assert_null(shared_kernel_state_);
   shared_kernel_state_ = this;
-  processor_ = emulator->processor();
-  file_system_ = emulator->file_system();
   xam_state_ = std::make_unique<xam::XamState>(emulator, this);
   smc_ = std::make_unique<SystemManagementController>();
   xconfig_ =
@@ -88,6 +105,15 @@ KernelState::~KernelState() {
     dispatch_thread_running_ = false;
     dispatch_cond_.notify_all();
     dispatch_thread_->Wait(0, 0, 0, nullptr);
+  }
+  if (timer_dpc_thread_) {
+    {
+      std::lock_guard<std::mutex> lock(timer_dpc_mutex_);
+      timer_dpc_thread_running_ = false;
+      timer_dpc_queue_.clear();
+    }
+    timer_dpc_cond_.notify_all();
+    timer_dpc_thread_->Wait(0, 0, 0, nullptr);
   }
 
   executable_module_.reset();
@@ -582,6 +608,53 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     dispatch_thread_->set_name("Kernel Dispatch");
     dispatch_thread_->Create();
   }
+
+  // Timer DPCs get their own worker: the dispatch queue also runs overlapped
+  // completions that sleep.
+  if (!timer_dpc_thread_) {
+    {
+      std::lock_guard<std::mutex> lock(timer_dpc_mutex_);
+      timer_dpc_thread_running_ = true;
+    }
+    timer_dpc_thread_ = object_ref<XHostThread>(new XHostThread(
+        this, 128 * 1024, 0,
+        [this]() {
+          timer_dpc_thread_->set_can_debugger_suspend(true);
+          std::unique_lock<std::mutex> lock(timer_dpc_mutex_);
+          while (timer_dpc_thread_running_) {
+            if (timer_dpc_queue_.empty()) {
+              timer_dpc_cond_.wait(lock);
+              continue;
+            }
+            const QueuedTimerDpc dpc = timer_dpc_queue_.front();
+            timer_dpc_queue_.pop_front();
+            lock.unlock();
+            // Runs without the global lock: a DPC waiting on a compile would
+            // deadlock with it.
+            xboxkrnl::xeKeExecuteDpc(dpc.dpc_ptr, dpc.arg1, dpc.arg2);
+            lock.lock();
+          }
+          return 0;
+        },
+        GetSystemProcess()));
+    timer_dpc_thread_->set_name("Timer DPC");
+    timer_dpc_thread_->Create();
+  }
+}
+
+bool KernelState::QueueTimerDpc(uint32_t dpc_ptr, uint32_t arg1,
+                                uint32_t arg2) {
+  std::lock_guard<std::mutex> lock(timer_dpc_mutex_);
+  if (!timer_dpc_thread_running_ ||
+      std::any_of(timer_dpc_queue_.cbegin(), timer_dpc_queue_.cend(),
+                  [dpc_ptr](const QueuedTimerDpc& queued) {
+                    return queued.dpc_ptr == dpc_ptr;
+                  })) {
+    return false;
+  }
+  timer_dpc_queue_.push_back({dpc_ptr, arg1, arg2});
+  timer_dpc_cond_.notify_one();
+  return true;
 }
 
 void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
@@ -887,6 +960,13 @@ void KernelState::InitXmpVolumePatch() {
 void KernelState::TerminateTitle() {
   XELOGD("KernelState::TerminateTitle");
   xmp_volume_patch_.reset();
+
+  // Pending timer DPCs target title code that is about to go away.
+  {
+    std::lock_guard<std::mutex> lock(timer_dpc_mutex_);
+    timer_dpc_queue_.clear();
+  }
+
   auto global_lock = global_critical_region_.Acquire();
 
   // Call terminate routines.
@@ -944,6 +1024,16 @@ void KernelState::TerminateTitle() {
   // Unset the executable module.
   executable_module_ = nullptr;
 
+  // The title's threads are gone, so user-mode mappings and frames can retire.
+  // Manager methods never take the global lock.
+  if (XThread::IsInThread()) {
+    // XThread::Terminate finishes the reset once this thread is marked
+    // exited.
+    deferred_user_mode_title_reset_.store(true, std::memory_order_release);
+  } else {
+    user_mode_kernel_runtime_->ResetTitle();
+  }
+
   if (XThread::IsInThread()) {
     threads_by_id_.erase(XThread::GetCurrentThread()->thread_id());
 
@@ -954,17 +1044,34 @@ void KernelState::TerminateTitle() {
   }
 }
 
+void KernelState::FinalizeDeferredUserModeTitleReset() {
+  if (!deferred_user_mode_title_reset_.exchange(false,
+                                                std::memory_order_acq_rel)) {
+    return;
+  }
+  user_mode_kernel_runtime_->ResetTitle();
+  // Emulator::TerminateTitle can't finish for a guest caller; finish it now
+  // that the thread has exited.
+  emulator_->FinalizeDeferredGuestTitleTermination();
+}
+
 void KernelState::RegisterThread(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
   threads_by_id_[thread->thread_id()] = thread;
 }
 
 void KernelState::UnregisterThread(XThread* thread) {
-  auto global_lock = global_critical_region_.Acquire();
-  auto it = threads_by_id_.find(thread->thread_id());
-  if (it != threads_by_id_.end()) {
-    threads_by_id_.erase(it);
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    auto it = threads_by_id_.find(thread->thread_id());
+    if (it != threads_by_id_.end()) {
+      threads_by_id_.erase(it);
+    }
   }
+
+  // Outside the global lock. User-mode state is keyed by the emulated thread
+  // ID.
+  user_mode_kernel_runtime_->OnThreadDestroyed(thread->thread_id());
 }
 
 void KernelState::OnThreadExecute(XThread* thread) {

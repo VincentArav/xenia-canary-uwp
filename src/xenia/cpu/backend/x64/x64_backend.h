@@ -83,6 +83,8 @@ enum : uint32_t {
       2,  // non-java mode bit is currently set. for use in software fp routines
   kX64BackendNonIEEEMode =
       3,  // non-ieee mode is currently enabled for scalar fpu.
+  // Set while checked_reserve_identity holds a checked reservation.
+  kX64BackendHasCheckedReserveBit = 4,
 };
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
@@ -111,6 +113,13 @@ struct X64BackendContext {
   unsigned int flags;
   unsigned int Ox1000;  // constant 0x1000 so we can shrink each tail emitted
                         // add of it by... 2 bytes lol
+  uint64_t checked_reserve_value;
+  uint64_t checked_reserve_domain_id;
+  uint32_t checked_reserve_effective_address;
+  uint32_t checked_reserve_byte_count;
+  // Opaque checked-memory backing identity. The active GuestMemoryAccessor
+  // owns its meaning; it is valid only while the checked reserve flag is set.
+  uint32_t checked_reserve_identity[4];
 };
 constexpr unsigned int DEFAULT_VMX_MXCSR =
     0x8000 |                   // flush to zero
@@ -124,6 +133,10 @@ class X64Backend : public Backend {
 
   explicit X64Backend();
   ~X64Backend() override;
+
+  bool SupportsCheckedGuestMemoryAccess() const noexcept override {
+    return true;
+  }
 
   X64CodeCache* code_cache() const { return code_cache_.get(); }
   uintptr_t emitter_data() const { return emitter_data_; }

@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/module.h"
 
+#include "xenia/base/assert.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/processor.h"
@@ -16,10 +17,17 @@
 namespace xe {
 namespace cpu {
 
-Module::Module(Processor* processor)
-    : processor_(processor), memory_(processor->memory()) {}
+Module::Module(Processor* processor,
+               TranslationDomainKey translation_domain_key)
+    : processor_(processor),
+      memory_(processor->memory()),
+      translation_domain_key_(translation_domain_key) {}
 
 Module::~Module() = default;
+
+const TranslationDomainKey& Symbol::translation_domain_key() const {
+  return module_->translation_domain_key();
+}
 
 bool Module::ContainsAddress(uint32_t address) { return true; }
 
@@ -143,12 +151,127 @@ Symbol::Status Module::DefineVariable(Symbol* symbol) {
 }
 
 const std::vector<uint32_t> Module::GetAddressedFunctions() {
+  auto global_lock = global_critical_region_.Acquire();
   std::vector<uint32_t> addresses;
 
   for (const auto& [key, _] : map_) {
     addresses.push_back(key);
   }
   return addresses;
+}
+
+std::vector<uint32_t> Module::GetInstalledGuestFunctionAddresses(
+    bool include_externs) {
+  auto global_lock = global_critical_region_.Acquire();
+  std::vector<uint32_t> addresses;
+  for (const auto& [address, symbol] : map_) {
+    if (symbol->type() != Symbol::Type::kFunction) {
+      continue;
+    }
+    auto* function = dynamic_cast<GuestFunction*>(symbol);
+    if (!function || !function->machine_code() ||
+        (!include_externs &&
+         function->behavior() == Function::Behavior::kExtern)) {
+      continue;
+    }
+    addresses.push_back(address);
+  }
+  return addresses;
+}
+
+std::vector<uint32_t> Module::GuestFunctionInvalidationPlan::addresses() const {
+  std::vector<uint32_t> result;
+  result.reserve(replacements.size());
+  for (const Replacement& replacement : replacements) {
+    result.push_back(replacement.old_function->address());
+  }
+  return result;
+}
+
+bool Module::PrepareGuestFunctionsForInvalidation(
+    GuestFunctionInvalidationPlan* plan_out,
+    const GuestFunctionInvalidationFilter& filter) {
+  if (!plan_out || plan_out->module || !plan_out->replacements.empty()) {
+    return false;
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  plan_out->module = this;
+
+  // Create every replacement before publishing any, so a failure leaves the
+  // module unchanged.
+  for (size_t i = 0; i < list_.size(); ++i) {
+    Symbol* symbol = list_[i].get();
+    if (symbol->type() != Symbol::Type::kFunction) {
+      continue;
+    }
+    auto* old_function = dynamic_cast<GuestFunction*>(symbol);
+    if (!old_function ||
+        old_function->behavior() == Function::Behavior::kExtern) {
+      continue;
+    }
+
+    // Only defined and failed functions are replaced; a failed one gets
+    // another try.
+    if (old_function->status() != Symbol::Status::kDefined &&
+        old_function->status() != Symbol::Status::kFailed) {
+      continue;
+    }
+    if (filter && !filter(*old_function)) {
+      continue;
+    }
+
+    std::unique_ptr<Function> new_function =
+        CreateFunction(old_function->address());
+    if (!new_function) {
+      plan_out->replacements.clear();
+      plan_out->module = nullptr;
+      return false;
+    }
+    if (preserves_declaration_metadata_on_invalidation()) {
+      new_function->CopyDeclarationMetadataFrom(*old_function);
+      new_function->set_status(Symbol::Status::kNew);
+    } else {
+      // Declare it now: other threads may look it up once it is published.
+      new_function->set_status(Symbol::Status::kDeclared);
+    }
+    plan_out->replacements.push_back(GuestFunctionInvalidationPlan::Replacement{
+        i, old_function, std::move(new_function)});
+  }
+  return true;
+}
+
+size_t Module::CommitGuestFunctionsForInvalidation(
+    GuestFunctionInvalidationPlan&& plan) {
+  assert_true(plan.module == this);
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& replacement : plan.replacements) {
+    // The Processor holds the resolution lock exclusively from prepare to
+    // commit.
+    assert_true(replacement.symbol_index < list_.size());
+    assert_true(list_[replacement.symbol_index].get() ==
+                replacement.old_function);
+    const auto map_it = map_.find(replacement.old_function->address());
+    assert_true(map_it != map_.end());
+    assert_true(map_it->second == replacement.old_function);
+    replacement.old_function->Retire();
+    retired_list_.push_back(std::move(list_[replacement.symbol_index]));
+    map_it->second = replacement.new_function.get();
+    list_[replacement.symbol_index] = std::move(replacement.new_function);
+  }
+  const size_t replacement_count = plan.replacements.size();
+  plan.replacements.clear();
+  plan.module = nullptr;
+  return replacement_count;
+}
+
+void Module::RetireGuestFunctionsForUnload() {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& symbol : list_) {
+    if (auto* function = dynamic_cast<GuestFunction*>(symbol.get())) {
+      function->Retire();
+    }
+  }
 }
 
 void Module::ForEachFunction(std::function<void(Function*)> callback) {

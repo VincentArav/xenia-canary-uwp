@@ -8,6 +8,10 @@
  */
 
 #include "xenia/vfs/virtual_file_system.h"
+
+#include <algorithm>
+#include <new>
+
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 
@@ -22,6 +26,30 @@ namespace vfs {
 
 using namespace xe::literals;
 
+namespace {
+
+constexpr size_t kMaxSymbolicLinkResolutionHops = 64;
+
+bool IsGuestPathParentOrEqual(std::string_view parent, std::string_view child) {
+  if (parent.empty() || !xe::utf8::starts_with_case(child, parent)) {
+    return false;
+  }
+  if (parent.size() == child.size()) {
+    return true;
+  }
+  // canonicalize_guest_path removes trailing separators except for an
+  // absolute root. Drive aliases still require the separator: "X:foo" is not
+  // a child of "X:", while "X:\\foo" is.
+  return parent.back() == '\\' || child[parent.size()] == '\\';
+}
+
+bool GuestPathNamespacesOverlap(std::string_view left, std::string_view right) {
+  return IsGuestPathParentOrEqual(left, right) ||
+         IsGuestPathParentOrEqual(right, left);
+}
+
+}  // namespace
+
 VirtualFileSystem::VirtualFileSystem() {}
 
 VirtualFileSystem::~VirtualFileSystem() {
@@ -31,21 +59,84 @@ VirtualFileSystem::~VirtualFileSystem() {
 }
 
 void VirtualFileSystem::Clear() {
-  devices_.clear();
+  auto global_lock = global_critical_region_.Acquire();
   symlinks_.clear();
+  devices_.clear();
+  mount_groups_.clear();
 }
 
-bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
+VirtualFileSystem::RegistrationToken
+VirtualFileSystem::AllocateRegistrationTokenLocked() {
+  RegistrationToken token = next_registration_token_++;
+  if (token == kInvalidRegistrationToken) {
+    token = next_registration_token_++;
+  }
+  return token;
+}
+
+bool VirtualFileSystem::HasMountGroupPathConflictLocked(
+    std::string_view normalized_path) const {
+  return std::find_if(mount_groups_.cbegin(), mount_groups_.cend(),
+                      [&](const RegisteredMountGroup& group) {
+                        return std::find_if(
+                                   group.namespace_paths.cbegin(),
+                                   group.namespace_paths.cend(),
+                                   [&](const std::string& reserved_path) {
+                                     return GuestPathNamespacesOverlap(
+                                         normalized_path, reserved_path);
+                                   }) != group.namespace_paths.cend();
+                      }) != mount_groups_.cend();
+}
+
+bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device,
+                                       RegistrationToken* registration_token) {
+  if (!device) {
+    return false;
+  }
+
   auto global_lock = global_critical_region_.Acquire();
-  devices_.emplace_back(std::move(device));
+  const std::string normalized_mount_path =
+      xe::utf8::canonicalize_guest_path(device->mount_path());
+  if (normalized_mount_path.empty()) {
+    return false;
+  }
+  if (HasMountGroupPathConflictLocked(normalized_mount_path)) {
+    XELOGE("Device path overlaps an active mount-group reservation: {}",
+           device->mount_path());
+    return false;
+  }
+  const auto existing =
+      std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& item) {
+        return xe::utf8::equal_case(
+            xe::utf8::canonicalize_guest_path(item.device->mount_path()),
+            normalized_mount_path);
+      });
+  if (existing != devices_.cend()) {
+    XELOGE("Trying to re-register already registered device: {}",
+           device->mount_path());
+    return false;
+  }
+
+  XELOGD("Registered device: {}", device->mount_path());
+  const RegistrationToken token = AllocateRegistrationTokenLocked();
+  devices_.push_back({token, kInvalidRegistrationToken, std::move(device)});
+  if (registration_token) {
+    *registration_token = token;
+  }
   return true;
 }
 
 bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
   for (auto it = devices_.begin(); it != devices_.end(); ++it) {
-    if ((*it)->mount_path() == path) {
-      XELOGD("Unregistered device: {}", (*it)->mount_path());
+    if (xe::utf8::equal_case(
+            xe::utf8::canonicalize_guest_path(it->device->mount_path()),
+            normalized_path)) {
+      if (it->mount_group_token != kInvalidRegistrationToken) {
+        return false;
+      }
+      XELOGD("Unregistered device: {}", it->device->mount_path());
       devices_.erase(it);
       return true;
     }
@@ -53,19 +144,78 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   return false;
 }
 
-bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
-                                             const std::string_view target) {
+bool VirtualFileSystem::UnregisterDevice(RegistrationToken registration_token) {
+  if (registration_token == kInvalidRegistrationToken) {
+    return false;
+  }
   auto global_lock = global_critical_region_.Acquire();
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  const auto it =
+      std::find_if(devices_.begin(), devices_.end(), [&](const auto& device) {
+        return device.mount_group_token == kInvalidRegistrationToken &&
+               device.token == registration_token;
+      });
+  if (it == devices_.end()) {
+    return false;
+  }
+  XELOGD("Unregistered device: {}", it->device->mount_path());
+  devices_.erase(it);
+  return true;
+}
+
+bool VirtualFileSystem::IsDeviceRegistered(const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  return std::find_if(
+             devices_.cbegin(), devices_.cend(), [&](const auto& device) {
+               return xe::utf8::equal_case(xe::utf8::canonicalize_guest_path(
+                                               device.device->mount_path()),
+                                           normalized_path);
+             }) != devices_.cend();
+}
+
+bool VirtualFileSystem::HasDeviceMountPathConflict(
+    const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  return std::find_if(devices_.cbegin(), devices_.cend(),
+                      [&](const auto& device) {
+                        const std::string normalized_mount_path =
+                            xe::utf8::canonicalize_guest_path(
+                                device.device->mount_path());
+                        return GuestPathNamespacesOverlap(
+                            normalized_path, normalized_mount_path);
+                      }) != devices_.cend();
+}
+
+bool VirtualFileSystem::RegisterSymbolicLink(
+    const std::string_view path, const std::string_view target,
+    RegistrationToken* registration_token) {
+  auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  if (normalized_path.empty()) {
+    return false;
+  }
+  if (HasMountGroupPathConflictLocked(normalized_path)) {
+    XELOGE("Symbolic-link path overlaps an active mount-group reservation: {}",
+           path);
+    return false;
+  }
+  auto it =
+      std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+        return xe::utf8::equal_case(normalized_path, s.first);
+      });
   if (it != symlinks_.end()) {
     XELOGE("Trying to re-register already registered symbolic link: {} => {}",
            path, target);
     return false;
   }
 
-  symlinks_.insert({std::string(path), std::string(target)});
+  const RegistrationToken token = AllocateRegistrationTokenLocked();
+  symlinks_.insert({normalized_path,
+                    {token, kInvalidRegistrationToken, std::string(target)}});
+  if (registration_token) {
+    *registration_token = token;
+  }
   XELOGD("Registered symbolic link: {} => {}", path, target);
 
   return true;
@@ -73,57 +223,286 @@ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
 
 bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  auto it =
+      std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+        return xe::utf8::equal_case(normalized_path, s.first);
+      });
   if (it == symlinks_.end()) {
     return false;
   }
-  XELOGD("Unregistered symbolic link: {} => {}", it->first, it->second);
+  if (it->second.mount_group_token != kInvalidRegistrationToken) {
+    return false;
+  }
+  XELOGD("Unregistered symbolic link: {} => {}", it->first, it->second.target);
 
   symlinks_.erase(it);
   return true;
 }
 
+bool VirtualFileSystem::UnregisterSymbolicLink(
+    RegistrationToken registration_token) {
+  if (registration_token == kInvalidRegistrationToken) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const auto it = std::find_if(
+      symlinks_.begin(), symlinks_.end(), [&](const auto& symbolic_link) {
+        return symbolic_link.second.mount_group_token ==
+                   kInvalidRegistrationToken &&
+               symbolic_link.second.token == registration_token;
+      });
+  if (it == symlinks_.end()) {
+    return false;
+  }
+  XELOGD("Unregistered symbolic link: {} => {}", it->first, it->second.target);
+  symlinks_.erase(it);
+  return true;
+}
+
 bool VirtualFileSystem::IsSymbolicLinkRegistered(const std::string_view path) {
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  auto it =
+      std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+        return xe::utf8::equal_case(normalized_path, s.first);
+      });
 
   return it != symlinks_.cend();
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path,
                                          std::string& target) {
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::starts_with_case(path, s.first); });
-  if (it == symlinks_.cend()) {
+  auto global_lock = global_critical_region_.Acquire();
+  const std::string normalized_path = xe::utf8::canonicalize_guest_path(path);
+  auto best = symlinks_.cend();
+  size_t best_length = 0;
+  for (auto it = symlinks_.cbegin(); it != symlinks_.cend(); ++it) {
+    if (IsGuestPathParentOrEqual(it->first, normalized_path) &&
+        it->first.size() >= best_length) {
+      best = it;
+      best_length = it->first.size();
+    }
+  }
+  if (best == symlinks_.cend()) {
     return false;
   }
-  target = (*it).second;
+  target = best->second.target;
   return true;
 }
 
-bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
-                                            std::string& result) {
-  result = path;
-  bool was_resolved = false;
+bool VirtualFileSystem::RegisterMountGroup(
+    MountGroup group, RegistrationToken* registration_token) {
+  if (!registration_token ||
+      (group.devices.empty() && group.symbolic_links.empty())) {
+    return false;
+  }
+  *registration_token = kInvalidRegistrationToken;
+
+  std::vector<std::string> device_paths;
+  std::vector<std::string> symbolic_link_paths;
+  std::vector<std::string> namespace_paths;
+  device_paths.reserve(group.devices.size());
+  symbolic_link_paths.reserve(group.symbolic_links.size());
+  namespace_paths.reserve(group.devices.size() + group.symbolic_links.size());
+
+  for (const std::unique_ptr<Device>& device : group.devices) {
+    if (!device) {
+      return false;
+    }
+    std::string normalized_path =
+        xe::utf8::canonicalize_guest_path(device->mount_path());
+    if (normalized_path.empty() ||
+        std::find_if(device_paths.cbegin(), device_paths.cend(),
+                     [&](const std::string& existing_path) {
+                       return xe::utf8::equal_case(normalized_path,
+                                                   existing_path);
+                     }) != device_paths.cend()) {
+      return false;
+    }
+    device_paths.push_back(normalized_path);
+    namespace_paths.push_back(std::move(normalized_path));
+  }
+
+  for (MountGroupSymbolicLink& symbolic_link : group.symbolic_links) {
+    std::string normalized_path =
+        xe::utf8::canonicalize_guest_path(symbolic_link.path);
+    if (normalized_path.empty() || symbolic_link.target.empty() ||
+        std::find_if(symbolic_link_paths.cbegin(), symbolic_link_paths.cend(),
+                     [&](const std::string& existing_path) {
+                       return GuestPathNamespacesOverlap(normalized_path,
+                                                         existing_path);
+                     }) != symbolic_link_paths.cend()) {
+      return false;
+    }
+    // A link may not replace or contain a device of its own group; a link
+    // inside one of its devices is allowed.
+    if (std::find_if(
+            device_paths.cbegin(), device_paths.cend(),
+            [&](const std::string& device_path) {
+              return xe::utf8::equal_case(normalized_path, device_path) ||
+                     (GuestPathNamespacesOverlap(normalized_path,
+                                                 device_path) &&
+                      !IsGuestPathParentOrEqual(device_path, normalized_path));
+            }) != device_paths.cend()) {
+      return false;
+    }
+    symbolic_link_paths.push_back(normalized_path);
+    symbolic_link.path = normalized_path;
+    namespace_paths.push_back(std::move(normalized_path));
+  }
+
+  // Devices may nest within a group. Put the most specific first: resolution
+  // takes the first matching device.
+  std::stable_sort(
+      group.devices.begin(), group.devices.end(),
+      [](const std::unique_ptr<Device>& left,
+         const std::unique_ptr<Device>& right) {
+        return xe::utf8::canonicalize_guest_path(left->mount_path()).size() >
+               xe::utf8::canonicalize_guest_path(right->mount_path()).size();
+      });
+
+  auto global_lock = global_critical_region_.Acquire();
+  for (const std::string& proposed_path : namespace_paths) {
+    const bool device_conflict =
+        std::find_if(devices_.cbegin(), devices_.cend(),
+                     [&](const RegisteredDevice& existing_device) {
+                       return GuestPathNamespacesOverlap(
+                           proposed_path,
+                           xe::utf8::canonicalize_guest_path(
+                               existing_device.device->mount_path()));
+                     }) != devices_.cend();
+    const bool symbolic_link_conflict =
+        std::find_if(symlinks_.cbegin(), symlinks_.cend(),
+                     [&](const auto& existing_symbolic_link) {
+                       return GuestPathNamespacesOverlap(
+                           proposed_path, existing_symbolic_link.first);
+                     }) != symlinks_.cend();
+    if (device_conflict || symbolic_link_conflict ||
+        HasMountGroupPathConflictLocked(proposed_path)) {
+      return false;
+    }
+  }
+
+  const RegistrationToken group_token = AllocateRegistrationTokenLocked();
+  auto rollback_group = [&]() {
+    for (auto it = symlinks_.begin(); it != symlinks_.end();) {
+      if (it->second.mount_group_token == group_token) {
+        it = symlinks_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    devices_.erase(std::remove_if(devices_.begin(), devices_.end(),
+                                  [&](const RegisteredDevice& device) {
+                                    return device.mount_group_token ==
+                                           group_token;
+                                  }),
+                   devices_.end());
+    mount_groups_.erase(
+        std::remove_if(mount_groups_.begin(), mount_groups_.end(),
+                       [&](const RegisteredMountGroup& mount_group) {
+                         return mount_group.token == group_token;
+                       }),
+        mount_groups_.end());
+  };
+
+  try {
+    devices_.reserve(devices_.size() + group.devices.size());
+    symlinks_.reserve(symlinks_.size() + group.symbolic_links.size());
+    mount_groups_.reserve(mount_groups_.size() + 1);
+    mount_groups_.push_back({group_token, std::move(namespace_paths)});
+    for (std::unique_ptr<Device>& device : group.devices) {
+      devices_.push_back(
+          {kInvalidRegistrationToken, group_token, std::move(device)});
+    }
+    for (MountGroupSymbolicLink& symbolic_link : group.symbolic_links) {
+      const bool inserted =
+          symlinks_
+              .emplace(
+                  std::move(symbolic_link.path),
+                  RegisteredSymbolicLink{kInvalidRegistrationToken, group_token,
+                                         std::move(symbolic_link.target)})
+              .second;
+      if (!inserted) {
+        rollback_group();
+        return false;
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    rollback_group();
+    return false;
+  }
+
+  *registration_token = group_token;
+  XELOGD("Registered VFS mount group: {}", group_token);
+  return true;
+}
+
+bool VirtualFileSystem::UnregisterMountGroup(
+    RegistrationToken registration_token) {
+  if (registration_token == kInvalidRegistrationToken) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const auto group_it = std::find_if(mount_groups_.begin(), mount_groups_.end(),
+                                     [&](const RegisteredMountGroup& group) {
+                                       return group.token == registration_token;
+                                     });
+  if (group_it == mount_groups_.end()) {
+    return false;
+  }
+
+  for (auto it = symlinks_.begin(); it != symlinks_.end();) {
+    if (it->second.mount_group_token == registration_token) {
+      it = symlinks_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  devices_.erase(std::remove_if(devices_.begin(), devices_.end(),
+                                [&](const RegisteredDevice& device) {
+                                  return device.mount_group_token ==
+                                         registration_token;
+                                }),
+                 devices_.end());
+  mount_groups_.erase(group_it);
+  XELOGD("Unregistered VFS mount group: {}", registration_token);
+  return true;
+}
+
+VirtualFileSystem::SymbolicLinkResolution
+VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
+                                       std::string& result) {
+  result = xe::utf8::canonicalize_guest_path(path);
+  size_t hop_count = 0;
   while (true) {
-    auto it =
-        std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
-          return xe::utf8::starts_with_case(result, s.first);
-        });
-    if (it == symlinks_.cend()) {
+    auto best = symlinks_.cend();
+    size_t best_length = 0;
+    for (auto it = symlinks_.cbegin(); it != symlinks_.cend(); ++it) {
+      if (IsGuestPathParentOrEqual(it->first, result) &&
+          it->first.size() >= best_length) {
+        best = it;
+        best_length = it->first.size();
+      }
+    }
+    if (best == symlinks_.cend()) {
       break;
     }
+    // An acyclic chain can't cross more links than exist; the fixed ceiling
+    // also bounds the work in a large namespace.
+    if (hop_count++ >=
+        std::min(symlinks_.size(), kMaxSymbolicLinkResolutionHops)) {
+      result.clear();
+      return SymbolicLinkResolution::kFailed;
+    }
     // Found symlink!
-    auto target_path = (*it).second;
-    auto relative_path = result.substr((*it).first.size());
-    result = target_path + relative_path;
-    was_resolved = true;
+    auto target_path = best->second.target;
+    auto relative_path = result.substr(best->first.size());
+    result = xe::utf8::canonicalize_guest_path(target_path + relative_path);
   }
-  return was_resolved;
+  return hop_count ? SymbolicLinkResolution::kResolved
+                   : SymbolicLinkResolution::kUnchanged;
 }
 
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
@@ -134,14 +513,23 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
 
   // Resolve symlinks.
   std::string resolved_path;
-  if (ResolveSymbolicLink(normalized_path, resolved_path)) {
-    normalized_path = resolved_path;
+  switch (ResolveSymbolicLink(normalized_path, resolved_path)) {
+    case SymbolicLinkResolution::kResolved:
+      normalized_path = resolved_path;
+      break;
+    case SymbolicLinkResolution::kFailed:
+      XELOGE("ResolvePath({}) failed - symbolic-link cycle", path);
+      return nullptr;
+    case SymbolicLinkResolution::kUnchanged:
+      break;
   }
 
   // Find the device.
   auto it =
       std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-        return xe::utf8::starts_with(normalized_path, d->mount_path());
+        return IsGuestPathParentOrEqual(
+            xe::utf8::canonicalize_guest_path(d.device->mount_path()),
+            normalized_path);
       });
   if (it == devices_.cend()) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
@@ -152,8 +540,10 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
-  auto relative_path = normalized_path.substr(device->mount_path().size());
+  const auto& device = it->device;
+  const std::string normalized_mount_path =
+      xe::utf8::canonicalize_guest_path(device->mount_path());
+  auto relative_path = normalized_path.substr(normalized_mount_path.size());
   return device->ResolvePath(relative_path);
 }
 
@@ -161,22 +551,38 @@ Entry* VirtualFileSystem::CreatePath(const std::string_view path,
                                      uint32_t attributes) {
   // Create all required directories recursively.
   auto path_parts = xe::utf8::split_path(path);
-  if (path_parts.empty()) {
+  if (path_parts.size() < 2) {
     return nullptr;
   }
-  auto partial_path = std::string(path_parts[0]);
-  auto partial_entry = ResolvePath(partial_path);
-  if (!partial_entry) {
-    return nullptr;
-  }
-  auto parent_entry = partial_entry;
-  for (size_t i = 1; i < path_parts.size() - 1; ++i) {
-    partial_path = xe::utf8::join_guest_paths(partial_path, path_parts[i]);
-    auto child_entry = ResolvePath(partial_path);
-    if (!child_entry) {
-      child_entry =
-          parent_entry->CreateEntry(path_parts[i], kFileAttributeDirectory);
+  // Start from the deepest existing ancestor. An absolute device path keeps
+  // its leading separator, and its device root may span several components
+  // ("\Device\Harddisk0\Partition1"), so the first component alone need not
+  // resolve.
+  const bool absolute = path.front() == '\\' || path.front() == '/';
+  auto make_prefix = [&](size_t component_count) {
+    std::string prefix = absolute ? "\\" : "";
+    for (size_t i = 0; i < component_count; ++i) {
+      if (i) {
+        prefix += '\\';
+      }
+      prefix += path_parts[i];
     }
+    return prefix;
+  };
+  Entry* parent_entry = nullptr;
+  size_t existing_count = path_parts.size() - 1;
+  for (; existing_count; --existing_count) {
+    parent_entry = ResolvePath(make_prefix(existing_count));
+    if (parent_entry) {
+      break;
+    }
+  }
+  if (!parent_entry) {
+    return nullptr;
+  }
+  for (size_t i = existing_count; i < path_parts.size() - 1; ++i) {
+    auto child_entry =
+        parent_entry->CreateEntry(path_parts[i], kFileAttributeDirectory);
     if (!child_entry) {
       return nullptr;
     }
@@ -244,13 +650,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
-    // If the entry does not exist on the host then remove the cached entry
+    // If the entry does not exist on the host then remove the cached entry.
+    // The parent decides where a child lives: a root overlay stores writable
+    // children outside the parent's listed host directory.
     if (parent_entry) {
       const xe::vfs::HostPathEntry* host_path =
           dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
 
       if (host_path) {
-        auto const file_path = host_path->host_path() / entry->name();
+        auto const file_path = host_path->ChildHostPath(*entry);
 
         if (!std::filesystem::exists(file_path)) {
           // Remove cached entry
@@ -286,7 +694,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   // Verify permissions.
   bool wants_write = desired_access & FileAccess::kFileWriteData ||
                      desired_access & FileAccess::kFileAppendData;
-  if (wants_write && ((parent_entry && parent_entry->is_read_only()) ||
+  if (wants_write && ((parent_entry && !parent_entry->can_create_children()) ||
                       (entry && entry->is_read_only()))) {
     // Fail if read only device and wants write.
     // return X_STATUS_ACCESS_DENIED;

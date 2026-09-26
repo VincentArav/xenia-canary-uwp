@@ -10,9 +10,11 @@
 #ifndef XENIA_EMULATOR_H_
 #define XENIA_EMULATOR_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -54,6 +56,10 @@ namespace ui {
 class ImGuiDrawer;
 class Window;
 }  // namespace ui
+namespace xefu {
+struct MountedXefuSession;
+struct XefuLaunchRequest;
+}  // namespace xefu
 }  // namespace xe
 
 namespace xe {
@@ -129,6 +135,11 @@ class Emulator {
 
   // Are we currently running a title?
   bool is_title_open() const { return title_id_.has_value(); }
+
+  // The running XeFu session's mounts, or null.
+  const xefu::MountedXefuSession* mounted_xefu_session() const {
+    return mounted_xefu_session_.get();
+  }
 
   // Window used for displaying graphical output. Can be null.
   ui::Window* display_window() const { return display_window_; }
@@ -207,6 +218,10 @@ class Emulator {
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
 
+  // Finishes a title termination that a guest thread started; called by
+  // KernelState once that thread has exited.
+  void FinalizeDeferredGuestTitleTermination();
+
   const std::unique_ptr<vfs::Device> CreateVfsDevice(
       const std::filesystem::path& path, const std::string_view mount_path);
 
@@ -222,6 +237,7 @@ class Emulator {
     PIRS,
     XISO,
     ZAR,
+    XBE,
     EXE,
     Unknown
   };
@@ -233,6 +249,9 @@ class Emulator {
   // This will attempt to infer the type of the given file (such as an iso, etc)
   // using heuristics.
   X_STATUS LaunchPath(const std::filesystem::path& path);
+
+  // Launches a prepared XeFu session.
+  X_STATUS LaunchXefuTitle(const xefu::XefuLaunchRequest& request);
 
   // Launches a game from a .xex file by mounting the containing folder as if it
   // was an extracted STFS container.
@@ -333,6 +352,7 @@ class Emulator {
   static void SetPersistentEmulatorFlags(uint64_t new_flags);
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  void FinalizeTitleTerminationOwnership(bool release_main_thread);
 
   void AddGameConfigLoadCallback(GameConfigLoadCallback* callback);
   void RemoveGameConfigLoadCallback(GameConfigLoadCallback* callback);
@@ -340,7 +360,9 @@ class Emulator {
   std::string FindLaunchModule();
 
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
-                          const std::string_view module_path);
+                          const std::string_view module_path,
+                          bool defer_main_thread_resume = false);
+  void RollbackFailedXefuLaunch(bool launch_was_announced = false);
 
   std::filesystem::path command_line_;
   std::filesystem::path storage_root_;
@@ -367,6 +389,13 @@ class Emulator {
   std::unique_ptr<patcher::PluginLoader> plugin_loader_;
 
   std::unique_ptr<kernel::KernelState> kernel_state_;
+
+  // Reset only with title threads stopped and file_system_ alive.
+  std::unique_ptr<xefu::MountedXefuSession> mounted_xefu_session_;
+  // Set when a guest thread terminates the XeFu title;
+  // FinalizeDeferredGuestTitleTermination finishes after that thread exits.
+  std::atomic<bool> deferred_guest_title_termination_{false};
+  std::mutex title_termination_mutex_;
 
   // Accessible only from the thread that invokes those callbacks (the UI thread
   // if the UI is available).

@@ -9,10 +9,48 @@
 
 #include "xenia/base/filesystem.h"
 
+#include "xenia/base/platform.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 
 namespace xe {
 namespace filesystem {
+
+namespace {
+
+std::string HostPathOverlapKey(const std::filesystem::path& path) {
+  std::error_code error;
+  std::filesystem::path absolute = std::filesystem::absolute(path, error);
+  if (error) {
+    absolute = path;
+  }
+  std::string key = path_to_utf8(absolute.lexically_normal());
+#if XE_PLATFORM_WIN32
+  key = utf8::lower_ascii(key);
+#endif
+  while (key.size() > 1 && (key.back() == '\\' || key.back() == '/')) {
+    key.pop_back();
+  }
+  return key;
+}
+
+bool IsHostPathKeyParentOrEqual(std::string_view parent,
+                                std::string_view child) {
+  return !parent.empty() && child.starts_with(parent) &&
+         (child.size() == parent.size() || parent.back() == '\\' ||
+          parent.back() == '/' || child[parent.size()] == '\\' ||
+          child[parent.size()] == '/');
+}
+
+}  // namespace
+
+bool HostPathsOverlap(const std::filesystem::path& left,
+                      const std::filesystem::path& right) {
+  const std::string left_key = HostPathOverlapKey(left);
+  const std::string right_key = HostPathOverlapKey(right);
+  return IsHostPathKeyParentOrEqual(left_key, right_key) ||
+         IsHostPathKeyParentOrEqual(right_key, left_key);
+}
 
 bool CreateParentFolder(const std::filesystem::path& path) {
   if (path.has_parent_path()) {

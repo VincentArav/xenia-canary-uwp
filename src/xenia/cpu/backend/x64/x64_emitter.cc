@@ -11,8 +11,11 @@
 
 #include <stddef.h>
 
+#include <algorithm>
+#include <array>
 #include <climits>
 #include <cstring>
+#include <unordered_map>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -25,6 +28,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/vec128.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
+#include "xenia/cpu/backend/x64/x64_checked_memory.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
 #include "xenia/cpu/backend/x64/x64_sequences.h"
@@ -38,6 +42,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/cpu/translation_domain_registry.h"
 
 DEFINE_bool(debugprint_trap_log, false,
             "Log debugprint traps to the active debugger", "CPU");
@@ -115,6 +120,19 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   SCOPE_profile_cpu_f("cpu");
   guest_module_ = dynamic_cast<XexModule*>(function->module());
   current_guest_function_ = function->address();
+  checked_memory_descriptor_ = nullptr;
+  if (function->translation_domain_key().memory_access_mode() ==
+      MemoryAccessMode::kChecked) {
+    checked_memory_descriptor_ =
+        processor_->translation_domain_registry()->Lookup(
+            function->translation_domain_key());
+    if (!checked_memory_descriptor_ ||
+        !checked_memory_descriptor_->guest_memory_accessor()) {
+      return false;
+    }
+  }
+  current_guest_call_dispatch_mode_ =
+      GetGuestCallDispatchMode(function->translation_domain_key());
   // Reset.
   debug_info_ = debug_info;
   debug_info_flags_ = debug_info_flags;
@@ -296,13 +314,23 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
         }
       }
       const Instr* new_tail = instr;
-      if (!SelectSequence(this, instr, &new_tail)) {
+      const bool is_checked_memory =
+          checked_memory_descriptor_ &&
+          (instr->opcode->flags & hir::OPCODE_FLAG_MEMORY) != 0;
+      bool selected;
+      if (is_checked_memory) {
+        selected = SelectCheckedGuestMemorySequence(this, instr);
+        new_tail = instr->next;
+      } else {
+        selected = SelectSequence(this, instr, &new_tail);
+      }
+      if (!selected) {
         // No sequence found!
         // NOTE: If you encounter this after adding a new instruction, do a full
         // rebuild!
         assert_always();
         XELOGE("Unable to process HIR opcode {}", GetOpcodeName(instr->opcode));
-        break;
+        return false;
       }
       instr = new_tail;
     }
@@ -467,14 +495,90 @@ void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
   assert_always();
 }
 
+namespace {
+
+// Checked domains branch through the resolver every time. This thread's
+// resolutions stay valid while the processor's checked execution epoch holds:
+// it advances when a translation retires or authorization changes.
+struct CheckedResolution {
+  TranslationDomainKey::Id domain_id = TranslationDomainKey::kDefaultDirectId;
+  uint32_t guest_address = 0;
+  uint64_t machine_code = 0;
+};
+
+struct CheckedResolutionCache {
+  const xe::cpu::Processor* processor = nullptr;
+  uint64_t epoch = 0;
+  std::array<CheckedResolution, 4096> entries{};
+};
+
+thread_local CheckedResolutionCache checked_resolution_cache;
+
+CheckedResolution& CheckedResolutionFor(const xe::cpu::Processor* processor,
+                                        uint64_t epoch,
+                                        uint32_t guest_address) {
+  CheckedResolutionCache& cache = checked_resolution_cache;
+  if (cache.processor != processor || cache.epoch != epoch) {
+    cache.entries.fill({});
+    cache.processor = processor;
+    cache.epoch = epoch;
+  }
+  return cache.entries[(guest_address >> 2) % cache.entries.size()];
+}
+
+}  // namespace
+
 // This is used by the X64ThunkEmitter's ResolveFunctionThunk.
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
 
   auto thread_state = guest_context->thread_state;
 
-  // TODO(benvanik): required?
-  assert_not_zero(target_address);
+  const TranslationDomainKey translation_domain_key =
+      thread_state->translation_domain_key();
+  auto processor = thread_state->processor();
+  // Read before resolving: a resolution is cached only if nothing retired or
+  // changed authorization meanwhile.
+  const uint64_t checked_epoch = processor->checked_execution_epoch();
+  if (translation_domain_key != TranslationDomainKey::DefaultDirect() &&
+      !thread_state->guest_interrupt_pending()) {
+    const uint32_t guest_address =
+        static_cast<uint32_t>(target_address) & ~uint32_t(3);
+    const CheckedResolution& cached =
+        CheckedResolutionFor(processor, checked_epoch, guest_address);
+    if (cached.domain_id == translation_domain_key.id() &&
+        cached.guest_address == guest_address && cached.machine_code) {
+      return cached.machine_code;
+    }
+  }
+  if (!processor->CanExecuteTranslationDomain(translation_domain_key)) {
+    XELOGE(
+        "x64 runtime function resolution rejected unavailable "
+        "translation domain {:016X} at guest address {:08X}",
+        translation_domain_key.id(), static_cast<uint32_t>(target_address));
+    return 0;
+  }
+
+  const bool checked =
+      translation_domain_key != TranslationDomainKey::DefaultDirect();
+  // Checked-domain code may branch to 0 and take the instruction storage
+  // fault.
+  if (!checked) {
+    assert_not_zero(target_address);
+  } else {
+    // A branch ignores the low two bits of its target.
+    target_address &= ~uint64_t(3);
+  }
+
+  // Checked code takes pending interrupts at branches; the guest state is
+  // complete here.
+  if (translation_domain_key != TranslationDomainKey::DefaultDirect() &&
+      thread_state->guest_interrupt_pending()) {
+    if (GuestInterruptPoller* poller = processor->guest_interrupt_poller()) {
+      poller->PollGuestInterrupt(guest_context,
+                                 static_cast<uint32_t>(target_address));
+    }
+  }
 
   /*
           todo: refactor this!
@@ -491,9 +595,8 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
 
   */
 
-  if (cvars::enable_host_guest_stack_synchronization) {
-    auto processor = thread_state->processor();
-
+  if (translation_domain_key == TranslationDomainKey::DefaultDirect() &&
+      cvars::enable_host_guest_stack_synchronization) {
     auto module_for_address =
         processor->LookupModule(static_cast<uint32_t>(target_address));
 
@@ -659,9 +762,13 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
                    * indirection we lose our stack misalignment check
                    */
                   /* reinterpret_cast<X64CodeCache*>(backend->code_cache())
-      ->AddIndirection(static_cast<uint32_t>(target_address),
-                       static_cast<uint32_t>(host_address));
-                        */
+
+                   * ->AddIndirection(translation_domain_key,
+
+                   * static_cast<uint32_t>(target_address),
+
+                   * static_cast<uint32_t>(host_address));
+ */
 
                   return host_address;
                 }
@@ -672,12 +779,39 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       }
     }
   }
-  auto fn = thread_state->processor()->ResolveFunction(
-      static_cast<uint32_t>(target_address));
-  assert_not_null(fn);
+  ppc::GuestInstructionFetchFault fetch_fault;
+  auto fn = processor->ResolveFunction(translation_domain_key,
+                                       static_cast<uint32_t>(target_address),
+                                       checked ? &fetch_fault : nullptr);
+  if (!fn) {
+    if (checked) {
+      // No resolution lock is held here, so the delivery may leave
+      // nonlocally.
+      if (fetch_fault.is_guest_fault()) {
+        processor->DispatchGuestInstructionStorageFault(
+            guest_context, translation_domain_key, fetch_fault);
+      }
+      XELOGE(
+          "Checked branch to {:08X} unresolved (LR {:08X} CTR {:08X} r2 "
+          "{:08X}, fetch fault {})",
+          static_cast<uint32_t>(target_address),
+          static_cast<uint32_t>(guest_context->lr),
+          static_cast<uint32_t>(guest_context->ctr),
+          static_cast<uint32_t>(guest_context->r[2]),
+          static_cast<uint32_t>(fetch_fault.reason));
+    }
+    return 0;
+  }
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
 
+  if (checked && addr &&
+      processor->checked_execution_epoch() == checked_epoch) {
+    CheckedResolutionFor(processor, checked_epoch,
+                         static_cast<uint32_t>(target_address)) = {
+        translation_domain_key.id(), static_cast<uint32_t>(target_address),
+        addr};
+  }
   return addr;
 }
 
@@ -686,12 +820,19 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   ForgetMxcsrMode();
   auto fn = static_cast<X64Function*>(function);
   // Resolve address to the function to call and store in rax.
+  const bool may_use_default_dispatch =
+      current_guest_call_dispatch_mode_ ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection &&
+      GetGuestCallDispatchMode(function->translation_domain_key()) ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection;
+  uint8_t* machine_code =
+      may_use_default_dispatch ? fn->machine_code() : nullptr;
 
-  if (fn->machine_code()) {
+  if (machine_code) {
     if (!(instr->flags & hir::CALL_TAIL)) {
       mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
 
-      call((void*)fn->machine_code());
+      call(static_cast<void*>(machine_code));
       synchronize_stack_on_next_instruction_ = true;
     } else {
       // tail call
@@ -702,11 +843,11 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 
       add(rsp, static_cast<uint32_t>(stack_size()));
       PopStackpoint();
-      jmp((void*)fn->machine_code(), T_NEAR);
+      jmp(static_cast<void*>(machine_code), T_NEAR);
     }
 
     return;
-  } else if (code_cache_->has_indirection_table()) {
+  } else if (may_use_default_dispatch && code_cache_->has_indirection_table()) {
     // Load the pointer to the indirection table maintained in X64CodeCache.
     // The target dword will either contain the address of the generated code
     // or a thunk to ResolveAddress.
@@ -718,6 +859,12 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     // TODO: Overwrite the call-site with a straight call.
     CallNative(&ResolveFunction, function->address());
   }
+
+  test(rax, rax);
+  Xbyak::Label resolved_target;
+  jnz(resolved_target);
+  DebugBreak();
+  L(resolved_target);
 
   // Actually jump/call to rax.
   if (instr->flags & hir::CALL_TAIL) {
@@ -751,7 +898,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
   // Load the pointer to the indirection table maintained in X64CodeCache.
   // The target dword will either contain the address of the generated code
   // or a thunk to ResolveAddress.
-  if (code_cache_->has_indirection_table()) {
+  if (current_guest_call_dispatch_mode_ ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection &&
+      code_cache_->has_indirection_table()) {
     if (reg.cvt32() != ebx) {
       mov(ebx, reg.cvt32());
     }
@@ -764,6 +913,12 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     mov(rcx, GetContextReg());
     call(rax);
   }
+
+  test(rax, rax);
+  Xbyak::Label resolved_target;
+  jnz(resolved_target);
+  DebugBreak();
+  L(resolved_target);
 
   // Actually jump/call to rax.
   if (instr->flags & hir::CALL_TAIL) {
@@ -1729,8 +1884,30 @@ void X64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
   if (debugging::IsDebuggerAttached()) {
     debugging::Break();
   }
-  // context->lr
-  // todo: show lr in message?
+  // Report the call sites holding the most unreturned frames.
+  if (context && context->thread_state && context->thread_state->processor()) {
+    auto backend =
+        static_cast<X64Backend*>(context->thread_state->processor()->backend());
+    X64BackendContext* backend_context =
+        backend->BackendContextForGuestContext(context);
+    std::unordered_map<uint32_t, uint32_t> return_address_counts;
+    for (uint32_t i = 0; i < backend_context->current_stackpoint_depth; ++i) {
+      ++return_address_counts[backend_context->stackpoints[i]
+                                  .guest_return_address_];
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> sorted(
+        return_address_counts.begin(), return_address_counts.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    XELOGE("Stackpoint overflow at depth {}, LR {:08X}, r1 {:08X}",
+           backend_context->current_stackpoint_depth,
+           static_cast<uint32_t>(context->lr),
+           static_cast<uint32_t>(context->r[1]));
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
+      XELOGE("  {} unreturned frames with guest return address {:08X}",
+             sorted[i].second, sorted[i].first);
+    }
+  }
   xe::FatalError(
       "Overflowed stackpoints! Please report this error for this title to "
       "Xenia developers.");

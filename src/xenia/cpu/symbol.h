@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <string>
 
+#include "xenia/cpu/translation_domain.h"
+
 namespace xe {
 namespace cpu {
 
@@ -43,6 +45,10 @@ class Symbol {
   Status status() const { return status_; }
   void set_status(Status value) { status_ = value; }
   uint32_t address() const { return address_; }
+  const TranslationDomainKey& translation_domain_key() const;
+  TranslationAddress translation_address() const {
+    return TranslationAddress(translation_domain_key(), address_);
+  }
 
   const std::string& name() const { return name_; }
   void set_name(const std::string_view value) { name_ = value; }

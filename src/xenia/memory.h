@@ -10,10 +10,12 @@
 #ifndef XENIA_MEMORY_H_
 #define XENIA_MEMORY_H_
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -77,6 +79,12 @@ struct HeapAllocationInfo {
   uint32_t state;
   // The access protection of the pages in the region.
   uint32_t protect;
+};
+
+// A copy of one heap page's allocation state and protection.
+struct HeapPageInfo {
+  uint32_t state = 0;
+  uint32_t protect = 0;
 };
 
 // Describes a single page in the page table.
@@ -183,6 +191,10 @@ class BaseHeap {
 
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+
+  // The state of the page holding address (state 0 when unreserved), copied
+  // under the global lock.
+  std::optional<HeapPageInfo> QueryPageInfo(uint32_t address) const;
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -507,6 +519,15 @@ class Memory {
       uint32_t physical_address, uint32_t length,
       bool enable_invalidation_notifications, bool enable_data_providers);
 
+  // Notifies every physical-memory write callback before a host-side direct
+  // physical write; guest alias watch flags are left alone. The caller holds
+  // the global lock, once, through the write. Callbacks must not register or
+  // unregister callbacks. Returns false only for an invalid lock or an empty or
+  // out-of-range physical range.
+  bool NotifyPhysicalMemoryWriteInvalidationCallbacksLocked(
+      const global_unique_lock_type& global_lock_locked_once,
+      uint32_t physical_address, uint32_t length);
+
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
   // watched. Must be called with global critical region locking depth of 1.
@@ -526,6 +547,13 @@ class Memory {
 
   // Frees memory allocated with SystemHeapAlloc.
   void SystemHeapFree(uint32_t address, uint32_t* out_region_size = nullptr);
+
+  // Changes whenever a physical page may lose access (decommit, release or a
+  // protection change), so cached translations to physical pages can tell
+  // they are stale.
+  uint64_t physical_access_generation() const {
+    return physical_access_generation_.load(std::memory_order_acquire);
+  }
 
   // Gets the heap for the address space containing the given address.
   XE_NOALIAS
@@ -611,6 +639,7 @@ class Memory {
 
   friend class PhysicalHeap;
   xe::global_critical_region global_critical_region_;
+  std::atomic<uint64_t> physical_access_generation_{0};
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
 };

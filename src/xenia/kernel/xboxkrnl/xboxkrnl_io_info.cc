@@ -238,7 +238,7 @@ dword_result_t NtSetInformationFile_entry(
         return X_STATUS_INVALID_PARAMETER;
       }
 
-      file->Rename(target_path);
+      result = file->Rename(target_path);
       out_length = sizeof(*info);
       break;
     }

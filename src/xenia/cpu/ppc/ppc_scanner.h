@@ -19,6 +19,7 @@ namespace xe {
 namespace cpu {
 namespace ppc {
 
+class GuestCodeReader;
 class PPCFrontend;
 
 struct BlockInfo {
@@ -31,12 +32,16 @@ class PPCScanner {
   explicit PPCScanner(PPCFrontend* frontend);
   ~PPCScanner();
 
-  bool Scan(GuestFunction* function, FunctionDebugInfo* debug_info);
+  bool Scan(GuestFunction* function, const GuestCodeReader& guest_code_reader,
+            FunctionDebugInfo* debug_info);
 
-  std::vector<BlockInfo> FindBlocks(GuestFunction* function);
+  bool FindBlocks(GuestFunction* function,
+                  const GuestCodeReader& guest_code_reader,
+                  std::vector<BlockInfo>* blocks_out);
 
  private:
-  bool IsRestGprLr(uint32_t address);
+  bool IsRestGprLr(TranslationDomainKey translation_domain_key,
+                   uint32_t address);
 
   PPCFrontend* frontend_ = nullptr;
 };

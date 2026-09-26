@@ -157,6 +157,12 @@ void PosixA64CodeCache::PlaceCode(uint32_t guest_address, void* machine_code,
                                   const EmitFunctionInfo& func_info,
                                   void* code_execute_address,
                                   UnwindReservation unwind_reservation) {
+  if (generated_code_write_base_ != generated_code_execute_base_) {
+    // Flush the execute alias too: maintenance on the write alias may not
+    // cover it.
+    FlushCodeRange(code_execute_address, func_info.code_size.total);
+  }
+
   InitializeUnwindEntry(unwind_reservation.entry_address, code_execute_address,
                         func_info);
 

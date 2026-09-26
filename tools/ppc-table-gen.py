@@ -421,7 +421,7 @@ def generate_lookup(insns):
   w0('  return (v >> (32 - 1 - b)) & ((1 << (b - a + 1)) - 1);')
   w0('}')
   w0('')
-  w0('#define PPC_DECODER_MISS assert_always(); return PPCOpcode::kInvalid')
+  w0('#define PPC_DECODER_MISS return PPCOpcode::kInvalid')
   w0('#define PPC_DECODER_HIT(name) return PPCOpcode::name;')
   w0('')
   w0('PPCOpcode LookupOpcode(uint32_t code) {')

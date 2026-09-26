@@ -71,6 +71,10 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
   //   v2 = 0
 
   result = false;
+  const TranslationDomainKey translation_domain_key =
+      builder->translation_domain_key();
+  const bool has_default_direct_memory =
+      translation_domain_key == TranslationDomainKey::DefaultDirect();
   auto block = builder->first_block();
   while (block) {
     for (auto i = block->instr_head; i; i = i->next) {
@@ -130,7 +134,7 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
         case OPCODE_CALL_INDIRECT:
           if (i->src1.value->IsConstant()) {
             auto function = processor_->LookupFunction(
-                uint32_t(i->src1.value->constant.i32));
+                translation_domain_key, uint32_t(i->src1.value->constant.i32));
             if (!function) {
               break;
             }
@@ -152,7 +156,7 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
           } else if (i->src2.value->IsConstant()) {  // chrispy: fix h3 bug from
                                                      // const indirect call true
             auto function = processor_->LookupFunction(
-                uint32_t(i->src2.value->constant.i32));
+                translation_domain_key, uint32_t(i->src2.value->constant.i32));
             if (!function) {
               break;
             }
@@ -255,7 +259,7 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
           break;
         case OPCODE_LOAD:
         case OPCODE_LOAD_OFFSET:
-          if (i->src1.value->IsConstant()) {
+          if (has_default_direct_memory && i->src1.value->IsConstant()) {
             assert_false(i->flags & LOAD_STORE_BYTE_SWAP);
             auto memory = processor_->memory();
             auto address = i->src1.value->constant.i32;
@@ -317,7 +321,8 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
           break;
         case OPCODE_STORE:
         case OPCODE_STORE_OFFSET:
-          if (cvars::inline_mmio_access && i->src1.value->IsConstant()) {
+          if (has_default_direct_memory && cvars::inline_mmio_access &&
+              i->src1.value->IsConstant()) {
             auto address = i->src1.value->constant.i32;
             if (i->opcode->num == OPCODE_STORE_OFFSET) {
               address += i->src2.value->constant.i32;

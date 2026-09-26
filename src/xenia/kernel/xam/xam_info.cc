@@ -12,6 +12,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/config.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -488,6 +489,21 @@ dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
   auto& loader_data = xam->loader_data();
   loader_data.launch_data.resize(size);
   std::memcpy(loader_data.launch_data.data(), data, size);
+  std::string prefix;
+  for (size_t i = 0; i < std::min<size_t>(size, 16); ++i) {
+    prefix += fmt::format("{:02X} ", loader_data.launch_data[i]);
+  }
+  XELOGD("XamLoaderSetLaunchData: {} bytes: {}...", uint32_t(size), prefix);
+  // XeFu's 0x3FC-byte record names the next XBE at offset 0x1FC.
+  constexpr size_t kXefuLaunchDataSize = 0x3FC;
+  constexpr size_t kXefuLaunchDataPathOffset = 0x1FC;
+  if (size == kXefuLaunchDataSize) {
+    const char* path = reinterpret_cast<const char*>(
+        loader_data.launch_data.data() + kXefuLaunchDataPathOffset);
+    XELOGD("XamLoaderSetLaunchData: XeFu path '{}'",
+           std::string_view(path,
+                            strnlen(path, size - kXefuLaunchDataPathOffset)));
+  }
   return 0;
 }
 DECLARE_XAM_EXPORT1(XamLoaderSetLaunchData, kNone, kSketchy);
@@ -570,13 +586,13 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   }
 
   // This function does not return.
-  kernel_state()->TerminateTitle();
+  kernel_state()->emulator()->TerminateTitle();
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
 void XamLoaderTerminateTitle_entry() {
   // This function does not return.
-  kernel_state()->TerminateTitle();
+  kernel_state()->emulator()->TerminateTitle();
 }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
 

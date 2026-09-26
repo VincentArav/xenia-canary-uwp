@@ -22,6 +22,7 @@
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/lzx.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/xex_import_library_parser.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
@@ -1032,51 +1033,51 @@ bool XexModule::LoadContinue() {
   GetOptHeader(XEX_HEADER_IMPORT_LIBRARIES, &opt_import_libraries);
 
   if (opt_import_libraries) {
-    // FIXME: Don't know if 32 is the actual limit, but haven't seen more than
-    // 2.
-    const char* string_table[32];
-    std::memset(string_table, 0, sizeof(string_table));
-
-    // Parse the string table
-    for (size_t i = 0, o = 0; i < opt_import_libraries->string_table.size &&
-                              o < opt_import_libraries->string_table.count;
-         ++o) {
-      assert_true(o < xe::countof(string_table));
-      const char* str = &opt_import_libraries->string_table.data[i];
-
-      string_table[o] = str;
-      i += std::strlen(str) + 1;
-
-      // Padding
-      if ((i % 4) != 0) {
-        i += 4 - (i % 4);
-      }
+    auto library_data = reinterpret_cast<uint8_t*>(opt_import_libraries);
+    const uintptr_t header_begin =
+        reinterpret_cast<uintptr_t>(xex_header_mem_.data());
+    const uintptr_t library_address = reinterpret_cast<uintptr_t>(library_data);
+    if (library_address < header_begin ||
+        library_address - header_begin >= xex_header_mem_.size()) {
+      XELOGE("XEX import-library header points outside the XEX header");
+      return false;
+    }
+    const size_t available_size =
+        xex_header_mem_.size() - size_t(library_address - header_begin);
+    const XexImportLibraryParseResult import_result = ParseXexImportLibraries(
+        std::span<const uint8_t>(library_data, available_size));
+    if (!import_result) {
+      XELOGE("Malformed XEX import libraries (error={}, offset={})",
+             uint32_t(import_result.error), import_result.error_offset);
+      return false;
     }
 
-    auto library_data = reinterpret_cast<uint8_t*>(opt_import_libraries);
-    uint32_t library_offset = opt_import_libraries->string_table.size + 12;
-    while (library_offset < opt_import_libraries->size) {
-      auto library =
-          reinterpret_cast<xex2_import_library*>(library_data + library_offset);
-      if (!library->size) {
-        break;
-      }
-      size_t library_name_index = library->name_index & 0xFF;
-      assert_true(library_name_index <
-                  opt_import_libraries->string_table.count);
-      assert_not_null(string_table[library_name_index]);
-      auto library_name = std::string(string_table[library_name_index]);
+    for (const ParsedXexImportLibrary& parsed_library :
+         import_result.libraries) {
+      auto library = reinterpret_cast<xex2_import_library*>(
+          library_data + parsed_library.descriptor_offset);
+      std::string library_name = parsed_library.name;
 
       if (!kernel_state_->IsModuleLoaded(library_name)) {
         if (auto module = kernel_state_->LoadUserModule(library_name)) {
-          if (kernel_state_->FinishLoadingUserModule(module, false)) {
+          const X_RESULT load_result =
+              kernel_state_->FinishLoadingUserModule(module, false);
+          if (XFAILED(load_result)) {
+            XELOGW("Failed to finish loading import library {}: {:08X}",
+                   library_name, load_result);
+            // Unregister a module whose LoadContinue failed, so later imports
+            // don't treat it as loaded.
+            kernel_state_->UnloadUserModule(module, false);
+          } else {
             library_name = module->path();
           }
+        } else {
+          // Its imports stay unresolved; SetupLibraryImports reports them.
+          XELOGW("Failed to load import library {}", library_name);
         }
       }
 
       SetupLibraryImports(library_name, library);
-      library_offset += library->size;
     }
   }
 

@@ -485,10 +485,22 @@ void* A64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
   auto thread_state = guest_context->thread_state;
+
+  const TranslationDomainKey translation_domain_key =
+      thread_state->translation_domain_key();
+  auto processor = thread_state->processor();
+  if (!processor->CanExecuteTranslationDomain(translation_domain_key)) {
+    XELOGE(
+        "A64 runtime function resolution rejected unavailable "
+        "translation domain {:016X} at guest address {:08X}",
+        translation_domain_key.id(), static_cast<uint32_t>(target_address));
+    return 0;
+  }
+
   assert_not_zero(target_address);
 
-  auto fn = thread_state->processor()->ResolveFunction(
-      static_cast<uint32_t>(target_address));
+  auto fn = processor->ResolveFunction(translation_domain_key,
+                                       static_cast<uint32_t>(target_address));
   if (!fn) {
     // Unresolvable — return 0 which will fault.
     return 0;
@@ -781,9 +793,12 @@ uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
       GUEST_TRAMPOLINE_BASE +
       (static_cast<uint32_t>(new_index) * GUEST_TRAMPOLINE_MIN_LEN);
 
-  code_cache()->AddIndirection(
-      indirection_guest_addr,
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)));
+  if (!code_cache()->AddIndirection(
+          TranslationDomainKey::DefaultDirect(), indirection_guest_addr,
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)))) {
+    guest_trampoline_address_bitmap_.Release(new_index);
+    return 0;
+  }
 
   return indirection_guest_addr;
 }

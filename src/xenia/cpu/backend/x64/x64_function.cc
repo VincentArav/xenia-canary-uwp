@@ -26,15 +26,19 @@ X64Function::~X64Function() {
 }
 
 void X64Function::Setup(uint8_t* machine_code, size_t machine_code_length) {
-  machine_code_ = machine_code;
-  machine_code_length_ = machine_code_length;
+  machine_code_length_.store(machine_code_length, std::memory_order_relaxed);
+  machine_code_.store(machine_code, std::memory_order_release);
 }
 
 bool X64Function::CallImpl(ThreadState* thread_state, uint32_t return_address) {
   auto backend =
       reinterpret_cast<X64Backend*>(thread_state->processor()->backend());
   auto thunk = backend->host_to_guest_thunk();
-  thunk(machine_code_, thread_state->context(),
+  auto* code = machine_code_.load(std::memory_order_acquire);
+  if (!thunk || !code) {
+    return false;
+  }
+  thunk(code, thread_state->context(),
         reinterpret_cast<void*>(uintptr_t(return_address)));
   return true;
 }

@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -41,6 +42,8 @@
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
+#include "xenia/kernel/user_mode_kernel_runtime.h"
+#include "xenia/kernel/user_mode_manager.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -61,6 +64,9 @@
 #include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/virtual_file_system.h"
+#include "xenia/xefu/xefu_launch.h"
+#include "xenia/xefu/xefu_launch_coordinator.h"
+#include "xenia/xefu/xefu_selection.h"
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -84,6 +90,24 @@ DEFINE_bool(allow_game_relative_writes, false,
             "relative to game://. Used for "
             "generating test data to compare with original hardware. ",
             "General");
+
+DEFINE_string(
+    xefu_build, "retail7b",
+    "Exact XeFu build used when launching an original-Xbox XBE. Examples: "
+    "retail7b, hacked7b, hacked-config-loader7, hacked-hud2021c.",
+    "XeFu");
+DEFINE_path(
+    xefu_compatibility_root, "",
+    "Directory containing the exact hash-pinned XeFu runtime, selector and "
+    "companion assets. If empty, <storage_root>/Compatibility is used.",
+    "XeFu");
+DEFINE_path(xefu_config, "",
+            "Optional exact Compatibility/Configs/{TITLEID}.bin file for a "
+            "matching config-loader XeFu build.",
+            "XeFu");
+DEFINE_bool(xefu_live_enabled, false,
+            "Set the XeFu launch-data Live flag for an explicit XBE launch.",
+            "XeFu");
 
 DECLARE_bool(allow_plugins);
 
@@ -193,7 +217,10 @@ Emulator::~Emulator() {
   audio_system_.reset();
   audio_media_player_.reset();
 
+  main_thread_.reset();
   kernel_state_.reset();
+  // Release the XeFu mounts while the VFS still exists.
+  mounted_xefu_session_.reset();
   file_system_.reset();
 
   processor_.reset();
@@ -365,16 +392,72 @@ X_STATUS Emulator::Setup(
 }
 
 X_STATUS Emulator::TerminateTitle() {
-  if (!is_title_open()) {
-    return X_STATUS_UNSUCCESSFUL;
+  const bool called_from_guest = kernel::XThread::IsInThread();
+  {
+    std::lock_guard<std::mutex> lock(title_termination_mutex_);
+    if (!title_id_.has_value() && !mounted_xefu_session_) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+
+    // KernelState::TerminateTitle ends the calling guest thread without
+    // returning here; the XeFu mounts are released once that thread exits.
+    if (called_from_guest && mounted_xefu_session_) {
+      deferred_guest_title_termination_.store(true, std::memory_order_release);
+    }
   }
 
   kernel_state_->TerminateTitle();
-  title_id_ = std::nullopt;
-  title_name_ = "";
-  title_version_ = "";
-  on_terminate();
+
+  if (called_from_guest) {
+    // Unreachable: the calling guest thread was terminated.
+    XELOGE("Guest-triggered KernelState::TerminateTitle unexpectedly returned");
+    std::abort();
+  }
+
+  // A host termination may end a guest thread that armed the latch before it
+  // finished; consume the latch here. The mutex makes this idempotent.
+  deferred_guest_title_termination_.store(false, std::memory_order_release);
+  FinalizeTitleTerminationOwnership(true);
   return X_STATUS_SUCCESS;
+}
+
+void Emulator::FinalizeDeferredGuestTitleTermination() {
+  if (!deferred_guest_title_termination_.exchange(false,
+                                                  std::memory_order_acq_rel)) {
+    return;
+  }
+
+  // main_thread_ may be the calling thread; a later teardown or launch
+  // releases it.
+  FinalizeTitleTerminationOwnership(false);
+}
+
+void Emulator::FinalizeTitleTerminationOwnership(bool release_main_thread) {
+  bool notify_termination = false;
+  {
+    std::lock_guard<std::mutex> lock(title_termination_mutex_);
+    notify_termination = title_id_.has_value() || mounted_xefu_session_;
+
+    if (release_main_thread) {
+      main_thread_.reset();
+    }
+    if (mounted_xefu_session_) {
+      auto xam =
+          kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+      if (xam) {
+        xam->loader_data().launch_data.clear();
+      }
+      // Title threads have stopped, so the mounts can go.
+      mounted_xefu_session_.reset();
+    }
+    title_id_ = std::nullopt;
+    title_name_.clear();
+    title_version_.clear();
+  }
+
+  if (notify_termination) {
+    on_terminate();
+  }
 }
 
 const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
@@ -499,6 +582,8 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   fclose(file);
 
   switch (magic_value) {
+    case make_fourcc('X', 'B', 'E', 'H'):
+      return FileSignatureType::XBE;
     case xe::cpu::kXEX1Signature:
       return FileSignatureType::XEX1;
     case xe::cpu::kXEX2Signature:
@@ -553,6 +638,65 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   X_STATUS mount_result = X_STATUS_SUCCESS;
 
   switch (GetFileSignature(path)) {
+    case FileSignatureType::XBE: {
+      const std::optional<xefu::XefuBuildId> build =
+          xefu::XefuBuildForCommandLineName(cvars::xefu_build);
+      if (!build) {
+        XELOGE("Unknown --xefu_build '{}'.", cvars::xefu_build);
+        return X_STATUS_INVALID_PARAMETER;
+      }
+      const xefu::XefuBuildDescriptor* descriptor =
+          xefu::FindKnownXefuBuild(*build);
+      if (!descriptor) {
+        return X_STATUS_INVALID_PARAMETER;
+      }
+
+      std::error_code path_error;
+      const std::filesystem::path absolute_xbe =
+          std::filesystem::absolute(path, path_error);
+      if (path_error) {
+        XELOGE("Unable to resolve XBE path '{}': {}", path,
+               path_error.message());
+        return X_STATUS_INVALID_PARAMETER;
+      }
+      std::filesystem::path compatibility_root =
+          cvars::xefu_compatibility_root.empty()
+              ? storage_root_ / "Compatibility"
+              : cvars::xefu_compatibility_root;
+      compatibility_root =
+          std::filesystem::absolute(compatibility_root, path_error);
+      if (path_error) {
+        XELOGE("Unable to resolve XeFu compatibility root: {}",
+               path_error.message());
+        return X_STATUS_INVALID_PARAMETER;
+      }
+
+      xefu::XefuLaunchRequest request;
+      request.xbe_host_path = absolute_xbe;
+      request.xbe_guest_path =
+          "\\Device\\Cdrom0\\" + xe::path_to_utf8(path.filename());
+      request.compatibility_root = std::move(compatibility_root);
+      request.writable_root = storage_root_ / "xefu";
+      request.build = *build;
+      request.live_enabled = cvars::xefu_live_enabled ? 1u : 0u;
+      if (!cvars::xefu_config.empty()) {
+        if (!descriptor->required_external_config_pack) {
+          XELOGE("XeFu build '{}' does not accept an external config.",
+                 cvars::xefu_build);
+          return X_STATUS_INVALID_PARAMETER;
+        }
+        std::filesystem::path config_path =
+            std::filesystem::absolute(cvars::xefu_config, path_error);
+        if (path_error) {
+          XELOGE("Unable to resolve XeFu config path: {}",
+                 path_error.message());
+          return X_STATUS_INVALID_PARAMETER;
+        }
+        request.external_config = xefu::XefuConfigRequest{
+            std::move(config_path), *descriptor->required_external_config_pack};
+      }
+      return LaunchXefuTitle(request);
+    } break;
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
@@ -578,6 +722,122 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     default:
       return X_STATUS_NOT_SUPPORTED;
       break;
+  }
+}
+
+X_STATUS Emulator::LaunchXefuTitle(const xefu::XefuLaunchRequest& request) {
+  if (is_title_open() || mounted_xefu_session_) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  const xefu::PrepareXefuLaunchResult prepared =
+      xefu::PrepareXefuLaunch(request);
+  if (!prepared) {
+    XELOGE(
+        "XeFu launch preparation failed (prepare={}, xbe={}, asset={}, "
+        "config={}, launch_data={})",
+        uint32_t(prepared.error), uint32_t(prepared.xbe_error),
+        uint32_t(prepared.asset_error), uint32_t(prepared.config_error),
+        uint32_t(prepared.launch_data_error));
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  const xefu::XefuBuildDescriptor* const descriptor =
+      xefu::FindKnownXefuBuild(prepared.launch.assets.build);
+  if (!descriptor || !descriptor->capabilities.execution_supported) {
+    XELOGW(
+        "XeFu assets and XBE were validated, but build {} is not enabled for "
+        "execution",
+        uint32_t(prepared.launch.assets.build));
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  if (!kernel_state_ || !kernel_state_->user_mode_kernel_runtime() ||
+      !kernel_state_->user_mode_kernel_runtime()->is_ready()) {
+    XELOGW(
+        "XeFu execution is unavailable on the selected CPU backend or the "
+        "checked-memory runtime did not initialize");
+    return X_STATUS_NOT_SUPPORTED;
+  }
+
+  std::unique_ptr<xefu::ScopedXefuLaunchData> launch_data_transaction;
+  xefu::CoordinatedXefuLaunchResult coordinated =
+      xefu::CoordinatePreparedXefuLaunch(
+          file_system_.get(), prepared.launch,
+          [this, &launch_data_transaction](
+              const std::filesystem::path& runtime_host_path,
+              std::string_view runtime_guest_path,
+              std::span<const uint8_t> launch_data) {
+            auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>(
+                "xam.xex");
+            if (!xam) {
+              return X_STATUS_UNSUCCESSFUL;
+            }
+
+            launch_data_transaction =
+                std::make_unique<xefu::ScopedXefuLaunchData>(
+                    xam->loader_data().launch_data, launch_data);
+            const X_STATUS status =
+                CompleteLaunch(runtime_host_path, runtime_guest_path, true);
+            if (XFAILED(status)) {
+              // Unload partially loaded modules while the mounts still exist.
+              RollbackFailedXefuLaunch();
+              launch_data_transaction.reset();
+            }
+            return status;
+          });
+
+  if (!coordinated) {
+    if (coordinated.mount_error != xefu::XefuSessionMountError::kNone) {
+      XELOGE("XeFu session mount failed ({})",
+             uint32_t(coordinated.mount_error));
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    return coordinated.runtime_status;
+  }
+
+  // Publish the session before the suspended main thread runs.
+  mounted_xefu_session_ = std::move(coordinated.session);
+  if (!main_thread_ || !launch_data_transaction) {
+    RollbackFailedXefuLaunch(true);
+    launch_data_transaction.reset();
+    mounted_xefu_session_.reset();
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  const X_STATUS resume_status = main_thread_->Resume();
+  if (XFAILED(resume_status)) {
+    RollbackFailedXefuLaunch(true);
+    launch_data_transaction.reset();
+    mounted_xefu_session_.reset();
+    return resume_status;
+  }
+
+  launch_data_transaction->Commit();
+  launch_data_transaction.reset();
+  return X_STATUS_SUCCESS;
+}
+
+void Emulator::RollbackFailedXefuLaunch(bool launch_was_announced) {
+  if (display_window_ && !display_window_->app_context().IsInUIThread()) {
+    display_window_->app_context().CallInUIThreadSynchronous(
+        [this, launch_was_announced]() {
+          RollbackFailedXefuLaunch(launch_was_announced);
+        });
+    return;
+  }
+
+  // KernelState's, not ours: title_id_ may be unset, but loaded modules and
+  // the suspended main thread must go before the mounts.
+  kernel_state_->TerminateTitle();
+  main_thread_.reset();
+  title_id_ = std::nullopt;
+  title_name_.clear();
+  title_version_.clear();
+  if (display_window_) {
+    display_window_->SetIcon(nullptr, 0);
+  }
+  if (launch_was_announced) {
+    on_terminate();
   }
 }
 
@@ -1139,25 +1399,57 @@ void Emulator::Resume() {
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
           kernel::XObject::Type::Thread);
+  auto current_thread = kernel::XThread::IsInThread()
+                            ? kernel::XThread::GetCurrentThread()
+                            : nullptr;
   for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
+    // Don't resume ourself or host threads.
+    if (thread == current_thread || !thread->can_debugger_suspend()) {
       continue;
     }
 
-    if (!thread->is_running()) {
+    if (thread->is_running()) {
       thread->thread()->Resume(nullptr);
     }
   }
 }
 
 bool Emulator::SaveToFile(const std::filesystem::path& path) {
+  const bool was_paused = is_paused();
   Pause();
 
-  filesystem::CreateEmptyFile(path);
+  const auto finish_save = [this, was_paused](bool result) {
+    if (!was_paused) {
+      Resume();
+    }
+    return result;
+  };
+
+  if (!processor_->CanSaveActiveTranslationDomains()) {
+    XELOGE("Cannot save while a non-default translation domain is active");
+    return finish_save(false);
+  }
+
+  // Refuse to save kernel state it can't capture.
+  switch (kernel_state_->CheckSaveStatePreconditions()) {
+    case kernel::UserModeSaveStatePreflightResult::kReady:
+      break;
+    case kernel::UserModeSaveStatePreflightResult::kMappingsPresent:
+      XELOGE("Cannot save while user-mode mappings are present");
+      return finish_save(false);
+    case kernel::UserModeSaveStatePreflightResult::kActiveFrames:
+      XELOGE("Cannot save while user-mode frames are active");
+      return finish_save(false);
+  }
+
+  if (!filesystem::CreateEmptyFile(path)) {
+    XELOGE("Could not create save-state file: {}", xe::path_to_utf8(path));
+    return finish_save(false);
+  }
   auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite, 0, 2_GiB);
   if (!map) {
-    return false;
+    XELOGE("Could not map save-state file: {}", xe::path_to_utf8(path));
+    return finish_save(false);
   }
 
   // Save the emulator state to a file
@@ -1170,15 +1462,16 @@ bool Emulator::SaveToFile(const std::filesystem::path& path) {
 
   // It's important we don't hold the global lock here! XThreads need to step
   // forward (possibly through guarded regions) without worry!
-  processor_->Save(&stream);
-  graphics_system_->Save(&stream);
-  audio_system_->Save(&stream);
-  kernel_state_->Save(&stream);
-  memory_->Save(&stream);
+  const bool save_succeeded =
+      processor_->Save(&stream) && graphics_system_->Save(&stream) &&
+      audio_system_->Save(&stream) && kernel_state_->Save(&stream) &&
+      memory_->Save(&stream);
   map->Close(stream.offset());
 
-  Resume();
-  return true;
+  if (!save_succeeded) {
+    XELOGE("Failed to serialize the complete emulator state");
+  }
+  return finish_save(save_succeeded);
 }
 
 bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
@@ -1304,10 +1597,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     return false;
   }
 
-  // Within range. Pause the emulator and eat the exception.
-  Pause();
-
-  // Dump information into the log.
+  // Within range. Log the crash before pausing, which waits on other
+  // subsystems.
   auto current_thread = kernel::XThread::GetCurrentThread();
   assert_not_null(current_thread);
 
@@ -1357,6 +1648,10 @@ bool Emulator::ExceptionCallback(Exception* ex) {
                     context->v[i].u32[2], context->v[i].u32[3]));
   }
   XELOGE("{}", crash_msg);
+
+  // Pause the emulator and eat the exception.
+  Pause();
+
   std::string crash_dlg = fmt::format(
       "The guest has crashed.\n\n"
       "Xenia has now paused itself.\n\n"
@@ -1476,15 +1771,16 @@ static std::string format_version(xex2_version version) {
 }
 
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
-                                  const std::string_view module_path) {
+                                  const std::string_view module_path,
+                                  bool defer_main_thread_resume) {
   // Making changes to the UI (setting the icon) and executing game config
   // load callbacks which expect to be called from the UI thread.
   // If not on UI thread, dispatch to it synchronously.
   if (!display_window_->app_context().IsInUIThread()) {
     X_STATUS result = X_STATUS_UNSUCCESSFUL;
     display_window_->app_context().CallInUIThreadSynchronous(
-        [this, &path, &module_path, &result]() {
-          result = CompleteLaunch(path, module_path);
+        [this, &path, &module_path, defer_main_thread_resume, &result]() {
+          result = CompleteLaunch(path, module_path, defer_main_thread_resume);
         });
     return result;
   }
@@ -1500,12 +1796,15 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Partition1 will go to this. Registering during CompleteLaunch allows us
   // to make sure any HostPathDevices are ready beforehand. (see comment above
   // cache:\ device registration for more info about why)
-  auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"),
-                     std::string("\\Cache1")};
-  auto null_device =
-      std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
-  if (null_device->Initialize()) {
-    file_system_->RegisterDevice(std::move(null_device));
+  constexpr std::string_view kRawHarddiskDevice = "\\Device\\Harddisk0";
+  if (!file_system_->IsDeviceRegistered(kRawHarddiskDevice)) {
+    auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"),
+                       std::string("\\Cache1")};
+    auto null_device = std::make_unique<vfs::NullDevice>(
+        std::string(kRawHarddiskDevice), null_paths);
+    if (null_device->Initialize()) {
+      file_system_->RegisterDevice(std::move(null_device));
+    }
   }
 
   // Reset state.
@@ -1774,7 +2073,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Resume the main thread now.
   // If the debugger has requested a suspend this will just decrement the
   // suspend count without resuming it until the debugger wants.
-  main_thread_->Resume();
+  if (!defer_main_thread_resume) {
+    main_thread_->Resume();
+  }
 
   return X_STATUS_SUCCESS;
 }

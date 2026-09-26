@@ -20,8 +20,8 @@
 #include "third_party/crypto/des/des.h"
 #include "third_party/crypto/des/des3.h"
 #include "third_party/crypto/des/descbc.h"
-#include "third_party/crypto/sha256.cpp"
 #include "third_party/crypto/sha256.h"
+#include "xenia/kernel/xboxkrnl/xecrypt_rc4.h"
 #include "xenia/kernel/xboxkrnl/xecrypt_rsa.h"
 
 extern "C" {
@@ -379,45 +379,25 @@ static_assert_size(XE_CONSOLE_SIGNATURE, 0x228);
 
 void XeCryptRc4Key_entry(pointer_t<XECRYPT_RC4_STATE> rc4_ctx, lpvoid_t key,
                          dword_t key_size) {
-  // Setup RC4 state
-  rc4_ctx->i = rc4_ctx->j = 0;
-  for (uint32_t x = 0; x < 0x100; x++) {
-    rc4_ctx->S[x] = (uint8_t)x;
-  }
-
-  uint32_t idx = 0;
-  for (uint32_t x = 0; x < 0x100; x++) {
-    idx = (idx + rc4_ctx->S[x] + key[x % 0x10]) % 0x100;
-    uint8_t temp = rc4_ctx->S[idx];
-    rc4_ctx->S[idx] = rc4_ctx->S[x];
-    rc4_ctx->S[x] = temp;
-  }
+  xecrypt::rc4::KeySchedule(rc4_ctx->S, rc4_ctx->i, rc4_ctx->j,
+                            key.as<const uint8_t*>(), key_size);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptRc4Key, kNone, kImplemented);
 
 void XeCryptRc4Ecb_entry(pointer_t<XECRYPT_RC4_STATE> rc4_ctx, lpvoid_t data,
                          dword_t size) {
-  // Crypt data
-  for (uint32_t idx = 0; idx < size; idx++) {
-    rc4_ctx->i = (rc4_ctx->i + 1) % 0x100;
-    rc4_ctx->j = (rc4_ctx->j + rc4_ctx->S[rc4_ctx->i]) % 0x100;
-    uint8_t temp = rc4_ctx->S[rc4_ctx->i];
-    rc4_ctx->S[rc4_ctx->i] = rc4_ctx->S[rc4_ctx->j];
-    rc4_ctx->S[rc4_ctx->j] = temp;
-
-    uint8_t a = data[idx];
-    uint8_t b =
-        rc4_ctx->S[(rc4_ctx->S[rc4_ctx->i] + rc4_ctx->S[rc4_ctx->j]) % 0x100];
-    data[idx] = (uint8_t)(a ^ b);
-  }
+  xecrypt::rc4::Crypt(rc4_ctx->S, rc4_ctx->i, rc4_ctx->j, data.as<uint8_t*>(),
+                      size);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptRc4Ecb, kNone, kImplemented);
 
 void XeCryptRc4_entry(lpvoid_t key, dword_t key_size, lpvoid_t data,
                       dword_t size) {
   XECRYPT_RC4_STATE rc4_ctx;
-  XeCryptRc4Key_entry(&rc4_ctx, key, key_size);
-  XeCryptRc4Ecb_entry(&rc4_ctx, data, size);
+  xecrypt::rc4::KeySchedule(rc4_ctx.S, rc4_ctx.i, rc4_ctx.j,
+                            key.as<const uint8_t*>(), key_size);
+  xecrypt::rc4::Crypt(rc4_ctx.S, rc4_ctx.i, rc4_ctx.j, data.as<uint8_t*>(),
+                      size);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptRc4, kNone, kImplemented);
 
@@ -1036,9 +1016,13 @@ DECLARE_XBOXKRNL_EXPORT1(XeKeysGetKeyProperties, kNone, kImplemented);
 
 dword_result_t XeKeysGetKey_entry(word_t key, lpvoid_t key_buffer,
                                   lpdword_t key_length) {
+  // Keys without data, and any tail past a key's size, read as 0.
+  const uint32_t length = *key_length;
+  std::memset(key_buffer, 0, length);
   if (key_vault.contains(key)) {
     std::span<const uint8_t> key_needed = key_vault.at(key);
-    std::memcpy(key_buffer, key_needed.data(), *key_length);
+    std::memcpy(key_buffer, key_needed.data(),
+                std::min<size_t>(length, key_needed.size()));
   } else {
     XELOGW("Key 0x{:04X} not implemented", static_cast<uint16_t>(key));
   }

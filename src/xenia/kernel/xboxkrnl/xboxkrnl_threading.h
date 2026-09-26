@@ -70,6 +70,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
 
 X_STATUS xeProcessUserApcs(PPCContext* ctx);
 
+// Runs a guest KDPC's routine with (dpc, context, arg1, arg2) on the current
+// guest-capable thread at impersonated DISPATCH_LEVEL.
+void xeKeExecuteDpc(uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2);
+
 void xeRundownApcs(PPCContext* ctx);
 uint32_t xeKeGetCurrentProcessType(PPCContext* context);
 void xeKeSetCurrentProcessType(uint32_t type, PPCContext* context);

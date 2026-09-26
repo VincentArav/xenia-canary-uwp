@@ -28,6 +28,7 @@
 namespace xe {
 namespace cpu {
 class Processor;
+class TranslationDomainDescriptor;
 }  // namespace cpu
 }  // namespace xe
 
@@ -212,6 +213,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   Processor* processor() const { return processor_; }
   X64Backend* backend() const { return backend_; }
+  const TranslationDomainDescriptor* checked_memory_descriptor() const {
+    return checked_memory_descriptor_;
+  }
 
   static uintptr_t PlaceConstData();
   static void FreeConstData(uintptr_t data);
@@ -261,6 +265,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
+  GuestCallDispatchMode current_guest_call_dispatch_mode() const {
+    return current_guest_call_dispatch_mode_;
+  }
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
   void CallNative(uint64_t (*fn)(void* raw_context));
@@ -403,6 +410,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
   Xbyak::util::Cpu cpu_;
   uint64_t feature_flags_ = 0;
   uint32_t current_guest_function_ = 0;
+  const TranslationDomainDescriptor* checked_memory_descriptor_ = nullptr;
+  GuestCallDispatchMode current_guest_call_dispatch_mode_ =
+      GuestCallDispatchMode::kResolverOnly;
   Xbyak::Label* epilog_label_ = nullptr;
 
   hir::Instr* current_instr_ = nullptr;

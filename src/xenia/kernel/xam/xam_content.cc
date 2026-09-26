@@ -10,6 +10,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/smc.h"
 #include "xenia/kernel/user_module.h"
@@ -828,7 +829,7 @@ dword_result_t xeXamContentLaunchImage(dword_t user_index,
     });
   }
 
-  kernel_state()->TerminateTitle();
+  kernel_state()->emulator()->TerminateTitle();
   return X_ERROR_SUCCESS;
 }
 

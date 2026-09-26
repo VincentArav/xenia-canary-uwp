@@ -74,8 +74,10 @@ bool DeadCodeEliminationPass::Run(HIRBuilder* builder) {
       auto prev = i->prev;
 
       auto opcode = i->opcode;
-      if (!(opcode->flags & OPCODE_FLAG_VOLATILE) && i->dest &&
-          !i->dest->use_head) {
+      // A guest-memory read may fault in a checked domain even when its value
+      // is unused, so memory operations are kept.
+      if (!(opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_MEMORY)) &&
+          i->dest && !i->dest->use_head) {
         // Has no uses and is not volatile. This instruction can die!
         MakeNopRecursive(i);
         any_instr_removed = true;

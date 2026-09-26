@@ -25,6 +25,10 @@ using utf8_citer = utfcpp::iterator<std::string_view::const_iterator>;
 
 namespace xe::utf8 {
 
+bool is_valid(const std::string_view view) {
+  return utfcpp::is_valid(view.cbegin(), view.cend());
+}
+
 std::string to_string(char32_t c) {
   std::string result;
   utfcpp::append(c, result);

@@ -23,6 +23,7 @@
 #include "xenia/cpu/hir/opcodes.h"
 #include "xenia/cpu/hir/value.h"
 #include "xenia/cpu/mmio_handler.h"
+#include "xenia/cpu/translation_domain.h"
 
 #if defined(XE_COMPILER_MSVC) && defined(XE_ARCH_ARM64)
 // winnt.h defines `MemoryBarrier` as a macro on ARM-MSVC
@@ -61,6 +62,10 @@ class HIRBuilder {
 
   uint32_t attributes() const { return attributes_; }
   void set_attributes(uint32_t value) { attributes_ = value; }
+
+  const TranslationDomainKey& translation_domain_key() const {
+    return translation_domain_key_;
+  }
 
   std::vector<Value*>& locals() { return locals_; }
 
@@ -305,6 +310,10 @@ class HIRBuilder {
   void SetNJM(Value* value);
 
  protected:
+  void set_translation_domain_key(TranslationDomainKey translation_domain_key) {
+    translation_domain_key_ = translation_domain_key;
+  }
+
   void DumpValue(StringBuffer* str, Value* value);
   void DumpOp(StringBuffer* str, OpcodeSignatureType sig_type, Instr::Op* op);
 
@@ -322,6 +331,8 @@ class HIRBuilder {
   Arena* arena_;
 
   uint32_t attributes_;
+  TranslationDomainKey translation_domain_key_ =
+      TranslationDomainKey::DefaultDirect();
 
   uint32_t next_label_id_;
   uint32_t next_value_ordinal_;

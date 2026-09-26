@@ -416,6 +416,15 @@ typedef struct alignas(64) PPCContext_s {
   // Used to shuttle data into externs. Contents volatile.
   uint64_t scratch;
 
+  // The guest address the next builtin call reports: the sc instruction for
+  // the syscall builtin, the faulting instruction for the program-exception
+  // builtins, the resume address for the interrupt poll. Not guest state.
+  uint32_t guest_system_call_cia;
+
+  // Mirror of ThreadState::guest_interrupt_pending for generated code:
+  // checked-domain loops test it at backward branches. Host metadata only.
+  uint8_t guest_interrupt_pending;
+
   // Processor-specific data pointer. Used on callbacks to get access to the
   // current runtime and its data.
   Processor* processor;

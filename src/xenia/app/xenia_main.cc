@@ -125,7 +125,7 @@ DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
 DECLARE_bool(force_mount_devkit);
 
 DEFINE_transient_path(target, "",
-                      "Specifies the target .xex or .iso to execute.",
+                      "Specifies the target .xex, .xbe or .iso to execute.",
                       "General");
 #ifndef XE_PLATFORM_WIN32
 DEFINE_transient_bool(portable, false,
@@ -315,7 +315,7 @@ void EmulatorApp::DebugWindowClosedListener::OnClosing(xe::ui::UIEvent& e) {
 }
 
 EmulatorApp::EmulatorApp(xe::ui::WindowedAppContext& app_context)
-    : xe::ui::WindowedApp(app_context, "xenia", "[Path to .iso/.xex]"),
+    : xe::ui::WindowedApp(app_context, "xenia", "[Path to .iso/.xex/.xbe]"),
       debug_window_closed_listener_(*this) {
   AddPositionalOption("target");
 }

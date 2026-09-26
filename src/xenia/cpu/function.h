@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_FUNCTION_H_
 #define XENIA_CPU_FUNCTION_H_
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -82,6 +83,17 @@ class Function : public Symbol {
 
   virtual bool Call(ThreadState* thread_state, uint32_t return_address) = 0;
 
+ private:
+  friend class Module;
+  void CopyDeclarationMetadataFrom(const Function& source) {
+    name_ = source.name_;
+    end_address_ = source.end_address_;
+    behavior_ = source.behavior_;
+    saverest_type_ = source.saverest_type_;
+    is_restore_ = source.is_restore_;
+    saverest_index_ = source.saverest_index_;
+  }
+
  protected:
   Function(Module* module, uint32_t address);
 
@@ -114,6 +126,12 @@ class BuiltinFunction : public Function {
   void* arg1_ = nullptr;
 };
 
+// Half-open range of guest physical bytes that translated code was read from.
+struct GuestCodeSourceRange {
+  uint32_t begin;
+  uint32_t end;
+};
+
 class GuestFunction : public Function {
  public:
   typedef void (*ExternHandler)(ppc::PPCContext* ppc_context,
@@ -141,6 +159,24 @@ class GuestFunction : public Function {
   Export* export_data() const { return export_data_; }
   void SetupExtern(ExternHandler handler, Export* export_data = nullptr);
 
+  bool is_retired() const { return retired_.load(std::memory_order_acquire); }
+
+  // Physical sources of every instruction word the translation read, sorted
+  // and merged. Only checked-domain translations record them; complete is
+  // false when a word came from a reader that can't report its source.
+  void SetCodeSources(std::vector<GuestCodeSourceRange> sorted_ranges,
+                      bool complete) {
+    code_sources_ = std::move(sorted_ranges);
+    code_sources_complete_ = complete;
+  }
+  const std::vector<GuestCodeSourceRange>& code_sources() const {
+    return code_sources_;
+  }
+  bool code_sources_complete() const { return code_sources_complete_; }
+  // Whether a change to guest physical bytes [begin, end) may affect this
+  // translation. Incomplete sources conservatively overlap everything.
+  bool CodeSourcesMayOverlap(uint32_t begin, uint32_t end) const;
+
   const SourceMapEntry* LookupGuestAddress(uint32_t guest_address) const;
   const SourceMapEntry* LookupHIROffset(uint32_t offset) const;
   const SourceMapEntry* LookupMachineCodeOffset(uint32_t offset) const;
@@ -154,12 +190,19 @@ class GuestFunction : public Function {
  protected:
   virtual bool CallImpl(ThreadState* thread_state, uint32_t return_address) = 0;
 
+ private:
+  friend class Module;
+  void Retire() { retired_.store(true, std::memory_order_release); }
+
  protected:
   std::unique_ptr<FunctionDebugInfo> debug_info_;
   FunctionTraceData trace_data_;
   std::vector<SourceMapEntry> source_map_;
   ExternHandler extern_handler_ = nullptr;
   Export* export_data_ = nullptr;
+  std::atomic<bool> retired_{false};
+  std::vector<GuestCodeSourceRange> code_sources_;
+  bool code_sources_complete_ = false;
 };
 
 }  // namespace cpu

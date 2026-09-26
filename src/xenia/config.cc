@@ -31,7 +31,7 @@ DEFINE_uint32(
     "Config");
 
 namespace config {
-std::string config_name = "xenia-canary-netplay.config.toml";
+std::string config_name = "xenia-fusion-netplay.config.toml";
 std::filesystem::path config_folder;
 std::filesystem::path config_path;
 std::string game_config_suffix = ".config.toml";
@@ -295,6 +295,14 @@ void SetupConfig(const std::filesystem::path& config_folder) {
   // let's also load the default config
   if (!config_folder.empty()) {
     config_path = config_folder / config_name;
+    // Copy the config of a Xenia Canary Netplay build in the same folder.
+    const auto netplay_config_path =
+        config_folder / "xenia-canary-netplay.config.toml";
+    if (!std::filesystem::exists(config_path) &&
+        std::filesystem::exists(netplay_config_path)) {
+      std::error_code error;
+      std::filesystem::copy_file(netplay_config_path, config_path, error);
+    }
     if (std::filesystem::exists(config_path)) {
       ReadConfig(config_path, true);
     }

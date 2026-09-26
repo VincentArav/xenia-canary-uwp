@@ -9,10 +9,14 @@
 
 #include "xenia/cpu/ppc/ppc_translator.h"
 
+#include <algorithm>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
 #include "xenia/base/assert.h"
-#include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
-#include "xenia/base/memory.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/reset_scope.h"
 #include "xenia/base/string.h"
@@ -40,6 +44,89 @@ namespace ppc {
 using xe::cpu::backend::Backend;
 using xe::cpu::compiler::Compiler;
 namespace passes = xe::cpu::compiler::passes;
+
+namespace {
+
+// Records the physical source of every word a checked-domain translation
+// reads, and returns the first read of a word thereafter, so scanning,
+// disassembly and emission see the same instructions.
+class RecordingGuestCodeReader final : public GuestCodeReader {
+ public:
+  explicit RecordingGuestCodeReader(const GuestCodeReader& reader)
+      : reader_(reader) {}
+
+  MemoryAccessMode memory_access_mode() const override {
+    return reader_.memory_access_mode();
+  }
+
+  bool TryReadInstruction(uint32_t guest_address,
+                          uint32_t* instruction_out) const override {
+    uint32_t source_address;
+    return TryReadInstructionWithSource(guest_address, instruction_out,
+                                        &source_address);
+  }
+
+  bool TryReadInstructionWithSource(
+      uint32_t guest_address, uint32_t* instruction_out,
+      uint32_t* source_address_out) const override {
+    if (!instruction_out || !source_address_out) {
+      return false;
+    }
+    auto it = words_.find(guest_address);
+    if (it == words_.end()) {
+      Word word;
+      if (!reader_.TryReadInstructionWithSource(
+              guest_address, &word.instruction, &word.source_address)) {
+        return false;
+      }
+      it = words_.emplace(guest_address, word).first;
+    }
+    *instruction_out = it->second.instruction;
+    *source_address_out = it->second.source_address;
+    return true;
+  }
+
+  // The sorted, merged sources of every word read, and whether all of them
+  // were known.
+  std::vector<GuestCodeSourceRange> CollectSources(bool* complete_out) const {
+    bool complete = true;
+    std::vector<GuestCodeSourceRange> ranges;
+    ranges.reserve(words_.size());
+    for (const auto& [guest_address, word] : words_) {
+      if (word.source_address == kUnknownInstructionSource ||
+          word.source_address > UINT32_MAX - 4) {
+        complete = false;
+        continue;
+      }
+      ranges.push_back({word.source_address, word.source_address + 4});
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const GuestCodeSourceRange& a, const GuestCodeSourceRange& b) {
+                return a.begin < b.begin;
+              });
+    std::vector<GuestCodeSourceRange> merged;
+    for (const GuestCodeSourceRange& range : ranges) {
+      if (!merged.empty() && range.begin <= merged.back().end) {
+        merged.back().end = std::max(merged.back().end, range.end);
+      } else {
+        merged.push_back(range);
+      }
+    }
+    *complete_out = complete;
+    return merged;
+  }
+
+ private:
+  struct Word {
+    uint32_t instruction;
+    uint32_t source_address;
+  };
+
+  const GuestCodeReader& reader_;
+  mutable std::unordered_map<uint32_t, Word> words_;
+};
+
+}  // namespace
 
 PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   Backend* backend = frontend->processor()->backend();
@@ -180,6 +267,33 @@ void PPCTranslator::DumpHIR(GuestFunction* function, PPCHIRBuilder* builder) {
 bool PPCTranslator::Translate(GuestFunction* function,
                               uint32_t debug_info_flags) {
   SCOPE_profile_cpu_f("cpu");
+  if (!function) {
+    return false;
+  }
+  const TranslationDomainKey translation_domain_key =
+      function->translation_domain_key();
+  const GuestCodeReader* guest_code_reader =
+      frontend_->guest_code_reader(translation_domain_key);
+  if (!guest_code_reader) {
+    XELOGE("No instruction reader for translation domain {}",
+           translation_domain_key.id());
+    return false;
+  }
+  if (!frontend_->processor()->CanExecuteTranslationDomain(
+          translation_domain_key)) {
+    XELOGE(
+        "Refusing to translate guest function in an unsupported translation "
+        "domain");
+    return false;
+  }
+  // Checked-domain translations record their sources, so sweeps can retire
+  // them.
+  std::optional<RecordingGuestCodeReader> recording_reader;
+  if (translation_domain_key != TranslationDomainKey::DefaultDirect()) {
+    recording_reader.emplace(*guest_code_reader);
+    guest_code_reader = &*recording_reader;
+  }
+
   HirBuilderScope hir_build_scope{builder_.get()};
   // Reset() all caching when we leave.
   xe::make_reset_scope(builder_);
@@ -209,7 +323,7 @@ bool PPCTranslator::Translate(GuestFunction* function,
   }
 
   // Scan the function to find its extents and gather debug data.
-  if (!scanner_->Scan(function, debug_info.get())) {
+  if (!scanner_->Scan(function, *guest_code_reader, debug_info.get())) {
     return false;
   }
 
@@ -236,7 +350,9 @@ bool PPCTranslator::Translate(GuestFunction* function,
 
   // Stash source.
   if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmSource) {
-    DumpSource(function, &string_buffer_);
+    if (!DumpSource(function, *guest_code_reader, &string_buffer_)) {
+      return false;
+    }
     debug_info->set_source_disasm(xe_strdup(string_buffer_.buffer()));
     string_buffer_.Reset();
   }
@@ -246,8 +362,15 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (debug_info) {
     emit_flags |= PPCHIRBuilder::EMIT_DEBUG_COMMENTS;
   }
-  if (!builder_->Emit(function, emit_flags)) {
+  if (!builder_->Emit(function, *guest_code_reader, emit_flags)) {
     return false;
+  }
+  // Every guest word this translation depends on has now been read.
+  if (recording_reader) {
+    bool sources_complete;
+    std::vector<GuestCodeSourceRange> sources =
+        recording_reader->CollectSources(&sources_complete);
+    function->SetCodeSources(std::move(sources), sources_complete);
   }
 
   // Stash raw HIR.
@@ -280,23 +403,29 @@ bool PPCTranslator::Translate(GuestFunction* function,
   return true;
 }
 void PPCTranslator::Reset() { builder_->ResetPools(); }
-void PPCTranslator::DumpSource(GuestFunction* function,
+bool PPCTranslator::DumpSource(GuestFunction* function,
+                               const GuestCodeReader& guest_code_reader,
                                StringBuffer* string_buffer) {
-  Memory* memory = frontend_->memory();
-
   string_buffer->AppendFormat(
       "{} fn {:08X}-{:08X} {}\n", function->module()->name().c_str(),
       function->address(), function->end_address(), function->name().c_str());
 
-  auto blocks = scanner_->FindBlocks(function);
+  std::vector<BlockInfo> blocks;
+  if (!scanner_->FindBlocks(function, guest_code_reader, &blocks)) {
+    return false;
+  }
 
   uint32_t start_address = function->address();
   uint32_t end_address = function->end_address();
   auto block_it = blocks.begin();
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code;
+    if (!guest_code_reader.TryReadInstruction(address, &code)) {
+      XELOGE("Failed to fetch PPC instruction at {:08X} while disassembling",
+             address);
+      return false;
+    }
 
     // Check labels.
     if (block_it != blocks.end() && block_it->start_address == address) {
@@ -309,6 +438,7 @@ void PPCTranslator::DumpSource(GuestFunction* function,
     DisasmPPC(address, code, string_buffer);
     string_buffer->Append('\n');
   }
+  return true;
 }
 
 }  // namespace ppc

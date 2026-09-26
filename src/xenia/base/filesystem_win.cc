@@ -71,6 +71,22 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
   return true;
 }
 
+bool IsSymlinkOrReparsePoint(const std::filesystem::path& path) {
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+std::error_code RenameFileNoReplace(const std::filesystem::path& source,
+                                    const std::filesystem::path& destination) {
+  if (MoveFileExW(source.c_str(), destination.c_str(),
+                  MOVEFILE_WRITE_THROUGH)) {
+    return {};
+  }
+  return std::error_code(static_cast<int>(GetLastError()),
+                         std::system_category());
+}
+
 FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
   // Dumb, but OK.
   const auto wmode = xe::to_utf16(mode);
@@ -166,8 +182,9 @@ class Win32FileHandle : public FileHandle {
   HANDLE handle_ = nullptr;
 };
 
-std::unique_ptr<FileHandle> FileHandle::OpenExisting(
-    const std::filesystem::path& path, uint32_t desired_access) {
+namespace {
+
+DWORD GetWin32FileAccess(uint32_t desired_access) {
   DWORD open_access = 0;
   if (desired_access & FileAccess::kGenericRead) {
     open_access |= GENERIC_READ;
@@ -190,6 +207,25 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= FILE_APPEND_DATA;
   }
+  return open_access;
+}
+
+}  // namespace
+
+std::unique_ptr<FileHandle> FileHandle::CreateNew(
+    const std::filesystem::path& path, uint32_t desired_access) {
+  HANDLE handle =
+      CreateFileW(path.c_str(), GetWin32FileAccess(desired_access), 0, nullptr,
+                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return nullptr;
+  }
+  return std::make_unique<Win32FileHandle>(path, handle);
+}
+
+std::unique_ptr<FileHandle> FileHandle::OpenExisting(
+    const std::filesystem::path& path, uint32_t desired_access) {
+  DWORD open_access = GetWin32FileAccess(desired_access);
   DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   // We assume we've already created the file in the caller.
   DWORD creation_disposition = OPEN_EXISTING;
@@ -212,6 +248,8 @@ std::optional<FileInfo> GetInfo(const std::filesystem::path& path) {
   }
 
   FileInfo out_info{};
+  out_info.is_symlink_or_reparse_point =
+      (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
   if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
     out_info.type = FileInfo::Type::kDirectory;
@@ -242,7 +280,9 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
         std::wcscmp(ffd.cFileName, L"..") == 0) {
       continue;
     }
-    FileInfo info;
+    FileInfo info{};
+    info.is_symlink_or_reparse_point =
+        (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       info.type = FileInfo::Type::kDirectory;
       info.total_size = 0;

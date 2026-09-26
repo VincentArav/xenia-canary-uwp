@@ -87,7 +87,7 @@ Entry* Entry::IterateChildren(const xe::filesystem::WildcardEngine& engine,
 
 Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
   auto global_lock = global_critical_region_.Acquire();
-  if (is_read_only()) {
+  if (!can_create_children()) {
     return nullptr;
   }
   if (GetChild(name)) {
@@ -106,7 +106,8 @@ Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
 
 bool Entry::Delete(Entry* entry) {
   auto global_lock = global_critical_region_.Acquire();
-  if (is_read_only()) {
+  // A writable overlay root may still contain read-only children.
+  if (!can_create_children() || entry->is_read_only()) {
     return false;
   }
   if (entry->parent() != this) {
@@ -134,21 +135,27 @@ void Entry::Touch() {
   // TODO(benvanik): update timestamps.
 }
 
-void Entry::Rename(const std::filesystem::path file_path) {
+bool Entry::Rename(const std::filesystem::path file_path) {
   // Store the string to ensure string_views from split_path remain valid
   const std::string path_str = xe::path_to_utf8(file_path);
   std::vector<std::string_view> path_parts = xe::utf8::split_path(path_str);
 
   // Remove the root (e.g., "cache:")
+  if (path_parts.size() < 2) {
+    return false;
+  }
   path_parts.erase(path_parts.begin());
 
-  RenameEntryInternal(path_parts);
+  if (!RenameEntryInternal(path_parts)) {
+    return false;
+  }
 
   const std::string guest_path = xe::utf8::join_guest_paths(path_parts);
   absolute_path_ =
       xe::utf8::join_guest_paths(device_->mount_path(), guest_path);
   path_ = guest_path;
   name_ = xe::path_to_utf8(file_path.filename());
+  return true;
 }
 
 }  // namespace vfs

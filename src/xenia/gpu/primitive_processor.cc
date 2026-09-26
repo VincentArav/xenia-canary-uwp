@@ -68,6 +68,20 @@ DEFINE_int32(
 
 namespace xe {
 namespace gpu {
+namespace {
+
+constexpr bool HalfOpenRangesOverlap(uint32_t first_start, uint32_t first_end,
+                                     uint32_t second_start,
+                                     uint32_t second_end) {
+  return first_start < second_end && second_start < first_end;
+}
+
+static_assert(HalfOpenRangesOverlap(100, 120, 90, 101));
+static_assert(HalfOpenRangesOverlap(100, 120, 119, 130));
+static_assert(!HalfOpenRangesOverlap(100, 120, 80, 100));
+static_assert(!HalfOpenRangesOverlap(100, 120, 120, 140));
+
+}  // namespace
 
 // SIMD processing here assumes that alignment is not required (neither AVX nor
 // Neon requires it) and there's no punishment for using an unaligned access
@@ -1605,60 +1619,60 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
               entry.buckets_next[bucket_index - entry_bucket_index_first];
           // For exact_range, don't invalidate bucket entries that are outside
           // the specified range.
-          if (entry_key.base < physical_address_end) {
-            uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
-              // Invalidate the entry.
-              any_invalidated = true;
-              // Remove the entry from the cache map.
-              auto entry_map_it = cache_map_.find(entry_key);
-              assert_true(entry_map_it != cache_map_.end());
-              if (entry_map_it != cache_map_.end()) {
-                cache_map_.erase(entry_map_it);
-              }
-              // Unlink the entry from the bucket's list.
-              uint32_t entry_link_index_last =
-                  ((entry_end - 1) >> kCacheBucketSizeBytesLog2) -
-                  entry_bucket_index_first;
-              assert_true(
-                  entry_link_index_last <= 1,
-                  "Cache entries only store list links within two buckets");
-              for (uint32_t entry_link_index = 0;
-                   entry_link_index <= entry_link_index_last;
-                   ++entry_link_index) {
-                uint32_t entry_bucket_index =
-                    entry_bucket_index_first + entry_link_index;
-                size_t entry_link_prev = entry.buckets_prev[entry_link_index];
-                size_t entry_link_next = entry.buckets_next[entry_link_index];
-                if (entry_link_prev != SIZE_MAX) {
-                  CacheEntry& entry_prev = cache_entry_pool_[entry_link_prev];
-                  entry_prev.buckets_next[size_t(
-                      (entry_prev.key.base >> kCacheBucketSizeBytesLog2) !=
-                      entry_bucket_index)] = entry_link_next;
-                } else {
-                  if (entry_link_next != SIZE_MAX) {
-                    cache_bucket_first_entries_[entry_bucket_index] =
-                        entry_link_next;
-                  } else {
-                    // The only entry that was remaining in the bucket - it's
-                    // empty now.
-                    cache_buckets_non_empty_l1_[entry_bucket_index >> 6] &=
-                        ~(uint64_t(1) << (entry_bucket_index & 63));
-                    UpdateCacheBucketsNonEmptyL2(entry_bucket_index >> 6,
-                                                 global_lock);
-                  }
-                }
-                if (entry_link_next != SIZE_MAX) {
-                  CacheEntry& entry_next = cache_entry_pool_[entry_link_next];
-                  entry_next.buckets_prev[size_t(
-                      (entry_next.key.base >> kCacheBucketSizeBytesLog2) !=
-                      entry_bucket_index)] = entry_link_prev;
-                }
-              }
-              // Make the entry free for reuse.
-              entry.free_next = cache_bucket_free_first_entry_;
-              cache_bucket_free_first_entry_ = entry_index;
+          const uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
+          if (HalfOpenRangesOverlap(entry_key.base, entry_end,
+                                    physical_address_start,
+                                    physical_address_end)) {
+            // Invalidate the entry.
+            any_invalidated = true;
+            // Remove the entry from the cache map.
+            auto entry_map_it = cache_map_.find(entry_key);
+            assert_true(entry_map_it != cache_map_.end());
+            if (entry_map_it != cache_map_.end()) {
+              cache_map_.erase(entry_map_it);
             }
+            // Unlink the entry from the bucket's list.
+            uint32_t entry_link_index_last =
+                ((entry_end - 1) >> kCacheBucketSizeBytesLog2) -
+                entry_bucket_index_first;
+            assert_true(
+                entry_link_index_last <= 1,
+                "Cache entries only store list links within two buckets");
+            for (uint32_t entry_link_index = 0;
+                 entry_link_index <= entry_link_index_last;
+                 ++entry_link_index) {
+              uint32_t entry_bucket_index =
+                  entry_bucket_index_first + entry_link_index;
+              size_t entry_link_prev = entry.buckets_prev[entry_link_index];
+              size_t entry_link_next = entry.buckets_next[entry_link_index];
+              if (entry_link_prev != SIZE_MAX) {
+                CacheEntry& entry_prev = cache_entry_pool_[entry_link_prev];
+                entry_prev.buckets_next[size_t(
+                    (entry_prev.key.base >> kCacheBucketSizeBytesLog2) !=
+                    entry_bucket_index)] = entry_link_next;
+              } else {
+                if (entry_link_next != SIZE_MAX) {
+                  cache_bucket_first_entries_[entry_bucket_index] =
+                      entry_link_next;
+                } else {
+                  // The only entry that was remaining in the bucket - it's
+                  // empty now.
+                  cache_buckets_non_empty_l1_[entry_bucket_index >> 6] &=
+                      ~(uint64_t(1) << (entry_bucket_index & 63));
+                  UpdateCacheBucketsNonEmptyL2(entry_bucket_index >> 6,
+                                               global_lock);
+                }
+              }
+              if (entry_link_next != SIZE_MAX) {
+                CacheEntry& entry_next = cache_entry_pool_[entry_link_next];
+                entry_next.buckets_prev[size_t(
+                    (entry_next.key.base >> kCacheBucketSizeBytesLog2) !=
+                    entry_bucket_index)] = entry_link_prev;
+              }
+            }
+            // Make the entry free for reuse.
+            entry.free_next = cache_bucket_free_first_entry_;
+            cache_bucket_free_first_entry_ = entry_index;
           }
           entry_index = next_entry_index;
         } while (entry_index != SIZE_MAX);

@@ -9,7 +9,11 @@
 
 #include "xenia/cpu/function.h"
 
+#include <algorithm>
+
 #include "xenia/base/logging.h"
+#include "xenia/cpu/module.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 
@@ -129,8 +133,55 @@ uint32_t GuestFunction::MapMachineCodeToGuestAddress(
   return entry ? entry->guest_address : address();
 }
 
+bool GuestFunction::CodeSourcesMayOverlap(uint32_t begin, uint32_t end) const {
+  if (!code_sources_complete_) {
+    return true;
+  }
+  if (begin >= end) {
+    return false;
+  }
+  // The first range ending after begin is the only candidate.
+  auto it =
+      std::upper_bound(code_sources_.cbegin(), code_sources_.cend(), begin,
+                       [](uint32_t value, const GuestCodeSourceRange& range) {
+                         return value < range.end;
+                       });
+  return it != code_sources_.cend() && it->begin < end;
+}
+
 bool GuestFunction::Call(ThreadState* thread_state, uint32_t return_address) {
   // SCOPE_profile_cpu_f("cpu");
+
+  if (is_retired()) {
+    XELOGE("Rejected call through retired guest function at {:08X}", address());
+    return false;
+  }
+
+  if (!thread_state) {
+    XELOGE("Rejected guest function call at {:08X} without a thread state",
+           address());
+    return false;
+  }
+
+  const TranslationDomainKey function_domain = translation_domain_key();
+  const TranslationDomainKey thread_domain =
+      thread_state->translation_domain_key();
+  if (thread_state->processor() != module()->processor() ||
+      thread_domain != function_domain) {
+    XELOGE(
+        "Rejected guest function call at {:08X}: thread translation domain "
+        "{:016X} does not match function domain {:016X}",
+        address(), thread_domain.id(), function_domain.id());
+    return false;
+  }
+  if (!thread_state->processor()->CanExecuteTranslationDomain(
+          function_domain)) {
+    XELOGE(
+        "Rejected guest function call at {:08X}: translation domain {:016X} "
+        "is not executable",
+        address(), function_domain.id());
+    return false;
+  }
 
   ThreadState* original_thread_state = ThreadState::Get();
   if (original_thread_state != thread_state) {

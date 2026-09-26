@@ -51,6 +51,10 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
   if (!lk) {
     // If LR is not set this call will never return here.
     call_flags |= CALL_TAIL;
+  } else if (f.is_checked_user_mode()) {
+    // A tail call, so a callee that never returns doesn't grow the host stack;
+    // its blr resolves LR like any indirect branch.
+    call_flags |= CALL_TAIL;
   }
 
   // TODO(benvanik): set CALL_TAIL if !lk and the last block in the fn.
@@ -67,7 +71,30 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
       is_recursion = true;
     }
     Label* label = is_recursion ? NULL : f.LookupLabel(nia_value);
-    if (label) {
+    if (label && f.is_checked_user_mode() && nia_value <= cia) {
+      // Poll pending interrupts on a taken backward branch: a loop within one
+      // function never reaches the resolver, which takes them otherwise.
+      Label* not_taken = cond ? f.NewLabel() : nullptr;
+      if (cond) {
+        if (expect_true) {
+          f.BranchFalse(cond, not_taken);
+        } else {
+          f.BranchTrue(cond, not_taken);
+        }
+      }
+      Label* no_interrupt = f.NewLabel();
+      f.BranchFalse(f.LoadContext(offsetof(PPCContext, guest_interrupt_pending),
+                                  INT8_TYPE),
+                    no_interrupt);
+      f.StoreContext(offsetof(PPCContext, guest_system_call_cia),
+                     f.LoadConstantUint32(nia_value));
+      f.CallExtern(f.builtins()->interrupt_poll_handler);
+      f.MarkLabel(no_interrupt);
+      f.Branch(label);
+      if (not_taken) {
+        f.MarkLabel(not_taken);
+      }
+    } else if (label) {
       // Branch to label.
       uint32_t branch_flags = 0;
       if (cond) {
@@ -422,11 +449,18 @@ int InstrEmit_crxor(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_mcrf(PPCHIRBuilder& f, const InstrData& i) {
-  uint32_t crfd = i.XL.BO >> 2;
-  Value* bi = f.LoadCR(i.XL.BI >> 2);
-
-  f.StoreCR(crfd, bi);
-  f.UpdateCR(crfd, bi);
+  // CR[4*BF:4*BF+3] <- CR[4*BFA:4*BFA+3]
+  // Copy the four bits exactly; LoadCR/StoreCR position a field by its own
+  // index, so they cannot move bits between fields.
+  const uint32_t crfd = i.XL.BO >> 2;
+  const uint32_t crfs = i.XL.BI >> 2;
+  Value* bits[4];
+  for (uint32_t bit = 0; bit < 4; ++bit) {
+    bits[bit] = f.LoadCRField(crfs, bit);
+  }
+  for (uint32_t bit = 0; bit < 4; ++bit) {
+    f.StoreCRField(crfd, bit, bits[bit]);
+  }
   return 0;
 }
 
@@ -457,10 +491,20 @@ int InstrEmit_sc(PPCHIRBuilder& f, const InstrData& i) {
   // LEV=2 is to signify 'call import' from Xenia.
   // TODO(gibbed): syscalls!
   if (i.SC.LEV == 0) {
+    f.StoreContext(offsetof(PPCContext, guest_system_call_cia),
+                   f.LoadConstantUint32(i.address));
     f.CallExtern(f.builtins()->syscall_handler);
     return 0;
   }
   if (i.SC.LEV == 2) {
+    // LEV=2 is Xenia's import-thunk convention for XEX modules; checked code
+    // can't reach a host export through it.
+    if (f.translation_domain_key() != TranslationDomainKey::DefaultDirect()) {
+      XELOGE(
+          "Refusing Xenia-private LEV=2 import in translation domain {:016X}",
+          f.translation_domain_key().id());
+      return PPCHIRBuilder::kInstructionEmitTranslationFailed;
+    }
     f.CallExtern(f.function());
     return 0;
   }
@@ -475,7 +519,11 @@ constexpr uint32_t TRAP_SLT = 1 << 4, TRAP_SGT = 1 << 3, TRAP_EQ = 1 << 2,
 
 int InstrEmit_trap(PPCHIRBuilder& f, const InstrData& i, Value* va, Value* vb,
                    uint32_t TO) {
-  if (cvars::ignore_trap_instructions) {
+  // Checked user-mode code gets the architectural program interrupt, which
+  // the guest kernel reports to the user-mode handler. ignore_trap_instructions
+  // only covers DefaultDirect titles.
+  const bool raise_program_exception = f.is_checked_user_mode();
+  if (!raise_program_exception && cvars::ignore_trap_instructions) {
     return 0;
   }
   // if (a < b) & TO[0] then TRAP
@@ -544,13 +592,20 @@ int InstrEmit_trap(PPCHIRBuilder& f, const InstrData& i, Value* va, Value* vb,
     }
   }
   if (v) {
-    f.TrapTrue(v);
+    if (raise_program_exception) {
+      auto no_trap = f.NewLabel();
+      f.BranchFalse(v, no_trap);
+      f.RaiseProgramException(i.address, GuestProgramExceptionKind::kTrap);
+      f.MarkLabel(no_trap);
+    } else {
+      f.TrapTrue(v);
+    }
   }
   return 0;
 }
 
 int InstrEmit_td(PPCHIRBuilder& f, const InstrData& i) {
-  if (cvars::ignore_trap_instructions) {
+  if (cvars::ignore_trap_instructions && !f.is_checked_user_mode()) {
     return 0;
   }
   // a <- (RA)
@@ -566,7 +621,7 @@ int InstrEmit_td(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_tdi(PPCHIRBuilder& f, const InstrData& i) {
-  if (cvars::ignore_trap_instructions) {
+  if (cvars::ignore_trap_instructions && !f.is_checked_user_mode()) {
     return 0;
   }
   // a <- (RA)
@@ -581,7 +636,7 @@ int InstrEmit_tdi(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_tw(PPCHIRBuilder& f, const InstrData& i) {
-  if (cvars::ignore_trap_instructions) {
+  if (cvars::ignore_trap_instructions && !f.is_checked_user_mode()) {
     return 0;
   }
   // a <- EXTS((RA)[32:63])
@@ -599,7 +654,7 @@ int InstrEmit_tw(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_twi(PPCHIRBuilder& f, const InstrData& i) {
-  if (cvars::ignore_trap_instructions) {
+  if (cvars::ignore_trap_instructions && !f.is_checked_user_mode()) {
     return 0;
   }
   // a <- EXTS((RA)[32:63])
@@ -608,7 +663,8 @@ int InstrEmit_twi(PPCHIRBuilder& f, const InstrData& i) {
   // if (a = EXTS(SI)) & TO[2] then TRAP
   // if (a <u EXTS(SI)) & TO[3] then TRAP
   // if (a >u EXTS(SI)) & TO[4] then TRAP
-  if (i.D.RA == 0 && i.D.RT == 0x1F) {
+  // Checked user-mode code gets the architectural program interrupt instead.
+  if (i.D.RA == 0 && i.D.RT == 0x1F && !f.is_checked_user_mode()) {
     // This is a special trap. Probably.
     uint16_t type = (uint16_t)XEEXTS16(i.D.DS);
     f.Trap(type);

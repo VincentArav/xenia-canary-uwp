@@ -862,6 +862,11 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
+  test(rax, rax);
+  Xbyak::Label resolved_target;
+  jnz(resolved_target);
+  DebugBreak();
+  L(resolved_target);
   jmp(rax);
 #else
   // Function is called with the following params:
@@ -901,6 +906,11 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
+  test(rax, rax);
+  Xbyak::Label resolved_target;
+  jnz(resolved_target);
+  DebugBreak();
+  L(resolved_target);
   jmp(rax);
 #endif
 
@@ -1834,9 +1844,12 @@ uint32_t X64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
       GUEST_TRAMPOLINE_BASE +
       (static_cast<uint32_t>(new_index) * GUEST_TRAMPOLINE_MIN_LEN);
 
-  code_cache()->AddIndirection(
-      indirection_guest_addr,
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)));
+  if (!code_cache()->AddIndirection(
+          TranslationDomainKey::DefaultDirect(), indirection_guest_addr,
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)))) {
+    guest_trampoline_address_bitmap_.Release(new_index);
+    return 0;
+  }
 
   return indirection_guest_addr;
 }

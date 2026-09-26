@@ -291,6 +291,31 @@ dword_result_t VdSetDisplayModeOverride_entry(dword_t width, dword_t height,
 }
 DECLARE_XBOXKRNL_EXPORT1(VdSetDisplayModeOverride, kVideo, kStub);
 
+void VdSetWSSOption_entry(dword_t option) {
+  // Wide screen signalling (0x10000 = 16:9) tells an analog SD TV to stretch
+  // the picture. The host output is HD; its aspect ratio comes from the
+  // scaler and the same widescreen setting.
+}
+DECLARE_XBOXKRNL_EXPORT1(VdSetWSSOption, kVideo, kStub);
+
+struct X_VIDEO_COLOR_PROFILE_ADJUSTMENT {
+  xe::be<float> gain;  // 0.925 with an offset of 64: NTSC 7.5 IRE setup.
+  xe::be<float> offset;
+  xe::be<float> unknown_gain;
+  xe::be<float> unknown_offset;
+  xe::be<float> unknown;
+  xe::be<uint32_t> enabled;
+};
+static_assert_size(X_VIDEO_COLOR_PROFILE_ADJUSTMENT, 0x18);
+
+void VdSetColorProfileAdjustment_entry(
+    pointer_t<X_VIDEO_COLOR_PROFILE_ADJUSTMENT> adjustment) {
+  // Adjusts the analog video levels, and HD output passes the identity
+  // (gain 1, offset 0). A TV removes the NTSC setup level again, so the host
+  // presents without it.
+}
+DECLARE_XBOXKRNL_EXPORT1(VdSetColorProfileAdjustment, kVideo, kStub);
+
 dword_result_t VdInitializeEngines_entry(unknown_t unk0, function_t callback,
                                          lpvoid_t arg, lpdword_t pfp_ptr,
                                          lpdword_t me_ptr) {

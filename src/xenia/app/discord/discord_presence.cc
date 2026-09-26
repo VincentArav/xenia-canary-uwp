@@ -54,7 +54,7 @@ void DiscordPresence::NotPlaying() {
   discordPresence.state = "Idle";
   discordPresence.details = "Standby";
   discordPresence.largeImageKey = "app";
-  discordPresence.largeImageText = "Xenia Canary - Netplay";
+  discordPresence.largeImageText = "Xenia Fusion - Netplay";
   discordPresence.startTimestamp = time(0);
   Discord_UpdatePresence(&discordPresence);
 }
@@ -132,7 +132,7 @@ void DiscordPresence::UpdatePresence() {
   discordPresence.state = current_state_.c_str();
   discordPresence.details = current_details_.c_str();
   discordPresence.largeImageKey = "app";
-  discordPresence.largeImageText = "Xenia Canary - Netplay";
+  discordPresence.largeImageText = "Xenia Fusion - Netplay";
   discordPresence.startTimestamp = start_time;
   discordPresence.instance = 1;
 

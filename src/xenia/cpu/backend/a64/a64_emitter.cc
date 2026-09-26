@@ -93,6 +93,8 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   trace_data_ = &function->trace_data();
 
   current_guest_function_ = function->address();
+  current_guest_call_dispatch_mode_ =
+      GetGuestCallDispatchMode(function->translation_domain_key());
 
   // Reset state.
   stack_size_ = StackLayout::GUEST_STACK_SIZE;
@@ -334,10 +336,17 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   ForgetFpcrMode();
   auto fn = static_cast<A64Function*>(function);
+  const bool may_use_default_dispatch =
+      current_guest_call_dispatch_mode_ ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection &&
+      GetGuestCallDispatchMode(function->translation_domain_key()) ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection;
+  uint8_t* machine_code =
+      may_use_default_dispatch ? fn->machine_code() : nullptr;
 
-  if (fn->machine_code()) {
+  if (machine_code) {
     // Direct call — function is already compiled.
-    mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));
+    mov(x9, reinterpret_cast<uint64_t>(machine_code));
     if (!(instr->flags & hir::CALL_TAIL)) {
       // Pass the next call's guest return address in x0.
       ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
@@ -359,10 +368,10 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     return;
   }
 
-  if (code_cache_->has_indirection_table()) {
-    // Load host code address from indirection table.
+  if (may_use_default_dispatch && code_cache_->has_indirection_table()) {
+    // Pair with the release-store that publishes the generated target.
     mov(w16, function->address());
-    ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
+    ldar(w9, ptr(x16));
   } else {
     // Fallback: resolve at runtime.
     mov(x0, x20);  // context
@@ -371,6 +380,11 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     blr(x9);
     mov(x9, x0);  // resolved address in x9
   }
+
+  auto& resolved_target = NewCachedLabel();
+  cbnz(x9, resolved_target);
+  DebugBreak();
+  L(resolved_target);
 
   if (instr->flags & hir::CALL_TAIL) {
     PopStackpoint();
@@ -403,10 +417,12 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   }
 
   // Load host code address from indirection table.
-  if (code_cache_->has_indirection_table()) {
+  if (current_guest_call_dispatch_mode_ ==
+          GuestCallDispatchMode::kDirectLinkAndGlobalIndirection &&
+      code_cache_->has_indirection_table()) {
     mov(w16, target_w);  // w16 = guest address (also used by resolve thunk)
-    ldr(w9, ptr(x16, static_cast<uint32_t>(
-                         0)));  // w9 = host code from indirection table
+    // Pair with the release-store that publishes the generated target.
+    ldar(w9, ptr(x16));  // w9 = host code from indirection table
   } else {
     // Fallback: resolve at runtime.
     mov(w16, target_w);
@@ -416,6 +432,11 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     blr(x9);
     mov(x9, x0);  // resolved address
   }
+
+  auto& resolved_target = NewCachedLabel();
+  cbnz(x9, resolved_target);
+  DebugBreak();
+  L(resolved_target);
 
   if (instr->flags & hir::CALL_TAIL) {
     // Tail call: pass our return address to the callee.

@@ -538,7 +538,8 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
           float btn_width = (ImGui::GetContentRegionAvail().x * 0.5f) -
                             (ImGui::GetStyle().ItemSpacing.x * 0.5f);
 
-          ImGui::Text("Multiple instances of Xenia Canary are running.");
+          ImGui::Text(
+              "Multiple instances of Xenia Fusion Netplay are running.");
           ImGui::Spacing();
           ImGui::TextWrapped(
               "Please close all other instances before applying the update.");
@@ -830,7 +831,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
 
       ImGui::Separator();
 
-      ImGui::Text("To update Xenia Canary manually:");
+      ImGui::Text("To update Xenia Fusion Netplay manually:");
       ImGui::Text(
           fmt::format("1. Extract the zip file: {}", artifact_name_).c_str());
       ImGui::Text("2. Replace the current Xenia executable with the new one.");

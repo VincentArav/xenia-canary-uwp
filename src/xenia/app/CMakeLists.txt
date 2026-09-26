@@ -1,4 +1,4 @@
-# src/xenia/app/CMakeLists.txt - Main xenia_canary executable.
+# src/xenia/app/CMakeLists.txt - Main xenia_fusion_netplay executable.
 
 if(WIN32)
   add_executable(xenia-app WIN32)
@@ -6,7 +6,7 @@ else()
   add_executable(xenia-app)
 endif()
 
-set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_canary_netplay")
+set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_fusion_netplay")
 
 # Main source
 target_sources(xenia-app PRIVATE

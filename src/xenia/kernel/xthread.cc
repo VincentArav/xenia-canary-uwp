@@ -19,6 +19,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
@@ -390,8 +391,11 @@ X_STATUS XThread::Create() {
   // Exports use this to get the kernel.
   thread_state_->context()->kernel_state = kernel_state_;
 
-  uint8_t cpu_index = GetFakeCpuNumber(
-      static_cast<uint8_t>(creation_params_.creation_flags >> 24));
+  // A title's main thread starts on hardware thread 0.
+  const uint8_t proc_mask =
+      static_cast<uint8_t>(creation_params_.creation_flags >> 24);
+  uint8_t cpu_index =
+      main_thread_ && !proc_mask ? 0 : GetFakeCpuNumber(proc_mask);
 
   // Initialize the KTHREAD object.
   InitializeGuestObject();
@@ -529,6 +533,10 @@ X_STATUS XThread::Terminate(int exit_code) {
   // Notify processor of our exit.
   emulator()->processor()->OnThreadExit(thread_id_);
 
+  if (XThread::IsInThread(this)) {
+    kernel_state()->FinalizeDeferredUserModeTitleReset();
+  }
+
   running_ = false;
   if (XThread::IsInThread(this)) {
     ReleaseHandle();
@@ -569,86 +577,166 @@ void XThread::Execute() {
     want_exit_code = true;
   }
 
-  // Set up reentry mechanism for fiber-based stack switching.
-  // When Reenter() is called (e.g., by KeSetCurrentStackPointers), it
-  // unwinds back here to re-enter at a new guest address.
-  //
-  // On Linux, C++ exceptions are used so that DWARF unwind info (registered
-  // for JIT code via __register_frame) allows proper destructor/RAII cleanup
-  // through both JIT and host C++ frames.
-  //
-  // On Windows, setjmp/longjmp is used because MSVC's longjmp performs SEH
-  // stack unwinding which already calls destructors.
-  uint32_t next_address;
-#if !XE_PLATFORM_WIN32
-  try {
-    exit_code = static_cast<int>(kernel_state()->processor()->Execute(
-        thread_state_, address, args.data(), args.size()));
-    next_address = 0;
-  } catch (const FiberReentryException& e) {
-#if XE_PLATFORM_LINUX
-    // Ensure SIGRTMIN (used for thread suspend) is not left blocked.
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGRTMIN);
-    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
-#endif
-    next_address = e.address;
-  }
-
-  while (next_address != 0) {
-    try {
-      kernel_state()->processor()->ExecuteRaw(thread_state_, next_address);
-      next_address = 0;
-      if (want_exit_code) {
-        exit_code = static_cast<int>(thread_state_->context()->r[3]);
-      }
-    } catch (const FiberReentryException& e) {
-#if XE_PLATFORM_LINUX
-      sigset_t set;
-      sigemptyset(&set);
-      sigaddset(&set, SIGRTMIN);
-      pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
-#endif
-      next_address = e.address;
-    }
-  }
-#else
-  if (setjmp(reentry_jmp_buf_) != 0) {
-    next_address = reentry_address_;
-  } else {
-    exit_code = static_cast<int>(kernel_state()->processor()->Execute(
-        thread_state_, address, args.data(), args.size()));
-    next_address = 0;
-  }
-
-  while (next_address != 0) {
-    if (setjmp(reentry_jmp_buf_) != 0) {
-      next_address = reentry_address_;
-    } else {
-      kernel_state()->processor()->ExecuteRaw(thread_state_, next_address);
-      next_address = 0;
-      if (want_exit_code) {
-        exit_code = static_cast<int>(thread_state_->context()->r[3]);
-      }
-    }
-  }
-#endif
+  exit_code = ExecuteGuestWithReentry(address, args.data(), args.size(),
+                                      GuestExecutionMode::kCall);
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).
   Exit(!want_exit_code ? 0 : exit_code);
 }
 
-void XThread::Reenter(uint32_t address) {
+int XThread::ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
+                                     size_t arg_count,
+                                     GuestExecutionMode initial_mode) {
+  assert_not_zero(address);
+  assert_true(XThread::GetCurrentThread() == this);
+  assert_not_null(thread_state_);
+  assert_true(cpu::ThreadState::Get() == thread_state_);
+
+  auto processor = kernel_state()->processor();
+  int exit_code = 0;
+  uint32_t next_address = address;
+#if !XE_PLATFORM_WIN32
+  cpu::TranslationDomainKey next_translation_domain_key =
+      thread_state_->translation_domain_key();
+  std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
+      next_transition_permit;
+  bool domain_commit_pending = false;
+#endif
+  GuestExecutionMode mode = initial_mode;
+
+  // Reenter() unwinds to this loop when guest code switches stacks. The first
+  // dispatch retains the caller-selected semantics; every reentry resumes the
+  // already initialized PPC context with ExecuteRaw.
+#if !XE_PLATFORM_WIN32
+  while (next_address != 0) {
+    if (domain_commit_pending) {
+      if (!processor->CommitThreadTranslationDomain(
+              thread_state_, next_translation_domain_key,
+              next_transition_permit.get())) {
+        XELOGE(
+            "Rejected post-unwind thread {:08X} translation-domain switch "
+            "to {:016X}",
+            thread_id_, next_translation_domain_key.id());
+        return static_cast<int>(X_STATUS_UNSUCCESSFUL);
+      }
+      next_transition_permit.reset();
+      domain_commit_pending = false;
+    }
+    try {
+      if (mode == GuestExecutionMode::kCall) {
+        exit_code = static_cast<int>(
+            processor->Execute(thread_state_, next_address, args, arg_count));
+      } else {
+        processor->ExecuteRaw(thread_state_, next_address);
+        exit_code = static_cast<int>(thread_state_->context()->r[3]);
+      }
+      next_address = 0;
+    } catch (const FiberReentryException& e) {
+#if XE_PLATFORM_LINUX
+      // Ensure SIGRTMIN (used for thread suspend) is not left blocked.
+      sigset_t set;
+      sigemptyset(&set);
+      sigaddset(&set, SIGRTMIN);
+      pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+#endif
+      next_address = e.address;
+      next_translation_domain_key = e.translation_domain_key;
+      next_transition_permit = e.transition_permit;
+      staged_reentry_transition_permit_.reset();
+      has_staged_domain_reentry_ = false;
+      domain_commit_pending = true;
+      mode = GuestExecutionMode::kRaw;
+    }
+  }
+#else
+  while (next_address != 0) {
+    if (setjmp(reentry_jmp_buf_) != 0) {
+      // Keep the owning permit in XThread across longjmp. A non-volatile
+      // automatic object modified after setjmp has indeterminate state after
+      // longjmp, and assigning over an indeterminate shared_ptr is undefined
+      // behavior. The staged member is outside this stack frame and remains a
+      // valid retirement pin until the post-unwind commit completes.
+      next_address = reentry_address_;
+      mode = GuestExecutionMode::kRaw;
+      if (!processor->CommitThreadTranslationDomain(
+              thread_state_, staged_reentry_translation_domain_key_,
+              staged_reentry_transition_permit_.get())) {
+        XELOGE(
+            "Rejected post-unwind thread {:08X} translation-domain switch "
+            "to {:016X}",
+            thread_id_, staged_reentry_translation_domain_key_.id());
+        staged_reentry_transition_permit_.reset();
+        has_staged_domain_reentry_ = false;
+        return static_cast<int>(X_STATUS_UNSUCCESSFUL);
+      }
+      staged_reentry_transition_permit_.reset();
+      has_staged_domain_reentry_ = false;
+    }
+
+    if (mode == GuestExecutionMode::kCall) {
+      exit_code = static_cast<int>(
+          processor->Execute(thread_state_, next_address, args, arg_count));
+    } else {
+      processor->ExecuteRaw(thread_state_, next_address);
+      exit_code = static_cast<int>(thread_state_->context()->r[3]);
+    }
+    next_address = 0;
+  }
+#endif
+
+  return exit_code;
+}
+
+[[noreturn]] void XThread::Reenter(uint32_t address) {
+  assert_not_null(thread_state_);
+  const bool staged = StageTranslationDomainReentry(
+      thread_state_->translation_domain_key(), nullptr);
+  assert_true(staged);
+  ReenterPrepared(address);
+}
+
+bool XThread::StageTranslationDomainReentry(
+    cpu::TranslationDomainKey translation_domain_key,
+    std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
+        transition_permit) {
+  if (!thread_state_ || XThread::GetCurrentThread() != this ||
+      cpu::ThreadState::Get() != thread_state_ || has_staged_domain_reentry_) {
+    return false;
+  }
+  const cpu::TranslationDomainKey current_domain_key =
+      thread_state_->translation_domain_key();
+  if (transition_permit
+          ? transition_permit->expected_source_domain_key() !=
+                    current_domain_key ||
+                transition_permit->target_domain_key() != translation_domain_key
+          : translation_domain_key != current_domain_key) {
+    return false;
+  }
+  staged_reentry_translation_domain_key_ = translation_domain_key;
+  staged_reentry_transition_permit_ = std::move(transition_permit);
+  has_staged_domain_reentry_ = true;
+  return true;
+}
+
+[[noreturn]] void XThread::ReenterPrepared(uint32_t address) {
   // Called when the game switches fiber stacks (e.g., via
   // KeSetCurrentStackPointers in games like Forza Horizon 2).
   // Must unwind through all frames between here and Execute().
+  assert_not_zero(address);
+  assert_true(XThread::GetCurrentThread() == this);
+  assert_not_null(thread_state_);
+  assert_true(has_staged_domain_reentry_);
+
+  // Drop backend state tied to the old guest stack.
+  kernel_state()->processor()->backend()->PrepareForReentry(
+      thread_state_->context());
 #if !XE_PLATFORM_WIN32
   // Throw a C++ exception that unwinds through JIT frames (using DWARF
   // .eh_frame info) and host frames (using compiler-generated DWARF),
   // calling destructors properly along the way.
-  throw FiberReentryException{address};
+  throw FiberReentryException{address, staged_reentry_translation_domain_key_,
+                              staged_reentry_transition_permit_};
 #else
   reentry_address_ = address;
   std::longjmp(reentry_jmp_buf_, 1);
@@ -1190,6 +1278,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
       current_xthread_tls_ = thread;
       current_thread_ = thread;
+      cpu::ThreadState::Bind(thread->thread_state());
 
       // Acquire any mutants
       for (auto mutant : thread->pending_mutant_acquires_) {
@@ -1203,7 +1292,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
       thread->running_ = true;
 
       uint32_t pc = state.context.pc;
-      thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_, pc);
+      thread->ExecuteGuestWithReentry(pc, nullptr, 0, GuestExecutionMode::kRaw);
 
       current_thread_ = nullptr;
       current_xthread_tls_ = nullptr;

@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XTHREAD_H_
 
 #include <atomic>
+#include <memory>
 #include <string>
 
 #include "xenia/base/mutex.h"
@@ -32,6 +33,9 @@
 #include "xenia/xbox.h"
 
 namespace xe {
+namespace cpu {
+class TranslationDomainTransitionPermit;
+}  // namespace cpu
 namespace kernel {
 
 constexpr fourcc_t kThreadSaveSignature = make_fourcc("THRD");
@@ -326,11 +330,14 @@ struct X_KTHREAD {
   xe::be<uint32_t> unk_118;      // 0x118
   X_LIST_ENTRY queue_related;    // 0x11C
   xe::be<uint32_t> unk_124;      // 0x124
-  xe::be<uint32_t> unk_128;      // 0x128
-  xe::be<uint32_t> unk_12C;      // 0x12C
-  xe::be<uint64_t> create_time;  // 0x130
-  xe::be<uint64_t> exit_time;    // 0x138
-  xe::be<uint32_t> exit_status;  // 0x140
+  // Trap frame of this thread's user-mode context while it is in user mode;
+  // 0 otherwise. Other threads mark the context through it (CR1 bits of the
+  // frame's CR at 0x1B0).
+  xe::be<uint32_t> user_mode_trap_frame;  // 0x128
+  xe::be<uint32_t> unk_12C;               // 0x12C
+  xe::be<uint64_t> create_time;           // 0x130
+  xe::be<uint64_t> exit_time;             // 0x138
+  xe::be<uint32_t> exit_status;           // 0x140
   // tracks all pending timers that have apcs which target this thread
   X_LIST_ENTRY timer_list;          // 0x144
   xe::be<uint32_t> thread_id;       // 0x14C
@@ -377,6 +384,9 @@ static_assert_size(X_KTHREAD, 0xAB0);
 // ensuring destructors and RAII guards in host C++ frames are properly called.
 struct FiberReentryException {
   uint32_t address;
+  cpu::TranslationDomainKey translation_domain_key;
+  std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
+      transition_permit;
 };
 #endif
 
@@ -435,7 +445,14 @@ class XThread : public XObject, public cpu::Thread {
 
   virtual void Execute();
 
-  virtual void Reenter(uint32_t address);
+  [[noreturn]] virtual void Reenter(uint32_t address);
+  // Stages a domain switch for the next reentry. Returns, so the caller can
+  // release what it owns before the transfer.
+  bool StageTranslationDomainReentry(
+      cpu::TranslationDomainKey translation_domain_key,
+      std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
+          transition_permit);
+  [[noreturn]] virtual void ReenterPrepared(uint32_t address);
 
   void EnterCriticalRegion();
   void LeaveCriticalRegion();
@@ -506,6 +523,15 @@ class XThread : public XObject, public cpu::Thread {
   void SetCurrentThread();
 
  protected:
+  enum class GuestExecutionMode {
+    kCall,
+    kRaw,
+  };
+
+  int ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
+                              size_t arg_count,
+                              GuestExecutionMode initial_mode);
+
   bool AllocateStack(uint32_t size);
   void FreeStack();
   void InitializeGuestObject();
@@ -547,6 +573,11 @@ class XThread : public XObject, public cpu::Thread {
   // On Linux, C++ exceptions are used instead of setjmp/longjmp so that
   // destructors and RAII guards in host C++ frames are properly unwound.
   // JIT code has DWARF .eh_frame unwind info registered via __register_frame.
+  cpu::TranslationDomainKey staged_reentry_translation_domain_key_ =
+      cpu::TranslationDomainKey::DefaultDirect();
+  std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
+      staged_reentry_transition_permit_;
+  bool has_staged_domain_reentry_ = false;
 #if XE_PLATFORM_WIN32
   std::jmp_buf reentry_jmp_buf_;
   uint32_t reentry_address_ = 0;

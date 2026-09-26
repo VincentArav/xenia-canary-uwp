@@ -19,6 +19,8 @@ namespace cpu {
 namespace ppc {
 
 struct PPCBuiltins;
+enum class GuestProgramExceptionKind : uint32_t;
+class GuestCodeReader;
 class PPCFrontend;
 
 class PPCHIRBuilder : public hir::HIRBuilder {
@@ -38,9 +40,32 @@ class PPCHIRBuilder : public hir::HIRBuilder {
     // Emit comment nodes.
     EMIT_DEBUG_COMMENTS = 1 << 0,
   };
-  bool Emit(GuestFunction* function, uint32_t flags);
+
+  // Emitters return 1 for an unimplemented opcode, which a cvar may skip; this
+  // result rejects the whole function regardless.
+  enum InstructionEmitResult {
+    kInstructionEmitSuccess = 0,
+    kInstructionEmitUnimplemented = 1,
+    kInstructionEmitTranslationFailed = 2,
+  };
+
+  bool Emit(GuestFunction* function, const GuestCodeReader& guest_code_reader,
+            uint32_t flags);
 
   GuestFunction* function() const { return function_; }
+
+  // Whether the code is in a checked (user-mode) domain, where program
+  // interrupts go to the guest kernel and calls keep no host frames.
+  bool is_checked_user_mode() const;
+  // Emits delivery of a program interrupt for the instruction at address.
+  void RaiseProgramException(uint32_t address, GuestProgramExceptionKind kind);
+  // Guest address and word of the instruction being emitted, for diagnostics.
+  uint32_t current_instruction_address() const {
+    return current_instruction_address_;
+  }
+  uint32_t current_instruction_code() const {
+    return current_instruction_code_;
+  }
   Function* LookupFunction(uint32_t address);
   Label* LookupLabel(uint32_t address);
 
@@ -63,9 +88,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   void CopyFPSCRToCR1();
   Value* LoadXER();
   void StoreXER(Value* value);
-  // void UpdateXERWithOverflow();
-  // void UpdateXERWithOverflowAndCarry();
-  // void StoreOV(Value* value);
+  // XER[OV] <- value; XER[SO] <- XER[SO] | value. value is an INT8 0 or 1.
+  void StoreOV(Value* value);
   Value* LoadCA();
   void StoreCA(Value* value);
   Value* LoadSAT();
@@ -96,6 +120,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // Reset each Emit:
   bool with_debug_info_;
   GuestFunction* function_;
+  uint32_t current_instruction_address_ = 0;
+  uint32_t current_instruction_code_ = 0;
   uint64_t start_address_;
   uint64_t instr_count_;
   Instr** instr_offset_list_;

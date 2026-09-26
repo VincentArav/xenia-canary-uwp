@@ -13,6 +13,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/cpu/elf_module.h"
+#include "xenia/cpu/xex_import_library_parser.h"
 #include "xenia/emulator.h"
 
 namespace xe {
@@ -621,52 +622,40 @@ void UserModule::Dump() {
         sb.Append("  XEX_HEADER_IMPORT_LIBRARIES:\n");
         auto opt_import_libraries =
             reinterpret_cast<const xex2_opt_import_libraries*>(opt_header_ptr);
-
-        // FIXME: Don't know if 32 is the actual limit, but haven't seen more
-        // than 2.
-        const char* string_table[32];
-        std::memset(string_table, 0, sizeof(string_table));
-
-        // Parse the string table
-        for (size_t j = 0, o = 0; j < opt_import_libraries->string_table.size &&
-                                  o < opt_import_libraries->string_table.count;
-             o++) {
-          assert_true(o < xe::countof(string_table));
-          const char* str = &opt_import_libraries->string_table.data[j];
-
-          string_table[o] = str;
-          j += std::strlen(str) + 1;
-
-          // Padding
-          if ((j % 4) != 0) {
-            j += 4 - (j % 4);
-          }
+        const uintptr_t header_address = reinterpret_cast<uintptr_t>(header);
+        const uintptr_t import_address =
+            reinterpret_cast<uintptr_t>(opt_import_libraries);
+        if (import_address < header_address ||
+            import_address - header_address >= uint32_t(header->header_size)) {
+          sb.Append(
+              "    malformed: header pointer is outside the XEX header\n");
+          break;
+        }
+        const size_t available_size = uint32_t(header->header_size) -
+                                      size_t(import_address - header_address);
+        const cpu::XexImportLibraryParseResult import_result =
+            cpu::ParseXexImportLibraries(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(opt_import_libraries),
+                available_size));
+        if (!import_result) {
+          sb.AppendFormat("    malformed: error {} at offset {}\n",
+                          uint32_t(import_result.error),
+                          import_result.error_offset);
+          break;
         }
 
-        auto library_data =
-            reinterpret_cast<const uint8_t*>(opt_import_libraries);
-        uint32_t library_offset = opt_import_libraries->string_table.size + 12;
-        while (library_offset < opt_import_libraries->size) {
-          auto library = reinterpret_cast<const xex2_import_library*>(
-              library_data + library_offset);
-          if (!library->size) {
-            break;
-          }
-          auto name = string_table[library->name_index & 0xFF];
-          assert_not_null(name);
-          sb.AppendFormat("    {} - {} imports\n", name,
-                          (uint16_t)library->count);
+        for (const cpu::ParsedXexImportLibrary& library :
+             import_result.libraries) {
+          sb.AppendFormat("    {} - {} imports\n", library.name,
+                          library.import_records.size());
 
-          xex2_version version, version_min;
-          version = library->version();
-          version_min = library->version_min();
+          xex2_version version{library.version};
+          xex2_version version_min{library.min_version};
           sb.AppendFormat("      Version: {}.{}.{}.{}\n", version.major,
                           version.minor, version.build, version.qfe);
           sb.AppendFormat("      Min Version: {}.{}.{}.{}\n", version_min.major,
                           version_min.minor, version_min.build,
                           version_min.qfe);
-
-          library_offset += library->size;
         }
       } break;
       case XEX_HEADER_CHECKSUM_TIMESTAMP: {

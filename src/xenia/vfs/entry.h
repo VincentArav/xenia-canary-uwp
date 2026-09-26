@@ -103,7 +103,13 @@ class Entry {
     delete_on_close_ = delete_on_close;
   }
 
-  bool is_read_only() const;
+  // Normally the device policy. A host-path entry in a read-only device's
+  // writable root overlay reports itself as writable.
+  virtual bool is_read_only() const;
+  // Whether new children may be created in (and writable children deleted
+  // from) this directory. The root of a read-only device with a writable
+  // overlay is itself read-only but accepts overlay children.
+  virtual bool can_create_children() const { return !is_read_only(); }
 
   Entry* GetChild(const std::string_view name);
   Entry* ResolvePath(const std::string_view path);
@@ -120,7 +126,8 @@ class Entry {
   bool Delete();
   void Touch();
 
-  void Rename(const std::filesystem::path file_path);
+  // Returns false, leaving the entry unchanged, if the device refuses.
+  bool Rename(const std::filesystem::path file_path);
   // If successful, out_file points to a new file. When finished, call
   // file->Destroy()
   virtual X_STATUS Open(uint32_t desired_access, File** out_file) = 0;
@@ -141,8 +148,10 @@ class Entry {
     return nullptr;
   }
   virtual bool DeleteEntryInternal(Entry* entry) = 0;
-  virtual void RenameEntryInternal(
-      const std::vector<std::string_view>& path_parts) {}
+  virtual bool RenameEntryInternal(
+      const std::vector<std::string_view>& path_parts) {
+    return true;
+  }
 
   xe::global_critical_region global_critical_region_;
   Device* device_;

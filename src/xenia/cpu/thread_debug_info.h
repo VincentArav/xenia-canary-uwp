@@ -48,6 +48,12 @@ struct ThreadDebugInfo {
   // XThread::handle() of the thread.
   // This will be invalidated when the thread dies.
   uint32_t thread_handle = 0;
+  // Current translation identity, changed together with the owning
+  // ThreadState under the Processor global lock after old JIT frames unwind.
+  // Debugging and save-state code must not interpret a guest PC through
+  // another domain.
+  TranslationDomainKey translation_domain_key =
+      TranslationDomainKey::DefaultDirect();
   // Thread object. Only valid when the thread is alive.
   Thread* thread = nullptr;
   // Current state of the thread.

@@ -194,7 +194,7 @@ int32_t UPnP::AddPort(std::string addr, uint16_t internal_port,
   int result =
       UPNP_AddPortMapping(igd_urls_.controlURL, igd_data_.first.servicetype,
                           external_port_str.c_str(), internal_port_str.c_str(),
-                          addr.c_str(), "Xenia Canary Netplay",
+                          addr.c_str(), "Xenia Fusion Netplay",
                           protocol.c_str(), nullptr, lease_time_str.c_str());
 
   if (result ==
@@ -202,7 +202,7 @@ int32_t UPnP::AddPort(std::string addr, uint16_t internal_port,
     result = UPNP_AddPortMapping(
         igd_urls_.controlURL, igd_data_.first.servicetype,
         external_port_str.c_str(), internal_port_str.c_str(), addr.c_str(),
-        "Xenia Canary Netplay", protocol.c_str(), nullptr, "0");
+        "Xenia Fusion Netplay", protocol.c_str(), nullptr, "0");
 
     leases_supported_ = false;
   }

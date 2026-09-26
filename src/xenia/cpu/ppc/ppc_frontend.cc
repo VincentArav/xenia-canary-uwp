@@ -43,7 +43,9 @@ void InitializeIfNeeded() {
 
 void CleanupOnShutdown() {}
 
-PPCFrontend::PPCFrontend(Processor* processor) : processor_(processor) {
+PPCFrontend::PPCFrontend(Processor* processor)
+    : processor_(processor),
+      guest_code_reader_(processor ? processor->memory() : nullptr) {
   InitializeIfNeeded();
 }
 
@@ -53,6 +55,19 @@ PPCFrontend::~PPCFrontend() {
 }
 
 Memory* PPCFrontend::memory() const { return processor_->memory(); }
+
+const GuestCodeReader* PPCFrontend::guest_code_reader(
+    TranslationDomainKey translation_domain_key) const {
+  if (translation_domain_key == TranslationDomainKey::DefaultDirect()) {
+    return &guest_code_reader_;
+  }
+  if (!processor_) {
+    return nullptr;
+  }
+  const TranslationDomainDescriptor* descriptor =
+      processor_->translation_domain_registry()->Lookup(translation_domain_key);
+  return descriptor ? descriptor->guest_code_reader() : nullptr;
+}
 
 // Checks the state of the global lock and sets scratch to the current MSR
 // value.
@@ -81,7 +96,15 @@ void LeaveGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
 }
 
 void SyscallHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
-  uint64_t syscall_number = ppc_context->r[0];
+  auto frontend = reinterpret_cast<PPCFrontend*>(arg0);
+  const uint32_t cia = ppc_context->guest_system_call_cia;
+  const GuestSystemCallEvent event = {
+      cia, static_cast<uint32_t>(cia + uint32_t{4}), ppc_context->r[0]};
+  if (frontend && frontend->DispatchGuestSyscall(ppc_context, event)) {
+    return;
+  }
+
+  uint64_t syscall_number = event.number;
   switch (syscall_number) {
     default:
       assert_unhandled_case(syscall_number);
@@ -89,6 +112,43 @@ void SyscallHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
       break;
 #pragma warning(suppress : 4065)
   }
+}
+
+void ProgramExceptionHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
+  auto frontend = reinterpret_cast<PPCFrontend*>(arg0);
+  const GuestProgramExceptionEvent event = {
+      ppc_context->guest_system_call_cia,
+      static_cast<GuestProgramExceptionKind>(
+          reinterpret_cast<uintptr_t>(arg1))};
+  if (frontend && frontend->DispatchGuestProgramException(ppc_context, event)) {
+    return;
+  }
+  XELOGE("Unhandled guest program exception {} at {:08X}",
+         static_cast<uint32_t>(event.kind), event.cia);
+}
+
+void InterruptPollHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
+  (void)arg1;
+  auto frontend = reinterpret_cast<PPCFrontend*>(arg0);
+  GuestInterruptPoller* poller =
+      frontend ? frontend->processor()->guest_interrupt_poller() : nullptr;
+  if (poller) {
+    // May leave nonlocally and resume at the branch target later.
+    poller->PollGuestInterrupt(ppc_context, ppc_context->guest_system_call_cia);
+  }
+}
+
+bool PPCFrontend::DispatchGuestProgramException(
+    PPCContext* ppc_context, const GuestProgramExceptionEvent& event) const {
+  GuestSyscallDispatcher* dispatcher = guest_syscall_dispatcher();
+  return dispatcher &&
+         dispatcher->DispatchGuestProgramException(ppc_context, event);
+}
+
+bool PPCFrontend::DispatchGuestSyscall(
+    PPCContext* ppc_context, const GuestSystemCallEvent& event) const {
+  GuestSyscallDispatcher* dispatcher = guest_syscall_dispatcher();
+  return dispatcher && dispatcher->DispatchGuestSyscall(ppc_context, event);
 }
 
 bool PPCFrontend::Initialize() {
@@ -101,11 +161,29 @@ bool PPCFrontend::Initialize() {
   builtins_.leave_global_lock =
       processor_->DefineBuiltin("LeaveGlobalLock", LeaveGlobalLock, arg0, arg1);
   builtins_.syscall_handler = processor_->DefineBuiltin(
-      "SyscallHandler", SyscallHandler, nullptr, nullptr);
+      "SyscallHandler", SyscallHandler, this, nullptr);
+  builtins_.illegal_instruction_handler = processor_->DefineBuiltin(
+      "IllegalInstructionHandler", ProgramExceptionHandler, this,
+      reinterpret_cast<void*>(static_cast<uintptr_t>(
+          GuestProgramExceptionKind::kIllegalInstruction)));
+  builtins_.interrupt_poll_handler = processor_->DefineBuiltin(
+      "InterruptPollHandler", InterruptPollHandler, this, nullptr);
+  builtins_.trap_handler = processor_->DefineBuiltin(
+      "TrapHandler", ProgramExceptionHandler, this,
+      reinterpret_cast<void*>(
+          static_cast<uintptr_t>(GuestProgramExceptionKind::kTrap)));
   return true;
 }
 
 bool PPCFrontend::DeclareFunction(GuestFunction* function) {
+  if (!function || !processor_->CanExecuteTranslationDomain(
+                       function->translation_domain_key())) {
+    XELOGE(
+        "Refusing to declare guest function in an unsupported translation "
+        "domain");
+    return false;
+  }
+
   // chrispy: make sure we aren't declaring a function that is actually padding
   // data, this will mess up PPCScanner and is hard to debug wow, this halo
   // reach actually has branches into 0 opcodes, look into further
@@ -122,6 +200,14 @@ bool PPCFrontend::DeclareFunction(GuestFunction* function) {
 
 bool PPCFrontend::DefineFunction(GuestFunction* function,
                                  uint32_t debug_info_flags) {
+  if (!function || !processor_->CanExecuteTranslationDomain(
+                       function->translation_domain_key())) {
+    XELOGE(
+        "Refusing to define guest function in an unsupported translation "
+        "domain");
+    return false;
+  }
+
   auto translator = translator_pool_.Allocate(this);
   bool result = translator->Translate(function, debug_info_flags);
   translator->Reset();

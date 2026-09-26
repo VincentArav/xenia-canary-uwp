@@ -180,7 +180,7 @@ using namespace xe::hid;
 using namespace xe::gpu;
 
 constexpr std::string_view kRecentlyPlayedTitlesFilename = "recent.toml";
-constexpr std::string_view kBaseTitle = "Xenia-canary-netplay";
+constexpr std::string_view kBaseTitle = "Xenia-Fusion-Netplay";
 
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
@@ -1343,10 +1343,11 @@ void EmulatorWindow::FileOpen() {
   file_picker->set_multi_selection(false);
   file_picker->set_title("Select Content Package");
   file_picker->set_extensions({
-      {"Supported Files", "*.iso;*.xex;*.zar;*.*"},
+      {"Supported Files", "*.iso;*.xex;*.xbe;*.zar;*.*"},
       {"Disc Image (*.iso)", "*.iso"},
       {"Disc Archive (*.zar)", "*.zar"},
       {"Xbox Executable (*.xex)", "*.xex"},
+      {"Original Xbox Executable (*.xbe)", "*.xbe"},
       //{"Content Package (*.xcp)", "*.xcp" },
       {"All Files (*.*)", "*.*"},
   });

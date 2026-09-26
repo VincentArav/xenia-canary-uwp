@@ -8,10 +8,12 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/kernel/user_mode_kernel_runtime.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xsemaphore.h"
@@ -349,7 +351,6 @@ void KeSetCurrentStackPointers_entry(lpvoid_t stack_ptr,
   // host stack overflowing.
   if (thread->fiber_ptr &&
       current_thread->guest_object() == thread.guest_address()) {
-    context->processor->backend()->PrepareForReentry(context.value());
     current_thread->Reenter(static_cast<uint32_t>(context->lr));
   }
 }
@@ -1294,7 +1295,6 @@ dword_result_t KeRaiseIrqlToDpcLevel_entry(const ppc_context_t& ctx) {
   if (old_irql > 2) {
     XELOGE("KeRaiseIrqlToDpcLevel - old_irql > 2");
   }
-
   pcr->current_irql = 2;
 
   return old_irql;
@@ -1393,11 +1393,11 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
 
   auto& user_apc_queue = current_thread->apc_lists[1];
 
-  // use guest stack for temporaries
-  uint32_t old_stack_pointer = static_cast<uint32_t>(ctx->r[1]);
-
-  uint32_t scratch_address = old_stack_pointer - 16;
-  ctx->r[1] = old_stack_pointer - 32;
+  // Nothing is written below the waiter's stack pointer, where callers may
+  // still read data. The kernel routine's pointer arguments go in a system
+  // heap block.
+  auto memory = ctx->kernel_state->memory();
+  uint32_t scratch_address = 0;
 
   while (!user_apc_queue.empty(ctx)) {
     uint32_t apc_ptr = user_apc_queue.flink_ptr;
@@ -1405,34 +1405,46 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
     XAPC* apc = user_apc_queue.ListEntryObject(
         ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_ptr));
 
-    uint8_t* scratch_ptr = ctx->TranslateVirtual(scratch_address);
-    xe::store_and_swap<uint32_t>(scratch_ptr + 0, apc->normal_routine);
-    xe::store_and_swap<uint32_t>(scratch_ptr + 4, apc->normal_context);
-    xe::store_and_swap<uint32_t>(scratch_ptr + 8, apc->arg1);
-    xe::store_and_swap<uint32_t>(scratch_ptr + 12, apc->arg2);
+    const uint32_t kernel_routine = apc->kernel_routine;
+    uint32_t normal_routine = apc->normal_routine;
+    uint32_t normal_context = apc->normal_context;
+    uint32_t arg1 = apc->arg1;
+    uint32_t arg2 = apc->arg2;
     util::XeRemoveEntryList(&apc->list_entry, ctx);
     apc->enqueued = 0;
 
     xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
     alert_status = X_STATUS_USER_APC;
-    if (apc->kernel_routine != XAPC::kDummyKernelRoutine) {
-      uint64_t kernel_args[] = {
-          apc_ptr,
-          scratch_address + 0,
-          scratch_address + 4,
-          scratch_address + 8,
-          scratch_address + 12,
-      };
-      ctx->processor->Execute(ctx->thread_state, apc->kernel_routine,
-                              kernel_args, xe::countof(kernel_args));
+    if (kernel_routine != XAPC::kDummyKernelRoutine) {
+      if (!scratch_address) {
+        scratch_address = memory->SystemHeapAlloc(16);
+      }
+      if (scratch_address) {
+        uint8_t* scratch_ptr = memory->TranslateVirtual(scratch_address);
+        xe::store_and_swap<uint32_t>(scratch_ptr + 0, normal_routine);
+        xe::store_and_swap<uint32_t>(scratch_ptr + 4, normal_context);
+        xe::store_and_swap<uint32_t>(scratch_ptr + 8, arg1);
+        xe::store_and_swap<uint32_t>(scratch_ptr + 12, arg2);
+        uint64_t kernel_args[] = {
+            apc_ptr,
+            scratch_address + 0,
+            scratch_address + 4,
+            scratch_address + 8,
+            scratch_address + 12,
+        };
+        ctx->processor->Execute(ctx->thread_state, kernel_routine, kernel_args,
+                                xe::countof(kernel_args));
+        normal_routine = xe::load_and_swap<uint32_t>(scratch_ptr + 0);
+        normal_context = xe::load_and_swap<uint32_t>(scratch_ptr + 4);
+        arg1 = xe::load_and_swap<uint32_t>(scratch_ptr + 8);
+        arg2 = xe::load_and_swap<uint32_t>(scratch_ptr + 12);
+      } else {
+        XELOGE("APC {:08X}: no memory for its kernel routine's arguments",
+               apc_ptr);
+      }
     } else {
-      ctx->kernel_state->memory()->SystemHeapFree(apc_ptr);
+      memory->SystemHeapFree(apc_ptr);
     }
-
-    uint32_t normal_routine = xe::load_and_swap<uint32_t>(scratch_ptr + 0);
-    uint32_t normal_context = xe::load_and_swap<uint32_t>(scratch_ptr + 4);
-    uint32_t arg1 = xe::load_and_swap<uint32_t>(scratch_ptr + 8);
-    uint32_t arg2 = xe::load_and_swap<uint32_t>(scratch_ptr + 12);
 
     if (normal_routine) {
       uint64_t normal_args[] = {normal_context, arg1, arg2};
@@ -1443,9 +1455,10 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
     unlocked_irql = xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);
   }
 
-  ctx->r[1] = old_stack_pointer;
-
   xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
+  if (scratch_address) {
+    memory->SystemHeapFree(scratch_address);
+  }
   return alert_status;
 }
 
@@ -1621,52 +1634,86 @@ void KeInitializeDpc_entry(pointer_t<XDPC> dpc, lpvoid_t routine,
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
 
+void xeKeExecuteDpc(uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2) {
+  auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+  dpc->arg1 = arg1;
+  dpc->arg2 = arg2;
+
+  // DPC routines access per-CPU state via r13 (KPCR), so they run on the
+  // current guest-capable thread whose KPCR stands in for the target CPU.
+  uint32_t routine = dpc->routine;
+  auto thread = XThread::GetCurrentThread();
+  if (!routine || !thread) {
+    return;
+  }
+  auto thread_state = thread->thread_state();
+  auto ppc_context = thread_state->context();
+  auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
+
+  // If we're already inside a DPC (reentrant KeInsertQueueDpc from a DPC
+  // routine), skip the impersonation — we're already at DISPATCH_IRQL.
+  bool already_in_dpc = kpcr->prcb_data.dpc_active != 0;
+
+  DPCImpersonationScope dpc_scope{};
+  if (!already_in_dpc) {
+    kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
+  }
+
+  uint64_t args[] = {dpc_ptr, (uint64_t)dpc->context, (uint64_t)arg1,
+                     (uint64_t)arg2};
+  kernel_state()->processor()->Execute(thread_state, routine, args,
+                                       xe::countof(args));
+
+  if (!already_in_dpc) {
+    kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
+  }
+}
+
 dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
                                       dword_t arg2) {
+  // desired_cpu_number is the target processor plus one, or 0 for the current
+  // processor. A DPC for another processor sees that processor's PRCB; a
+  // user-mode thread on the target takes it as an interrupt, as for a timer
+  // DPC.
+  X_KPCR* kpcr = nullptr;
+  if (XThread* thread = XThread::GetCurrentThread()) {
+    kpcr = kernel_memory()->TranslateVirtual<X_KPCR*>(thread->pcr_ptr());
+  }
+  const uint8_t desired_cpu = dpc->desired_cpu_number;
+  const bool other_cpu =
+      desired_cpu && kpcr && kpcr->prcb_data.current_cpu != desired_cpu - 1;
+  if (other_cpu) {
+    UserModeKernelRuntime* runtime = kernel_state()->user_mode_kernel_runtime();
+    if (runtime && runtime->QueueProcessorDpc(
+                       desired_cpu - 1, dpc.guest_address(), arg1, arg2)) {
+      return 1;
+    }
+  }
+
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
 
   // Lock dispatcher.
   auto global_lock = xe::global_critical_region::AcquireDirect();
   auto dpc_list = kernel_state()->dpc_list();
 
-  // Prep DPC.
-  dpc->arg1 = (uint32_t)arg1;
-  dpc->arg2 = (uint32_t)arg2;
-
   dpc_list->Insert(list_entry_ptr);
 
   // Dispatch the DPC inline on the calling thread.  On real hardware DPCs
-  // are deferred to DISPATCH_IRQL on the target processor, but DPC routines
-  // access per-CPU state via r13 (KPCR) so they must run on a thread whose
-  // KPCR is valid for the target CPU.  The calling thread's KPCR satisfies
-  // this for the common case (desired_cpu_number == 0, meaning current CPU).
-  // Inline dispatch also avoids latency issues with shared work queues.
-  uint32_t routine = dpc->routine;
-  if (routine) {
-    auto thread = XThread::GetCurrentThread();
-    if (thread) {
-      auto thread_state = thread->thread_state();
-      auto ppc_context = thread_state->context();
-      auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
-
-      // If we're already inside a DPC (reentrant KeInsertQueueDpc from a DPC
-      // routine), skip the impersonation — we're already at DISPATCH_IRQL.
-      bool already_in_dpc = kpcr->prcb_data.dpc_active != 0;
-
-      DPCImpersonationScope dpc_scope{};
-      if (!already_in_dpc) {
-        kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
-      }
-
-      uint64_t args[] = {dpc.guest_address(), (uint64_t)dpc->context,
-                         (uint64_t)arg1, (uint64_t)arg2};
-      kernel_state()->processor()->Execute(thread_state, routine, args,
-                                           xe::countof(args));
-
-      if (!already_in_dpc) {
-        kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
-      }
-    }
+  // are deferred to DISPATCH_IRQL on the target processor; the calling
+  // thread's KPCR stands in for it, with the target's processor number for a
+  // DPC targeted elsewhere. Inline dispatch also avoids latency issues with
+  // shared work queues.
+  // The lock covers only the list. A routine run under it could wait on a
+  // compile or a code invalidation that needs the global lock itself.
+  global_lock.unlock();
+  uint8_t previous_cpu = 0;
+  if (other_cpu) {
+    previous_cpu = kpcr->prcb_data.current_cpu;
+    kpcr->prcb_data.current_cpu = desired_cpu - 1;
+  }
+  xeKeExecuteDpc(dpc.guest_address(), arg1, arg2);
+  if (other_cpu) {
+    kpcr->prcb_data.current_cpu = previous_cpu;
   }
 
   return 1;
@@ -1933,6 +1980,14 @@ void xeKeInitializeTimerEx(X_KTIMER* timer, uint32_t type, uint32_t proctype,
                            PPCContext* context) {
   xenia_assert(proctype < 3);
   xenia_assert(type == 0 || type == 1);
+  // Reinitializing drops the stashed native-object handle below, so stop an
+  // armed timer first rather than leaving it to deliver DPCs.
+  if (timer->header.wait_list.flink_ptr == kXObjSignature) {
+    if (auto native = kernel_state()->object_table()->LookupObject<XTimer>(
+            timer->header.wait_list.blink_ptr)) {
+      native->CancelGuestTimer();
+    }
+  }
   // other fields are unmodified, they must carry through multiple calls of
   // initialize
   timer->header.process_type = proctype;
@@ -1949,6 +2004,41 @@ void KeInitializeTimerEx_entry(pointer_t<X_KTIMER> timer, dword_t type,
   xeKeInitializeTimerEx(timer, type, proctype & 0xFF, context);
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeTimerEx, kThreading, kImplemented);
+
+// DueTime is in 100ns units (negative = relative, positive = absolute system
+// time), Period in milliseconds. Returns whether the timer was already set.
+dword_result_t KeSetTimerEx_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                  dword_t period, pointer_t<XDPC> dpc) {
+  auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer);
+  if (!native) {
+    return 0;
+  }
+  return native->SetGuestTimer(static_cast<int64_t>(uint64_t(due_time)), period,
+                               dpc.guest_address())
+             ? 1
+             : 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimerEx, kThreading, kImplemented);
+
+dword_result_t KeSetTimer_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                pointer_t<XDPC> dpc) {
+  auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer);
+  if (!native) {
+    return 0;
+  }
+  return native->SetGuestTimer(static_cast<int64_t>(uint64_t(due_time)), 0,
+                               dpc.guest_address())
+             ? 1
+             : 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimer, kThreading, kImplemented);
+
+// Returns whether the timer was set.
+dword_result_t KeCancelTimer_entry(pointer_t<X_KTIMER> timer) {
+  auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer);
+  return native && native->CancelGuestTimer() ? 1 : 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeCancelTimer, kThreading, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

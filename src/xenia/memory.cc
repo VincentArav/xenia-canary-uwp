@@ -686,6 +686,26 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(
                                          enable_data_providers);
 }
 
+bool Memory::NotifyPhysicalMemoryWriteInvalidationCallbacksLocked(
+    const global_unique_lock_type& global_lock_locked_once,
+    uint32_t physical_address, uint32_t length) {
+  constexpr uint32_t kPhysicalAddressLimit = 0x20000000;
+  if (!global_lock_locked_once.owns_lock() ||
+      global_lock_locked_once.mutex() != &global_critical_region::mutex() ||
+      !length || physical_address >= kPhysicalAddressLimit ||
+      length - 1 >= kPhysicalAddressLimit - physical_address) {
+    return false;
+  }
+
+  // Notify every cache observer of the write; the range expansions the
+  // callbacks return are ignored, as no alias is unwatched here.
+  for (auto invalidation_callback : physical_memory_invalidation_callbacks_) {
+    invalidation_callback->first(invalidation_callback->second,
+                                 physical_address, length, true);
+  }
+  return true;
+}
+
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment,
                                  uint32_t system_heap_flags) {
   // TODO(benvanik): lightweight pool.
@@ -1359,6 +1379,10 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   end_page_number = std::min(uint32_t(page_table_.size()) - 1, end_page_number);
 
   auto global_lock = global_critical_region_.Acquire();
+  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
+    memory_->physical_access_generation_.fetch_add(1,
+                                                   std::memory_order_acq_rel);
+  }
 
   // Release from host.
   // TODO(benvanik): find a way to actually decommit memory;
@@ -1383,6 +1407,10 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto global_lock = global_critical_region_.Acquire();
+  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
+    memory_->physical_access_generation_.fetch_add(1,
+                                                   std::memory_order_acq_rel);
+  }
 
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) / page_size_;
@@ -1448,6 +1476,10 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   if (!size) {
     XELOGE("BaseHeap::Protect failed due to zero size");
     return false;
+  }
+  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
+    memory_->physical_access_generation_.fetch_add(1,
+                                                   std::memory_order_acq_rel);
   }
 
   // From the VirtualProtect MSDN page:
@@ -1594,6 +1626,21 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
 
   return true;
+}
+
+std::optional<HeapPageInfo> BaseHeap::QueryPageInfo(uint32_t address) const {
+  if (address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return std::nullopt;
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  const uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+  if (page_number >= page_table_.size()) {
+    return std::nullopt;
+  }
+
+  const PageEntry page_entry = page_table_[page_number];
+  return HeapPageInfo{page_entry.state, page_entry.current_protect};
 }
 
 bool BaseHeap::QueryRegionInfo(uint32_t base_address,

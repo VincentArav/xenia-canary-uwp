@@ -9,7 +9,11 @@
 
 #include "xenia/kernel/xtimer.h"
 
+#include <algorithm>
+
 #include "xenia/base/logging.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/user_mode_kernel_runtime.h"
 #include "xenia/kernel/xthread.h"
 
 namespace xe {
@@ -18,7 +22,11 @@ namespace kernel {
 XTimer::XTimer(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType) {}
 
-XTimer::~XTimer() = default;
+XTimer::~XTimer() {
+  if (auto wait_item = guest_timer_wait_item_.lock()) {
+    wait_item->Disarm();
+  }
+}
 
 void XTimer::Initialize(uint32_t timer_type) {
   assert_false(timer_);
@@ -36,24 +44,38 @@ void XTimer::Initialize(uint32_t timer_type) {
   assert_not_null(timer_);
 }
 
+namespace {
+
+// Negative due times are relative 100ns intervals; positive ones are absolute
+// guest system times. Any timer implementation uses absolute times eventually,
+// so convert as early as possible for increased accuracy.
+xe::chrono::WinSystemClock::time_point GuestDueTimeToHost(int64_t due_time) {
+  using xe::chrono::WinSystemClock;
+  using xe::chrono::XSystemClock;
+  if (due_time < 0) {
+    auto after = xe::chrono::hundrednanoseconds(-due_time);
+    return date::clock_cast<WinSystemClock>(XSystemClock::now() + after);
+  }
+  return date::clock_cast<WinSystemClock>(
+      XSystemClock::from_file_time(due_time));
+}
+
+}  // namespace
+
+void XTimer::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
+  // TimerNotificationObject = 8, TimerSynchronizationObject = 9.
+  Initialize(header->type - 8);
+  guest_timer_ptr_ = memory()->HostToGuestVirtual(native_ptr);
+}
+
 X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms,
                           uint32_t routine, uint32_t routine_arg, bool resume) {
   using xe::chrono::WinSystemClock;
-  using xe::chrono::XSystemClock;
 
   std::lock_guard<std::mutex> lock(timer_lock_);
 
   period_ms = Clock::ScaleGuestDurationMillis(period_ms);
-  WinSystemClock::time_point due_tp;
-  if (due_time < 0) {
-    // Any timer implementation uses absolute times eventually, convert as early
-    // as possible for increased accuracy
-    auto after = xe::chrono::hundrednanoseconds(-due_time);
-    due_tp = date::clock_cast<WinSystemClock>(XSystemClock::now() + after);
-  } else {
-    due_tp = date::clock_cast<WinSystemClock>(
-        XSystemClock::from_file_time(due_time));
-  }
+  const WinSystemClock::time_point due_tp = GuestDueTimeToHost(due_time);
 
   // Stash routine for callback.
   callback_thread_ = XThread::GetCurrentThread();
@@ -99,6 +121,158 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms,
 X_STATUS XTimer::Cancel() {
   std::lock_guard<std::mutex> lock(timer_lock_);
   return timer_->Cancel() ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+}
+
+bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
+                           uint32_t dpc_ptr) {
+  period_ms = Clock::ScaleGuestDurationMillis(period_ms);
+  const bool periodic = period_ms != 0;
+
+  bool was_armed;
+  uint64_t generation;
+  std::shared_ptr<xe::threading::TimerQueueWaitItem> previous_item;
+  {
+    std::lock_guard<std::mutex> lock(timer_lock_);
+    was_armed = guest_timer_armed_;
+    generation = ++guest_timer_generation_;
+    guest_timer_armed_ = true;
+    // A DPC that ran on a host thread (the timer DPC fallback) and re-arms
+    // its timer keeps the timer on the guest thread it targets.
+    XThread* current_thread = XThread::GetCurrentThread();
+    if (current_thread && current_thread->is_guest_thread()) {
+      guest_timer_dpc_thread_id_ = current_thread->thread_id();
+    }
+    previous_item = guest_timer_wait_item_.lock();
+    guest_timer_wait_item_.reset();
+    if (guest_timer_ptr_) {
+      // Mirror the fields guest code may read inline.
+      auto guest_timer =
+          memory()->TranslateVirtual<X_KTIMER*>(guest_timer_ptr_);
+      guest_timer->header.signal_state = 0;
+      guest_timer->header.inserted = 1;
+      guest_timer->period = period_ms;
+    }
+  }
+  // Disarm blocks while a callback runs, and callbacks take timer_lock_.
+  if (previous_item) {
+    previous_item->Disarm();
+  }
+
+  // Guest timers expire only on a clock interrupt, never sooner than the next
+  // tick. XeFu's emulated x86 clock re-arms a timer with DueTime = -1 from its
+  // own DPC, which would otherwise run back to back.
+  using WinDuration = xe::chrono::WinSystemClock::duration;
+  const WinDuration tick =
+      std::chrono::duration_cast<WinDuration>(std::chrono::milliseconds(1));
+  const auto now = xe::chrono::WinSystemClock::now();
+  const WinDuration requested = GuestDueTimeToHost(due_time) - now;
+  const WinDuration delay =
+      tick * std::max<int64_t>(
+                 1, (requested.count() + tick.count() - 1) / tick.count());
+  const auto due_tp = now + delay;
+
+  // The host waitable timer only provides the signal state for guest waits.
+  const bool armed =
+      periodic ? timer_->SetRepeatingAt(
+                     due_tp, std::chrono::milliseconds(period_ms), nullptr)
+               : timer_->SetOnceAt(due_tp, nullptr);
+  if (!armed) {
+    XELOGE("KeSetTimerEx: failed to arm the host timer");
+  }
+
+  // Deliver the DPC from the timer queue. Look the timer up by handle on
+  // expiry: the queue item may outlive a released guest object, and only the
+  // latest arming may deliver.
+  using QueueClock = xe::threading::TimerQueueWaitItem::clock;
+  const auto queue_due =
+      QueueClock::now() +
+      std::chrono::duration_cast<QueueClock::duration>(delay);
+  const uint32_t timer_handle = handle();
+  KernelState* const state = kernel_state();
+  auto callback = [state, timer_handle, generation, dpc_ptr, periodic](void*) {
+    auto timer = state->object_table()->LookupObject<XTimer>(timer_handle);
+    if (timer) {
+      timer->OnGuestTimerExpired(generation, dpc_ptr, periodic);
+    }
+  };
+  std::weak_ptr<xe::threading::TimerQueueWaitItem> wait_item =
+      periodic ? xe::threading::QueueTimerRecurring(
+                     std::move(callback), nullptr, queue_due,
+                     std::chrono::milliseconds(period_ms))
+               : xe::threading::QueueTimerOnce(std::move(callback), nullptr,
+                                               queue_due);
+
+  bool superseded;
+  {
+    std::lock_guard<std::mutex> lock(timer_lock_);
+    superseded = generation != guest_timer_generation_;
+    if (!superseded) {
+      guest_timer_wait_item_ = wait_item;
+    }
+  }
+  if (superseded) {
+    // Another KeSetTimerEx or KeCancelTimer won the race.
+    if (auto item = wait_item.lock()) {
+      item->Disarm();
+    }
+  }
+  return was_armed;
+}
+
+bool XTimer::CancelGuestTimer() {
+  bool was_armed;
+  std::shared_ptr<xe::threading::TimerQueueWaitItem> wait_item;
+  {
+    std::lock_guard<std::mutex> lock(timer_lock_);
+    was_armed = guest_timer_armed_;
+    guest_timer_armed_ = false;
+    ++guest_timer_generation_;
+    wait_item = guest_timer_wait_item_.lock();
+    guest_timer_wait_item_.reset();
+    if (guest_timer_ptr_) {
+      memory()->TranslateVirtual<X_KTIMER*>(guest_timer_ptr_)->header.inserted =
+          0;
+    }
+  }
+  if (wait_item) {
+    wait_item->Disarm();
+  }
+  timer_->Cancel();
+  return was_armed;
+}
+
+void XTimer::OnGuestTimerExpired(uint64_t generation, uint32_t dpc_ptr,
+                                 bool periodic) {
+  uint32_t dpc_thread_id;
+  {
+    std::lock_guard<std::mutex> lock(timer_lock_);
+    dpc_thread_id = guest_timer_dpc_thread_id_;
+    if (generation != guest_timer_generation_ || !guest_timer_armed_) {
+      return;
+    }
+    if (!periodic) {
+      guest_timer_armed_ = false;
+    }
+    if (guest_timer_ptr_) {
+      auto guest_timer =
+          memory()->TranslateVirtual<X_KTIMER*>(guest_timer_ptr_);
+      guest_timer->header.signal_state = 1;
+      guest_timer->header.inserted = periodic ? 1 : 0;
+    }
+  }
+  if (dpc_ptr) {
+    // Like NT, pass the expiry system time as the DPC's system arguments.
+    const uint64_t time = Clock::QueryGuestSystemTime();
+    const uint32_t time_low = static_cast<uint32_t>(time);
+    const uint32_t time_high = static_cast<uint32_t>(time >> 32);
+    // The DPC interrupts the arming thread if it runs user-mode code;
+    // otherwise it runs on the timer DPC thread.
+    UserModeKernelRuntime* runtime = kernel_state()->user_mode_kernel_runtime();
+    if (!dpc_thread_id || !runtime ||
+        !runtime->QueueThreadDpc(dpc_thread_id, dpc_ptr, time_low, time_high)) {
+      kernel_state()->QueueTimerDpc(dpc_ptr, time_low, time_high);
+    }
+  }
 }
 
 }  // namespace kernel

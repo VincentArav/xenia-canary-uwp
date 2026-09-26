@@ -101,8 +101,9 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
   Instr* i = block->instr_head;
   while (i) {
     auto next = i->next;
-    if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
-      // Volatile instruction - requires all context values be flushed.
+    if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_MEMORY)) {
+      // Checked memory faults serialize architectural context at this exact
+      // instruction, so memory operations are context promotion boundaries.
       validity.reset();
     } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       const size_t offset = i->src1.offset;
@@ -140,7 +141,8 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
   Instr* i = block->instr_tail;
   while (i) {
     Instr* prev = i->prev;
-    if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH)) {
+    if (i->opcode->flags &
+        (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH | OPCODE_FLAG_MEMORY)) {
       // Volatile instruction - requires all context values be flushed.
       validity.reset();
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {

@@ -8,9 +8,19 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
+
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "xenia/base/logging.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/kernel/icache_sweep.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/segment_array.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
 
@@ -654,6 +664,29 @@ dword_result_t MmGetPhysicalAddress_entry(dword_t base_address) {
 }
 DECLARE_XBOXKRNL_EXPORT1(MmGetPhysicalAddress, kMemory, kImplemented);
 
+// Retires the checked (user-mode) translations that read any physical byte in
+// [address, +size), even while threads run them. DefaultDirect code is left as
+// is.
+void KeSweepIcacheRange_entry(lpvoid_t address, dword_t size) {
+  const IcacheSweepClassification sweep =
+      ClassifyIcacheSweep(*kernel_memory(), address.guest_address(), size);
+  cpu::Processor* processor = kernel_state()->processor();
+  for (const IcacheSweepPhysicalRange& range : sweep.physical_ranges) {
+    const cpu::GuestCodeInvalidationResult result =
+        processor->InvalidateCheckedGuestCodeSources(range.begin, range.end);
+    if (!result) {
+      XELOGE("KeSweepIcacheRange({:08X}, {:X}) failed to invalidate: {}",
+             address.guest_address(), uint32_t(size),
+             static_cast<uint32_t>(result.status));
+    } else if (result.retired_function_count) {
+      XELOGD("KeSweepIcacheRange({:08X}, {:X}) retired {} translation(s)",
+             address.guest_address(), uint32_t(size),
+             result.retired_function_count);
+    }
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSweepIcacheRange, kMemory, kImplemented);
+
 dword_result_t MmMapIoSpace_entry(dword_t unk0, lpvoid_t src_address,
                                   dword_t size, dword_t flags) {
   // I've only seen this used to map XMA audio contexts.
@@ -812,6 +845,98 @@ dword_result_t MmIsAddressValid_entry(dword_t address,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(MmIsAddressValid, kMemory, kImplemented);
+
+namespace {
+
+// A segment array mapped through a bounce buffer, keyed by the buffer.
+struct SegmentArrayBounce {
+  std::vector<uint32_t> pages;
+  // The buffer's contents when it was mapped.
+  std::vector<uint8_t> snapshot;
+};
+
+std::mutex segment_array_bounces_mutex;
+std::unordered_map<uint32_t, SegmentArrayBounce> segment_array_bounces;
+
+}  // namespace
+
+// Maps size bytes of the 4 KiB pages page_array lists, by guest address, at
+// one address. Pages that aren't already contiguous are mapped through a
+// bounce buffer, which MmUnlockAndUnmapSegmentArray writes back. Returns 0 on
+// failure.
+dword_result_t MmLockAndMapSegmentArray_entry(dword_t unknown1,
+                                              lpdword_t page_array,
+                                              dword_t size, dword_t unknown2) {
+  using segment_array::kPageSize;
+  if (!page_array || !size) {
+    return 0;
+  }
+  // Only 0 is known for both.
+  if (unknown1 || unknown2) {
+    XELOGW("MmLockAndMapSegmentArray: unknown arguments {:08X} {:08X}",
+           uint32_t(unknown1), uint32_t(unknown2));
+  }
+  auto memory = kernel_memory();
+  const uint32_t page_count = (size + kPageSize - 1) / kPageSize;
+  std::vector<uint32_t> pages(page_count);
+  for (uint32_t i = 0; i < page_count; ++i) {
+    pages[i] = page_array[i];
+    if (!pages[i] || (pages[i] & (kPageSize - 1)) ||
+        !memory->LookupHeap(pages[i])) {
+      XELOGE("MmLockAndMapSegmentArray: invalid page {:08X}", pages[i]);
+      return 0;
+    }
+  }
+  if (segment_array::IsContiguous(pages)) {
+    return pages[0];
+  }
+
+  const uint32_t address =
+      memory->SystemHeapAlloc(page_count * kPageSize, kPageSize);
+  if (!address) {
+    return 0;
+  }
+  auto mapped = memory->TranslateVirtual<uint8_t*>(address);
+  for (uint32_t i = 0; i < page_count; ++i) {
+    const uint32_t offset = i * kPageSize;
+    std::memcpy(mapped + offset, memory->TranslateVirtual(pages[i]),
+                std::min<uint32_t>(kPageSize, size - offset));
+  }
+  SegmentArrayBounce bounce;
+  bounce.pages = std::move(pages);
+  bounce.snapshot.assign(mapped, mapped + size);
+  std::lock_guard<std::mutex> lock(segment_array_bounces_mutex);
+  segment_array_bounces.insert_or_assign(address, std::move(bounce));
+  return address;
+}
+DECLARE_XBOXKRNL_EXPORT1(MmLockAndMapSegmentArray, kMemory, kImplemented);
+
+void MmUnlockAndUnmapSegmentArray_entry(dword_t address) {
+  using segment_array::kPageSize;
+  SegmentArrayBounce bounce;
+  {
+    std::lock_guard<std::mutex> lock(segment_array_bounces_mutex);
+    auto it = segment_array_bounces.find(address);
+    if (it == segment_array_bounces.end()) {
+      // Contiguous pages were mapped in place.
+      return;
+    }
+    bounce = std::move(it->second);
+    segment_array_bounces.erase(it);
+  }
+  auto memory = kernel_memory();
+  const auto* mapped = memory->TranslateVirtual<const uint8_t*>(address);
+  const size_t size = bounce.snapshot.size();
+  for (size_t i = 0; i < bounce.pages.size(); ++i) {
+    const size_t offset = i * kPageSize;
+    segment_array::WriteBackChangedBytes(
+        mapped + offset, bounce.snapshot.data() + offset,
+        memory->TranslateVirtual<uint8_t*>(bounce.pages[i]),
+        std::min<size_t>(kPageSize, size - offset));
+  }
+  memory->SystemHeapFree(address);
+}
+DECLARE_XBOXKRNL_EXPORT1(MmUnlockAndUnmapSegmentArray, kMemory, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

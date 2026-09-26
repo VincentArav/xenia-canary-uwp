@@ -37,6 +37,14 @@ add_library(aes_128 STATIC
 target_include_directories(aes_128 PUBLIC aes_128)
 
 # ==============================================================================
+# sha256
+# ==============================================================================
+add_library(sha256 STATIC
+  crypto/sha256.cpp
+)
+target_include_directories(sha256 PUBLIC ${CMAKE_SOURCE_DIR})
+
+# ==============================================================================
 # capstone
 # ==============================================================================
 add_library(capstone STATIC

@@ -70,6 +70,7 @@ HIRBuilder::~HIRBuilder() {
 
 void HIRBuilder::Reset() {
   attributes_ = 0;
+  translation_domain_key_ = TranslationDomainKey::DefaultDirect();
   next_label_id_ = 0;
   next_value_ordinal_ = 0;
   locals_.clear();

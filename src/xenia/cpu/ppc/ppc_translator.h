@@ -21,6 +21,7 @@ namespace xe {
 namespace cpu {
 namespace ppc {
 
+class GuestCodeReader;
 class PPCFrontend;
 class PPCHIRBuilder;
 class PPCScanner;
@@ -35,7 +36,9 @@ class PPCTranslator {
   void Reset();
 
  private:
-  void DumpSource(GuestFunction* function, StringBuffer* string_buffer);
+  bool DumpSource(GuestFunction* function,
+                  const GuestCodeReader& guest_code_reader,
+                  StringBuffer* string_buffer);
 
   PPCFrontend* frontend_;
   std::unique_ptr<PPCScanner> scanner_;

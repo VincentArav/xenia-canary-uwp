@@ -307,6 +307,20 @@ EMITTER_OPCODE_TABLE(OPCODE_CALL_TRUE, CALL_TRUE_I8, CALL_TRUE_I16,
                      CALL_TRUE_I32, CALL_TRUE_I64, CALL_TRUE_F32,
                      CALL_TRUE_F64);
 
+// Checked code resolves every branch, so a constant target (0 included, which
+// raises an instruction storage fault) goes through the resolver too.
+template <typename T>
+void CallIndirectTarget(X64Emitter& e, const hir::Instr* instr,
+                        const T& target) {
+  if (target.is_constant && e.current_guest_call_dispatch_mode() ==
+                                GuestCallDispatchMode::kResolverOnly) {
+    e.mov(e.ebx, static_cast<uint32_t>(target.constant()));
+    e.CallIndirect(instr, e.rbx);
+  } else {
+    e.CallIndirect(instr, target);
+  }
+}
+
 // ============================================================================
 // OPCODE_CALL_INDIRECT
 // ============================================================================
@@ -314,7 +328,10 @@ struct CALL_INDIRECT
     : Sequence<CALL_INDIRECT, I<OPCODE_CALL_INDIRECT, VoidOp, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src1.is_constant) [[unlikely]] {
-      if (i.src1.constant() == 0) {
+      if (e.current_guest_call_dispatch_mode() ==
+          GuestCallDispatchMode::kResolverOnly) {
+        CallIndirectTarget(e, i.instr, i.src1);
+      } else if (i.src1.constant() == 0) {
         e.nop();
       } else {
         // This isn't valid, but at least we will have log info about potential
@@ -339,7 +356,7 @@ struct CALL_INDIRECT_TRUE_I8
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
     e.jz(skip, CodeGenerator::T_NEAR);
-    e.CallIndirect(i.instr, i.src2);
+    CallIndirectTarget(e, i.instr, i.src2);
     e.L(skip);
   }
 };
@@ -350,7 +367,7 @@ struct CALL_INDIRECT_TRUE_I16
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
     e.jz(skip, CodeGenerator::T_NEAR);
-    e.CallIndirect(i.instr, i.src2);
+    CallIndirectTarget(e, i.instr, i.src2);
     e.L(skip);
   }
 };
@@ -362,13 +379,13 @@ struct CALL_INDIRECT_TRUE_I32
       e.mov(e.ecx, i.src1);
       Xbyak::Label skip;
       e.jrcxz(skip);
-      e.CallIndirect(i.instr, i.src2);
+      CallIndirectTarget(e, i.instr, i.src2);
       e.L(skip);
     } else {
       e.test(i.src1, i.src1);
       Xbyak::Label skip;
       e.jz(skip, CodeGenerator::T_NEAR);
-      e.CallIndirect(i.instr, i.src2);
+      CallIndirectTarget(e, i.instr, i.src2);
       e.L(skip);
     }
   }
@@ -381,13 +398,13 @@ struct CALL_INDIRECT_TRUE_I64
       e.mov(e.rcx, i.src1);
       Xbyak::Label skip;
       e.jrcxz(skip);
-      e.CallIndirect(i.instr, i.src2);
+      CallIndirectTarget(e, i.instr, i.src2);
       e.L(skip);
     } else {
       e.test(i.src1, i.src1);
       Xbyak::Label skip;
       e.jz(skip, CodeGenerator::T_NEAR);
-      e.CallIndirect(i.instr, i.src2);
+      CallIndirectTarget(e, i.instr, i.src2);
       e.L(skip);
     }
   }

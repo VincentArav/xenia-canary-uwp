@@ -24,6 +24,19 @@ namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
+namespace {
+
+// \??\ names the object manager's DOS-devices directory. Its drive and device
+// links (X:, cache:, ...) are registered in the VFS without the qualifier, and
+// the '?' characters would otherwise fail non-pattern path validation.
+void StripDosDevicesQualifier(std::string& path) {
+  if (utf8::starts_with(path, "\\??\\")) {
+    path.erase(0, 4);
+  }
+}
+
+}  // namespace
+
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
   static constexpr uint32_t FILE_DIRECTORY_FILE = 0x00000001;
@@ -61,6 +74,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   // Compute path, possibly attrs relative.
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  StripDosDevicesQualifier(target_path);
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -114,10 +128,11 @@ DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
 dword_result_t NtOpenFile_entry(
     lpdword_t handle_out, dword_t desired_access,
     pointer_t<X_OBJECT_ATTRIBUTES> object_attributes,
-    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t open_options) {
+    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t share_access,
+    dword_t open_options) {
   return NtCreateFile_entry(
       handle_out, desired_access, object_attributes, io_status_block, nullptr,
-      0, 0, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
+      0, share_access, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
       open_options);
 }
 DECLARE_XBOXKRNL_EXPORT1(NtOpenFile, kFileSystem, kImplemented);
@@ -138,6 +153,9 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (!file->is_synchronous() && !byte_offset_ptr) {
+    // An asynchronous file object has no current position to fall back on.
+    result = X_STATUS_INVALID_PARAMETER;
   }
 
   if (XSUCCEEDED(result)) {
@@ -230,6 +248,9 @@ dword_result_t NtReadFileScatter_entry(
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (!file->is_synchronous() && !byte_offset_ptr) {
+    // An asynchronous file object has no current position to fall back on.
+    result = X_STATUS_INVALID_PARAMETER;
   }
 
   if (XSUCCEEDED(result)) {
@@ -319,6 +340,9 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (!file->is_synchronous() && !byte_offset_ptr) {
+    // An asynchronous file object has no current position to fall back on.
+    result = X_STATUS_INVALID_PARAMETER;
   }
 
   // Execute write.
@@ -488,6 +512,7 @@ dword_result_t NtQueryFullAttributesFile_entry(
   }
 
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  StripDosDevicesQualifier(target_path);
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -584,6 +609,7 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
       kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  StripDosDevicesQualifier(target_path);
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -592,10 +618,6 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
 
   if (object_attrs->root_directory != 0) {
     assert_always();
-  }
-
-  if (utf8::starts_with(target_path, "\\??\\")) {
-    target_path = target_path.substr(4);  // Strip the full qualifier
   }
 
   std::string link_path;
@@ -759,6 +781,15 @@ void IoDeleteDevice_entry(dword_t device_ptr, const ppc_context_t& ctx) {
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// Host-backed volumes have no mount state to tear down.
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t handle) {
+  if (!kernel_state()->object_table()->LookupObject<XFile>(handle)) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

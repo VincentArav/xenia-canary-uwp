@@ -52,6 +52,11 @@ class Backend {
 
   virtual bool Initialize(Processor* processor);
 
+  // Whether generated code can run checked (non-DefaultDirect) domains.
+  virtual bool SupportsCheckedGuestMemoryAccess() const noexcept {
+    return false;
+  }
+
   virtual void* AllocThreadData();
   virtual void FreeThreadData(void* thread_data);
 
@@ -83,15 +88,8 @@ class Backend {
   */
   virtual void DeinitializeBackendContext(void* ctx) {}
   virtual void SetGuestRoundingMode(void* ctx, unsigned int mode) {};
-  /*
-        called by KeSetCurrentStackPointers in xboxkrnl_threading.cc just prior
-  to calling XThread::Reenter this is an opportunity for a backend to clear any
-  data related to the guest stack
-
-        in the case of the X64 backend, it means we reset the stackpoint index
-  to 0, since its a new stack and all of our old entries are invalid now
-
-  * */
+  // Called by XThread::Reenter just before the non-local transfer, to drop
+  // state tied to the old guest stack (x64 resets its stackpoint index).
   virtual void PrepareForReentry(void* ctx) {}
 
   // returns true if populated st

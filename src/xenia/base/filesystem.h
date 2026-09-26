@@ -52,6 +52,20 @@ std::error_code CreateFolder(const std::filesystem::path& path);
 // Creates an empty file at the given path, overwriting if it exists.
 bool CreateEmptyFile(const std::filesystem::path& path);
 
+// Whether the path itself is a symbolic link or, on Windows, another reparse
+// point. Doesn't follow links.
+bool IsSymlinkOrReparsePoint(const std::filesystem::path& path);
+
+// Whether either path, made absolute and lexically normal, equals or contains
+// the other. Ignores ASCII case on Windows; doesn't resolve links.
+bool HostPathsOverlap(const std::filesystem::path& left,
+                      const std::filesystem::path& right);
+
+// Renames a file without replacing an existing destination. Returns an empty
+// error code on success.
+std::error_code RenameFileNoReplace(const std::filesystem::path& source,
+                                    const std::filesystem::path& destination);
+
 // Opens the file at the given path with the specified mode.
 // This behaves like fopen and the returned handle can be used with stdio.
 FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode);
@@ -81,6 +95,11 @@ struct FileAccess {
 
 class FileHandle {
  public:
+  // Creates and opens a new file, failing if it already exists.
+  // The desired_access bitmask denotes the permissions on the file.
+  static std::unique_ptr<FileHandle> CreateNew(
+      const std::filesystem::path& path, uint32_t desired_access);
+
   // Opens the file, failing if it doesn't exist.
   // The desired_access bitmask denotes the permissions on the file.
   static std::unique_ptr<FileHandle> OpenExisting(
@@ -126,6 +145,9 @@ struct FileInfo {
   uint64_t create_timestamp;
   uint64_t access_timestamp;
   uint64_t write_timestamp;
+  // Whether the entry itself is a symbolic link or Windows reparse point. Type
+  // and size may describe the link's target.
+  bool is_symlink_or_reparse_point = false;
 };
 
 std::optional<FileInfo> GetInfo(const std::filesystem::path& path);

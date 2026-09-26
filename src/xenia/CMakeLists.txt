@@ -6,7 +6,7 @@ file(GLOB _core_sources   "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/*.cc"
 )
 target_sources(xenia-core PRIVATE ${_core_sources})
-target_link_libraries(xenia-core PUBLIC fmt xenia-base)
+target_link_libraries(xenia-core PUBLIC fmt xenia-base xenia-xefu)
 xe_target_defaults(xenia-core)
 
 # All subdirectories
@@ -35,6 +35,7 @@ if(NOT APPLE)
   add_subdirectory(ui/vulkan)
 endif()
 add_subdirectory(vfs)
+add_subdirectory(xefu)
 add_subdirectory(debug/ui)
 add_subdirectory(app/discord)
 add_subdirectory(app)

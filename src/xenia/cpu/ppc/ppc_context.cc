@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/ppc/ppc_context.h"
 
+#include <array>
 #include <cstdlib>
 
 #include "xenia/base/assert.h"
@@ -19,27 +20,44 @@ namespace cpu {
 namespace ppc {
 
 uint64_t PPCContext::cr() const {
+  const std::array<std::array<const uint8_t*, 4>, 8> fields{{
+      {{&cr0.cr0_lt, &cr0.cr0_gt, &cr0.cr0_eq, &cr0.cr0_so}},
+      {{&cr1.cr1_fx, &cr1.cr1_fex, &cr1.cr1_vx, &cr1.cr1_ox}},
+      {{&cr2.cr2_0, &cr2.cr2_1, &cr2.cr2_2, &cr2.cr2_3}},
+      {{&cr3.cr3_0, &cr3.cr3_1, &cr3.cr3_2, &cr3.cr3_3}},
+      {{&cr4.cr4_0, &cr4.cr4_1, &cr4.cr4_2, &cr4.cr4_3}},
+      {{&cr5.cr5_0, &cr5.cr5_1, &cr5.cr5_2, &cr5.cr5_3}},
+      {{&cr6.cr6_all_equal, &cr6.cr6_1, &cr6.cr6_none_equal, &cr6.cr6_3}},
+      {{&cr7.cr7_0, &cr7.cr7_1, &cr7.cr7_2, &cr7.cr7_3}},
+  }};
   uint64_t final_bits = 0;
   for (int i = 0; i < 8; ++i) {
-    union {
-      uint32_t value;
-      struct {
-        uint8_t lt;
-        uint8_t gt;
-        uint8_t eq;
-        uint8_t so;
-      };
-    } crf;
-    crf.value = *(&cr0.value + i);
-    uint64_t bits = (crf.lt & 0x1) << 3 | (crf.gt & 0x1) << 2 |
-                    (crf.eq & 0x1) << 1 | (crf.so & 0x1) << 0;
+    const uint64_t bits =
+        uint64_t(*fields[i][0] & 1) << 3 | uint64_t(*fields[i][1] & 1) << 2 |
+        uint64_t(*fields[i][2] & 1) << 1 | uint64_t(*fields[i][3] & 1);
     final_bits |= bits << ((7 - i) * 4);
   }
   return final_bits;
 }
 
 void PPCContext::set_cr(uint64_t value) {
-  assert_always("not yet implemented");
+  const std::array<std::array<uint8_t*, 4>, 8> fields{{
+      {{&cr0.cr0_lt, &cr0.cr0_gt, &cr0.cr0_eq, &cr0.cr0_so}},
+      {{&cr1.cr1_fx, &cr1.cr1_fex, &cr1.cr1_vx, &cr1.cr1_ox}},
+      {{&cr2.cr2_0, &cr2.cr2_1, &cr2.cr2_2, &cr2.cr2_3}},
+      {{&cr3.cr3_0, &cr3.cr3_1, &cr3.cr3_2, &cr3.cr3_3}},
+      {{&cr4.cr4_0, &cr4.cr4_1, &cr4.cr4_2, &cr4.cr4_3}},
+      {{&cr5.cr5_0, &cr5.cr5_1, &cr5.cr5_2, &cr5.cr5_3}},
+      {{&cr6.cr6_all_equal, &cr6.cr6_1, &cr6.cr6_none_equal, &cr6.cr6_3}},
+      {{&cr7.cr7_0, &cr7.cr7_1, &cr7.cr7_2, &cr7.cr7_3}},
+  }};
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t bits = uint32_t(value >> ((7 - i) * 4)) & 0xF;
+    *fields[i][0] = uint8_t((bits >> 3) & 1);
+    *fields[i][1] = uint8_t((bits >> 2) & 1);
+    *fields[i][2] = uint8_t((bits >> 1) & 1);
+    *fields[i][3] = uint8_t(bits & 1);
+  }
 }
 
 std::string PPCContext::GetRegisterName(PPCRegister reg) {
