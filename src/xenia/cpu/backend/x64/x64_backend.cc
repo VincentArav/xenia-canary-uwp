@@ -1712,12 +1712,17 @@ void X64Backend::InitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
   bctx->checked_resolutions.epoch = 0;
   bctx->checked_resolutions.processor = nullptr;
+  bctx->checked_resolutions.stale = 0;
+  processor()->RegisterCheckedResolutionStaleFlag(
+      &bctx->checked_resolutions.stale);
   std::memset(bctx->checked_resolutions.entries, 0,
               sizeof(bctx->checked_resolutions.entries));
   bctx->checked_tlb.epoch = 0;
   bctx->checked_tlb.clear_epoch = 0;
   bctx->checked_tlb.owner = nullptr;
+  bctx->checked_tlb.stale = 0;
   bctx->checked_tlb.ClearEntries();
+  Memory::RegisterTranslationStaleFlag(&bctx->checked_tlb.stale);
   bctx->mxcsr_fpu =
       DEFAULT_FPU_MXCSR;  // idk if this is right, check on rgh what the
                           // rounding on ppc is at startup
@@ -1741,6 +1746,9 @@ void X64Backend::InitializeBackendContext(void* ctx) {
 }
 void X64Backend::DeinitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  Memory::UnregisterTranslationStaleFlag(&bctx->checked_tlb.stale);
+  processor()->UnregisterCheckedResolutionStaleFlag(
+      &bctx->checked_resolutions.stale);
 
   if (bctx->stackpoints) {
     delete[] bctx->stackpoints;

@@ -103,7 +103,10 @@ constexpr uint32_t kCheckedResolutionCount = 1u << kCheckedResolutionShift;
 struct alignas(64) CheckedResolutionTable {
   uint64_t epoch;
   const void* processor;
-  uint8_t padding[48];
+  // Set by every checked execution epoch advance while registered with the
+  // processor; generated code misses while it is set.
+  uint32_t stale;
+  uint8_t padding[44];
   CheckedResolutionEntry entries[kCheckedResolutionCount];
 
   // The instruction index folded with the bits above it.

@@ -36,6 +36,7 @@ UserModeOuterIntegerState CaptureUserModeOuterIntegerState(
   state.xer_ca = context.xer_ca;
   state.xer_ov = context.xer_ov;
   state.xer_so = context.xer_so;
+  state.xer_string_count = context.xer_string_count;
   return state;
 }
 
@@ -49,6 +50,7 @@ void ApplyUserModeOuterIntegerState(const UserModeOuterIntegerState& state,
   context.xer_ca = state.xer_ca;
   context.xer_ov = state.xer_ov;
   context.xer_so = state.xer_so;
+  context.xer_string_count = state.xer_string_count;
 }
 
 namespace {

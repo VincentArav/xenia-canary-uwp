@@ -98,6 +98,59 @@ std::optional<XefuRestrictionProfile> GetXefuRestrictionProfile(
 std::string_view XefuBuildSelectionDiagnosticToString(
     XefuBuildSelectionDiagnostic diagnostic);
 
+// One XeFu release, whichever pack supplies it.
+enum class XefuGeneration : uint8_t {
+  kNovember2005,  // xefu.xex as patched in November 2005
+  k1_1,
+  k2,
+  k3,
+  k5,
+  k6,
+  k7,
+  k7b,
+  // Builds found in the Xbox One / Series releases of particular titles; only
+  // the modified packs carry them.
+  k2019,
+  k2021a,
+  k2021b,
+  k2021c,
+};
+
+// The exact build of a release in a pack, if the pack has it.
+std::optional<XefuBuildId> XefuBuildForGeneration(XefuGeneration generation,
+                                                  XefuAssetProvenance pack);
+// The pack that supplies an exact build.
+XefuAssetProvenance XefuPackForBuild(XefuBuildId build);
+// The release the official Xbox 360 selector chooses for a title, if listed.
+std::optional<XefuGeneration> OfficialXefuGenerationForTitle(uint32_t title_id);
+
+enum class XefuAutomaticReason {
+  // Microsoft shipped a newer XeFu with this title's Xbox One release.
+  kXboxOneRelease,
+  // A community config for the title is in <pack>/Configs; the config loader
+  // (a release 7 build) applies it.
+  kCommunityConfig,
+  // Only the Xbox One-era title tables (2019/2021) carry settings for it.
+  kXboxOneTitleTable,
+  // The official Xbox 360 selector's choice.
+  kOfficialList,
+  // Unlisted: the latest Xbox 360 release, as a modified console uses.
+  kLatestRelease,
+};
+
+struct XefuAutomaticSelection {
+  XefuBuildId build = XefuBuildId::kHacked7b;
+  XefuAutomaticReason reason = XefuAutomaticReason::kLatestRelease;
+};
+
+// Picks the build for a title from a pack. community_config_available means
+// <pack>/Configs/{TITLEID:08X}.bin exists; it is used only with a modified
+// pack, for titles that are unlisted or officially on release 7 or 7b.
+XefuAutomaticSelection SelectAutomaticXefuBuild(
+    uint32_t title_id, XefuAssetProvenance pack,
+    bool community_config_available);
+std::string_view XefuAutomaticReasonToString(XefuAutomaticReason reason);
+
 }  // namespace xe::xefu
 
 #endif  // XENIA_XEFU_XEFU_SELECTION_H_

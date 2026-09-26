@@ -317,4 +317,211 @@ std::string_view XefuBuildSelectionDiagnosticToString(
   return "unknown XeFu build-selection error";
 }
 
+namespace {
+
+struct OfficialTitle {
+  uint32_t title_id;
+  XefuGeneration generation;
+};
+
+constexpr OfficialTitle kOfficialTitles[] = {
+#include "xenia/xefu/xefu_official_titles.inc"
+};
+
+// Titles whose Xbox One / Series release ships its own XeFu.
+constexpr OfficialTitle kXboxOneReleases[] = {
+    {0x42560002, XefuGeneration::k2021b},  // Chicken Little
+    {0x4C410008, XefuGeneration::k2021b},  // Gladius
+    {0x4D530002, XefuGeneration::k2019},   // Fuzion Frenzy
+    {0x4D530021, XefuGeneration::k2021c},  // Crimson Skies
+    {0x5345000B, XefuGeneration::k2021a},  // Gunvalkyrie
+};
+
+// Titles the Xbox One-era title tables (xefutitle2019/2021) add that the Xbox
+// 360 selector does not list; xefutitle2021 carries them all.
+constexpr uint32_t kXboxOneTableTitles[] = {
+    0x4541006D,  // Oddworld: Stranger's Wrath
+    0x4C410006,  // Secret Weapons Over Normandy
+    0x4C410011,  // Star Wars: Battlefront
+    0x4D530031,  // Kung Fu Chaos
+};
+
+std::optional<XefuGeneration> FindTitle(std::span<const OfficialTitle> titles,
+                                        uint32_t title_id) {
+  const auto it = std::lower_bound(titles.begin(), titles.end(), title_id,
+                                   [](const OfficialTitle& title, uint32_t id) {
+                                     return title.title_id < id;
+                                   });
+  return it != titles.end() && it->title_id == title_id
+             ? std::optional<XefuGeneration>(it->generation)
+             : std::nullopt;
+}
+
+constexpr bool TitlesSorted(std::span<const OfficialTitle> titles) {
+  for (size_t i = 1; i < titles.size(); ++i) {
+    if (titles[i - 1].title_id >= titles[i].title_id) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(TitlesSorted(kOfficialTitles));
+static_assert(TitlesSorted(kXboxOneReleases));
+
+}  // namespace
+
+std::optional<XefuBuildId> XefuBuildForGeneration(XefuGeneration generation,
+                                                  XefuAssetProvenance pack) {
+  using B = XefuBuildId;
+  using G = XefuGeneration;
+  switch (pack) {
+    case XefuAssetProvenance::kRetail:
+      switch (generation) {
+        case G::kNovember2005:
+          return B::kRetailPatched;
+        case G::k1_1:
+          return B::kRetail1_1;
+        case G::k2:
+          return B::kRetail2;
+        case G::k3:
+          return B::kRetail3;
+        case G::k5:
+          return B::kRetail5;
+        case G::k6:
+          return B::kRetail6;
+        case G::k7:
+          return B::kRetail7;
+        case G::k7b:
+          return B::kRetail7b;
+        default:
+          return std::nullopt;
+      }
+    case XefuAssetProvenance::kModified:
+      switch (generation) {
+        case G::kNovember2005:
+          return B::kHackedPatched;
+        case G::k1_1:
+          return B::kHacked1_1;
+        case G::k2:
+          return B::kHacked2;
+        case G::k3:
+          return B::kHacked3;
+        case G::k5:
+          return B::kHacked5;
+        case G::k6:
+          return B::kHacked6;
+        case G::k7:
+          return B::kHacked7;
+        case G::k7b:
+          return B::kHacked7b;
+        case G::k2019:
+          return B::kHacked2019;
+        case G::k2021a:
+          return B::kHacked2021a;
+        case G::k2021b:
+          return B::kHacked2021b;
+        case G::k2021c:
+          return B::kHacked2021c;
+      }
+      break;
+    case XefuAssetProvenance::kModifiedWithHud:
+      switch (generation) {
+        case G::kNovember2005:
+          return B::kHackedHudPatched;
+        case G::k1_1:
+          return B::kHackedHud1_1;
+        case G::k2:
+          return B::kHackedHud2;
+        case G::k3:
+          return B::kHackedHud3;
+        case G::k5:
+          return B::kHackedHud5;
+        case G::k6:
+          return B::kHackedHud6;
+        case G::k7:
+          return B::kHackedHud7;
+        case G::k7b:
+          return B::kHackedHud7b;
+        case G::k2019:
+          return B::kHackedHud2019;
+        case G::k2021a:
+          return B::kHackedHud2021a;
+        case G::k2021b:
+          return B::kHackedHud2021b;
+        case G::k2021c:
+          return B::kHackedHud2021c;
+      }
+      break;
+  }
+  return std::nullopt;
+}
+
+XefuAssetProvenance XefuPackForBuild(XefuBuildId build) {
+  if (build <= XefuBuildId::kRetail7b) {
+    return XefuAssetProvenance::kRetail;
+  }
+  if (build <= XefuBuildId::kHacked2021c) {
+    return XefuAssetProvenance::kModified;
+  }
+  return XefuAssetProvenance::kModifiedWithHud;
+}
+
+std::optional<XefuGeneration> OfficialXefuGenerationForTitle(
+    uint32_t title_id) {
+  return FindTitle(kOfficialTitles, title_id);
+}
+
+XefuAutomaticSelection SelectAutomaticXefuBuild(
+    uint32_t title_id, XefuAssetProvenance pack,
+    bool community_config_available) {
+  const bool modified = pack != XefuAssetProvenance::kRetail;
+  const std::optional<XefuGeneration> official =
+      OfficialXefuGenerationForTitle(title_id);
+  if (modified) {
+    if (const std::optional<XefuGeneration> xbox_one =
+            FindTitle(kXboxOneReleases, title_id)) {
+      return {*XefuBuildForGeneration(*xbox_one, pack),
+              XefuAutomaticReason::kXboxOneRelease};
+    }
+    // The config loader is a release 7 build, so it replaces only a release 7
+    // or 7b choice.
+    if (community_config_available &&
+        (!official || *official == XefuGeneration::k7 ||
+         *official == XefuGeneration::k7b)) {
+      return {pack == XefuAssetProvenance::kModified
+                  ? XefuBuildId::kHackedConfigLoader7
+                  : XefuBuildId::kHackedHudConfigLoader7,
+              XefuAutomaticReason::kCommunityConfig};
+    }
+    if (!official && std::find(std::begin(kXboxOneTableTitles),
+                               std::end(kXboxOneTableTitles),
+                               title_id) != std::end(kXboxOneTableTitles)) {
+      return {*XefuBuildForGeneration(XefuGeneration::k2021c, pack),
+              XefuAutomaticReason::kXboxOneTitleTable};
+    }
+  }
+  if (official) {
+    return {*XefuBuildForGeneration(*official, pack),
+            XefuAutomaticReason::kOfficialList};
+  }
+  return {*XefuBuildForGeneration(XefuGeneration::k7b, pack),
+          XefuAutomaticReason::kLatestRelease};
+}
+
+std::string_view XefuAutomaticReasonToString(XefuAutomaticReason reason) {
+  switch (reason) {
+    case XefuAutomaticReason::kXboxOneRelease:
+      return "the XeFu shipped with its Xbox One release";
+    case XefuAutomaticReason::kCommunityConfig:
+      return "its community config, through the config loader";
+    case XefuAutomaticReason::kXboxOneTitleTable:
+      return "only the Xbox One-era title tables list it";
+    case XefuAutomaticReason::kOfficialList:
+      return "the official Xbox 360 list";
+    case XefuAutomaticReason::kLatestRelease:
+      return "not listed, so the latest Xbox 360 release";
+  }
+  return "unknown";
+}
+
 }  // namespace xe::xefu

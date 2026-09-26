@@ -425,6 +425,9 @@ typedef struct alignas(64) PPCContext_s {
   // checked-domain loops test it at backward branches. Host metadata only.
   uint8_t guest_interrupt_pending;
 
+  // XER[57:63], the byte count of lswx and stswx. Fills alignment padding.
+  uint8_t xer_string_count;
+
   // Processor-specific data pointer. Used on callbacks to get access to the
   // current runtime and its data.
   Processor* processor;

@@ -444,18 +444,15 @@ int32_t CheckedTlbDisplacement(size_t offset_in_tlb) {
 }
 
 // With the effective address in eax, leaves the entry's host_delta in rdx, or
-// jumps to miss when the table is stale or has no inline-usable entry of
-// accessor_id for the access. The tag comes from the access's last byte and the
-// index from its first, and an entry sits at its own page's index, which no
-// adjacent page shares, so an access crossing a page never matches. Clobbers
-// rcx, rdx and flags.
+// jumps to miss when the table is stale or has no usable entry of accessor_id
+// for the access. The tag comes from the access's last byte and the index from
+// its first, so an access crossing a page never matches. Clobbers rcx, rdx and
+// flags.
 void EmitCheckedTlbProbe(X64Emitter& e, bool write, uint32_t byte_count,
                          uint32_t accessor_id, Xbyak::Label& miss) {
   const Xbyak::Reg64 context = e.GetContextReg();
-  e.mov(e.rcx, reinterpret_cast<uint64_t>(Memory::translation_epoch_address()));
-  e.mov(e.rcx, e.qword[e.rcx]);
-  e.cmp(e.rcx,
-        e.qword[context + CheckedTlbDisplacement(offsetof(CheckedTlb, epoch))]);
+  e.cmp(e.dword[context + CheckedTlbDisplacement(offsetof(CheckedTlb, stale))],
+        0);
   e.jne(miss, X64Emitter::T_NEAR);
   // The index, as CheckedTlb::IndexFor, scaled by the entry size.
   e.mov(e.edx, e.eax);
@@ -472,15 +469,13 @@ void EmitCheckedTlbProbe(X64Emitter& e, bool write, uint32_t byte_count,
     e.mov(e.ecx, e.eax);
   }
   e.shr(e.ecx, kCheckedTlbPageShift);
-  e.or_(e.ecx, kCheckedTlbValidBit | kCheckedTlbInlineBit);
+  assert_true(accessor_id <= kCheckedTlbMaxPackedAccessorId);
+  e.or_(e.ecx, kCheckedTlbValidBit | kCheckedTlbInlineBit |
+                   (accessor_id << kCheckedTlbAccessorShift));
   static_assert(sizeof(CheckedTlbEntry) == 16);
   const int32_t table = CheckedTlbDisplacement(
       write ? offsetof(CheckedTlb, write) : offsetof(CheckedTlb, read));
   e.cmp(e.ecx, e.dword[context + e.rdx + table]);
-  e.jne(miss, X64Emitter::T_NEAR);
-  e.cmp(e.dword[context + e.rdx +
-                (table + offsetof(CheckedTlbEntry, accessor_id))],
-        accessor_id);
   e.jne(miss, X64Emitter::T_NEAR);
   e.mov(e.rdx, e.qword[context + e.rdx +
                        (table + offsetof(CheckedTlbEntry, host_delta))]);

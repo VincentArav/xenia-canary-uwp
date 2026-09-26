@@ -10,6 +10,8 @@
 #ifndef XENIA_CPU_PPC_PPC_HIR_BUILDER_H_
 #define XENIA_CPU_PPC_PPC_HIR_BUILDER_H_
 
+#include <iterator>
+
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/hir/hir_builder.h"
@@ -126,6 +128,17 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   uint64_t instr_count_;
   Instr** instr_offset_list_;
   Label** label_list_;
+
+  // Records a register the current instruction writes. Multiple-register
+  // forms (lmw, lswi, lswx) write more than the record holds; the rest are
+  // not recorded.
+  void NoteTraceDest(uint32_t reg, Value* value) {
+    if (trace_info_.dest_count < std::size(trace_info_.dests)) {
+      auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
+      trace_reg.reg = uint8_t(reg);
+      trace_reg.value = value;
+    }
+  }
 
   // Reset each instruction.
   struct {

@@ -880,14 +880,176 @@ int InstrEmit_vmaxuw(PPCHIRBuilder& f, const InstrData& i) {
   return 0;
 }
 
+// Element-wise helpers for operations with no vector HIR opcode. Elements use
+// architectural (big-endian) numbering, as Extract and Insert do; values are
+// widened to INT64 so sums and products never overflow before saturation.
+namespace {
+
+Value* ElementS(PPCHIRBuilder& f, Value* v, uint32_t index, TypeName type) {
+  return f.SignExtend(f.Extract(v, uint8_t(index), type), INT64_TYPE);
+}
+
+Value* ElementU(PPCHIRBuilder& f, Value* v, uint32_t index, TypeName type) {
+  return f.ZeroExtend(f.Extract(v, uint8_t(index), type), INT64_TYPE);
+}
+
+// Clamps a signed value to `bits` bits, ORing whether it clamped into *sat.
+Value* SaturateSigned(PPCHIRBuilder& f, Value* v, int bits, Value** sat) {
+  const int64_t hi = (int64_t(1) << (bits - 1)) - 1;
+  const int64_t lo = -(int64_t(1) << (bits - 1));
+  Value* over = f.CompareSGT(v, f.LoadConstantInt64(hi));
+  Value* under = f.CompareSLT(v, f.LoadConstantInt64(lo));
+  Value* clamped = f.Select(over, f.LoadConstantInt64(hi),
+                            f.Select(under, f.LoadConstantInt64(lo), v));
+  Value* saturated = f.Or(over, under);
+  *sat = *sat ? f.Or(*sat, saturated) : saturated;
+  return clamped;
+}
+
+// Clamps a non-negative value to `bits` unsigned bits.
+Value* SaturateUnsigned(PPCHIRBuilder& f, Value* v, int bits, Value** sat) {
+  const uint64_t hi = (uint64_t(1) << bits) - 1;
+  Value* over = f.CompareUGT(v, f.LoadConstantUint64(hi));
+  Value* clamped = f.Select(over, f.LoadConstantUint64(hi), v);
+  *sat = *sat ? f.Or(*sat, over) : over;
+  return clamped;
+}
+
+// VSCR[SAT] is sticky.
+void OrSAT(PPCHIRBuilder& f, Value* sat) { f.StoreSAT(f.Or(f.LoadSAT(), sat)); }
+
+Value* WithElement(PPCHIRBuilder& f, Value* vector, uint32_t index,
+                   Value* value, TypeName type) {
+  return f.Insert(vector, uint64_t(index), f.Truncate(value, type));
+}
+
+// vmhaddshs and vmhraddshs: (a * b [+ 0x4000]) >> 15, plus c, saturated.
+int EmitMultiplyHighAdd(PPCHIRBuilder& f, const InstrData& i, bool round) {
+  Value* va = f.LoadVR(i.VXA.VA);
+  Value* vb = f.LoadVR(i.VXA.VB);
+  Value* vc = f.LoadVR(i.VXA.VC);
+  Value* result = f.LoadZeroVec128();
+  Value* sat = nullptr;
+  for (uint32_t k = 0; k < 8; ++k) {
+    Value* product =
+        f.Mul(ElementS(f, va, k, INT16_TYPE), ElementS(f, vb, k, INT16_TYPE));
+    if (round) {
+      product = f.Add(product, f.LoadConstantInt64(0x4000));
+    }
+    Value* sum = f.Add(f.Sha(product, 15), ElementS(f, vc, k, INT16_TYPE));
+    result =
+        WithElement(f, result, k, SaturateSigned(f, sum, 16, &sat), INT16_TYPE);
+  }
+  f.StoreVR(i.VXA.VD, result);
+  OrSAT(f, sat);
+  return 0;
+}
+
+// vmsum*: each word of c plus the products of the elements in the
+// corresponding word of a and b (a signed/unsigned as a_signed, b likewise).
+int EmitMultiplySum(PPCHIRBuilder& f, const InstrData& i, TypeName type,
+                    bool a_signed, bool b_signed, bool saturate) {
+  const uint32_t per_word = type == INT8_TYPE ? 4 : 2;
+  Value* va = f.LoadVR(i.VXA.VA);
+  Value* vb = f.LoadVR(i.VXA.VB);
+  Value* vc = f.LoadVR(i.VXA.VC);
+  Value* result = f.LoadZeroVec128();
+  Value* sat = nullptr;
+  for (uint32_t w = 0; w < 4; ++w) {
+    Value* sum = a_signed ? ElementS(f, vc, w, INT32_TYPE)
+                          : ElementU(f, vc, w, INT32_TYPE);
+    for (uint32_t j = 0; j < per_word; ++j) {
+      const uint32_t e = w * per_word + j;
+      Value* a = a_signed ? ElementS(f, va, e, type) : ElementU(f, va, e, type);
+      Value* b = b_signed ? ElementS(f, vb, e, type) : ElementU(f, vb, e, type);
+      sum = f.Add(sum, f.Mul(a, b));
+    }
+    if (saturate) {
+      sum = a_signed ? SaturateSigned(f, sum, 32, &sat)
+                     : SaturateUnsigned(f, sum, 32, &sat);
+    }
+    result = WithElement(f, result, w, sum, INT32_TYPE);
+  }
+  f.StoreVR(i.VXA.VD, result);
+  if (sat) {
+    OrSAT(f, sat);
+  }
+  return 0;
+}
+
+// vmule*/vmulo*: products of the even or odd elements, twice as wide.
+int EmitMultiplyEvenOdd(PPCHIRBuilder& f, const InstrData& i, TypeName type,
+                        bool is_signed, bool odd) {
+  const uint32_t count = type == INT8_TYPE ? 8 : 4;
+  const TypeName wide = type == INT8_TYPE ? INT16_TYPE : INT32_TYPE;
+  Value* va = f.LoadVR(i.VX.VA);
+  Value* vb = f.LoadVR(i.VX.VB);
+  Value* result = f.LoadZeroVec128();
+  for (uint32_t k = 0; k < count; ++k) {
+    const uint32_t e = 2 * k + (odd ? 1 : 0);
+    Value* a = is_signed ? ElementS(f, va, e, type) : ElementU(f, va, e, type);
+    Value* b = is_signed ? ElementS(f, vb, e, type) : ElementU(f, vb, e, type);
+    result = WithElement(f, result, k, f.Mul(a, b), wide);
+  }
+  f.StoreVR(i.VX.VD, result);
+  return 0;
+}
+
+// vsum4*: each word of b plus the elements in the corresponding word of a.
+int EmitSumAcrossQuarter(PPCHIRBuilder& f, const InstrData& i, TypeName type,
+                         bool is_signed) {
+  const uint32_t per_word = type == INT8_TYPE ? 4 : 2;
+  Value* va = f.LoadVR(i.VX.VA);
+  Value* vb = f.LoadVR(i.VX.VB);
+  Value* result = f.LoadZeroVec128();
+  Value* sat = nullptr;
+  for (uint32_t w = 0; w < 4; ++w) {
+    Value* sum = is_signed ? ElementS(f, vb, w, INT32_TYPE)
+                           : ElementU(f, vb, w, INT32_TYPE);
+    for (uint32_t j = 0; j < per_word; ++j) {
+      const uint32_t e = w * per_word + j;
+      sum = f.Add(
+          sum, is_signed ? ElementS(f, va, e, type) : ElementU(f, va, e, type));
+    }
+    sum = is_signed ? SaturateSigned(f, sum, 32, &sat)
+                    : SaturateUnsigned(f, sum, 32, &sat);
+    result = WithElement(f, result, w, sum, INT32_TYPE);
+  }
+  f.StoreVR(i.VX.VD, result);
+  OrSAT(f, sat);
+  return 0;
+}
+
+// vupkhpx/vupklpx: 1/5/5/5 pixels to words, the 1-bit field sign-extended to
+// a byte and each 5-bit field zero-extended to a byte.
+int EmitUnpackPixel(PPCHIRBuilder& f, const InstrData& i, uint32_t first) {
+  Value* vb = f.LoadVR(i.VX.VB);
+  Value* result = f.LoadZeroVec128();
+  for (uint32_t k = 0; k < 4; ++k) {
+    Value* h = ElementU(f, vb, first + k, INT16_TYPE);
+    Value* alpha = f.And(f.Sha(ElementS(f, vb, first + k, INT16_TYPE), 15),
+                         f.LoadConstantUint64(0xFF000000));
+    Value* word =
+        f.Or(alpha,
+             f.Or(f.Shl(f.And(f.Shr(h, 10), f.LoadConstantUint64(0x1F)), 16),
+                  f.Or(f.Shl(f.And(f.Shr(h, 5), f.LoadConstantUint64(0x1F)), 8),
+                       f.And(h, f.LoadConstantUint64(0x1F)))));
+    result = WithElement(f, result, k, word, INT32_TYPE);
+  }
+  f.StoreVR(i.VX.VD, result);
+  return 0;
+}
+
+}  // namespace
+
 int InstrEmit_vmhaddshs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // (VD.h) <- saturate(((VA.h * VB.h) >> 15) + VC.h)
+  return EmitMultiplyHighAdd(f, i, false);
 }
 
 int InstrEmit_vmhraddshs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // (VD.h) <- saturate(((VA.h * VB.h + 0x4000) >> 15) + VC.h)
+  return EmitMultiplyHighAdd(f, i, true);
 }
 
 int InstrEmit_vminfp_(PPCHIRBuilder& f, uint32_t vd, uint32_t va, uint32_t vb) {
@@ -949,8 +1111,19 @@ int InstrEmit_vminuw(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vmladduhm(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // (VD.h) <- (VA.h * VB.h + VC.h) mod 2^16
+  Value* va = f.LoadVR(i.VXA.VA);
+  Value* vb = f.LoadVR(i.VXA.VB);
+  Value* vc = f.LoadVR(i.VXA.VC);
+  Value* result = f.LoadZeroVec128();
+  for (uint32_t k = 0; k < 8; ++k) {
+    Value* v = f.Add(
+        f.Mul(ElementU(f, va, k, INT16_TYPE), ElementU(f, vb, k, INT16_TYPE)),
+        ElementU(f, vc, k, INT16_TYPE));
+    result = WithElement(f, result, k, v, INT16_TYPE);
+  }
+  f.StoreVR(i.VXA.VD, result);
+  return 0;
 }
 
 int InstrEmit_vmrghb(PPCHIRBuilder& f, const InstrData& i) {
@@ -1035,33 +1208,28 @@ int InstrEmit_vmrglw128(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vmsummbm(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // Signed bytes of VA times unsigned bytes of VB, summed per word, plus VC.
+  return EmitMultiplySum(f, i, INT8_TYPE, true, false, false);
 }
 
 int InstrEmit_vmsumshm(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplySum(f, i, INT16_TYPE, true, true, false);
 }
 
 int InstrEmit_vmsumshs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplySum(f, i, INT16_TYPE, true, true, true);
 }
 
 int InstrEmit_vmsumubm(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplySum(f, i, INT8_TYPE, false, false, false);
 }
 
 int InstrEmit_vmsumuhm(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplySum(f, i, INT16_TYPE, false, false, false);
 }
 
 int InstrEmit_vmsumuhs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplySum(f, i, INT16_TYPE, false, false, true);
 }
 
 int InstrEmit_vmsum3fp128(PPCHIRBuilder& f, const InstrData& i) {
@@ -1084,43 +1252,35 @@ int InstrEmit_vmsum4fp128(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vmulesb(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT8_TYPE, true, false);
 }
 
 int InstrEmit_vmulesh(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT16_TYPE, true, false);
 }
 
 int InstrEmit_vmuleub(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT8_TYPE, false, false);
 }
 
 int InstrEmit_vmuleuh(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT16_TYPE, false, false);
 }
 
 int InstrEmit_vmulosb(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT8_TYPE, true, true);
 }
 
 int InstrEmit_vmulosh(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT16_TYPE, true, true);
 }
 
 int InstrEmit_vmuloub(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT8_TYPE, false, true);
 }
 
 int InstrEmit_vmulouh(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMultiplyEvenOdd(f, i, INT16_TYPE, false, true);
 }
 
 int InstrEmit_vmulfp128(PPCHIRBuilder& f, const InstrData& i) {
@@ -1339,13 +1499,10 @@ int InstrEmit_vrlimi128(PPCHIRBuilder& f, const InstrData& i) {
         // X Y Z W -> Z W X Y
         swizzle_mask = SWIZZLE_XYZW_TO_ZWXY;
         break;
-      case 3:
-        // X Y Z W -> W X Y Z
+      default:
+        // 3 (the field is 2 bits): X Y Z W -> W X Y Z
         swizzle_mask = SWIZZLE_XYZW_TO_WXYZ;
         break;
-      default:
-        XEINSTRNOTIMPLEMENTED();
-        return 1;
     }
     v = f.Swizzle(f.LoadVR(vb), FLOAT32_TYPE, swizzle_mask);
   } else {
@@ -1769,28 +1926,49 @@ int InstrEmit_vsubuws(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vsumsws(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // (VD.w[3]) <- saturate(sum(VA.w) + VB.w[3]); the other words are 0.
+  Value* va = f.LoadVR(i.VX.VA);
+  Value* vb = f.LoadVR(i.VX.VB);
+  Value* sum = ElementS(f, vb, 3, INT32_TYPE);
+  for (uint32_t w = 0; w < 4; ++w) {
+    sum = f.Add(sum, ElementS(f, va, w, INT32_TYPE));
+  }
+  Value* sat = nullptr;
+  f.StoreVR(i.VX.VD, WithElement(f, f.LoadZeroVec128(), 3,
+                                 SaturateSigned(f, sum, 32, &sat), INT32_TYPE));
+  OrSAT(f, sat);
+  return 0;
 }
 
 int InstrEmit_vsum2sws(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // (VD.w[1]) <- saturate(VA.w[0] + VA.w[1] + VB.w[1]), likewise words 2-3
+  // into word 3; words 0 and 2 are 0.
+  Value* va = f.LoadVR(i.VX.VA);
+  Value* vb = f.LoadVR(i.VX.VB);
+  Value* result = f.LoadZeroVec128();
+  Value* sat = nullptr;
+  for (uint32_t w = 1; w < 4; w += 2) {
+    Value* sum = f.Add(f.Add(ElementS(f, va, w - 1, INT32_TYPE),
+                             ElementS(f, va, w, INT32_TYPE)),
+                       ElementS(f, vb, w, INT32_TYPE));
+    result =
+        WithElement(f, result, w, SaturateSigned(f, sum, 32, &sat), INT32_TYPE);
+  }
+  f.StoreVR(i.VX.VD, result);
+  OrSAT(f, sat);
+  return 0;
 }
 
 int InstrEmit_vsum4sbs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitSumAcrossQuarter(f, i, INT8_TYPE, true);
 }
 
 int InstrEmit_vsum4shs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitSumAcrossQuarter(f, i, INT16_TYPE, true);
 }
 
 int InstrEmit_vsum4ubs(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitSumAcrossQuarter(f, i, INT8_TYPE, false);
 }
 
 static Value* vkpkx_in_low(PPCHIRBuilder& f, Value* input) {
@@ -2000,13 +2178,11 @@ int InstrEmit_vpkuwus128(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vupkhpx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitUnpackPixel(f, i, 0);
 }
 
 int InstrEmit_vupklpx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitUnpackPixel(f, i, 4);
 }
 
 int InstrEmit_vupkhsh_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb) {

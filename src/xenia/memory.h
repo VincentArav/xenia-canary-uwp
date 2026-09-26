@@ -567,13 +567,28 @@ class Memory {
   }
   // Cached translations must be dropped.
   static void AdvanceTranslationEpoch() {
-    translation_clear_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    translation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    translation_clear_epoch_.fetch_add(1, std::memory_order_seq_cst);
+    translation_epoch_.fetch_add(1, std::memory_order_seq_cst);
+    MarkTranslationTablesStale();
   }
   // A guest TB flush: cached translations must be checked against the page
   // tables again.
   static void AdvanceTranslationEpochForTbFlush() {
-    translation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    translation_epoch_.fetch_add(1, std::memory_order_seq_cst);
+    MarkTranslationTablesStale();
+  }
+  // Generated code tests a table's stale flag instead of comparing epochs.
+  // Every advance sets each registered flag after publishing the new epoch,
+  // so an advance that has returned is seen by every later probe. The owner
+  // clears its flag (sequentially consistent) before it reads the epoch it
+  // syncs the table to.
+  static void RegisterTranslationStaleFlag(uint32_t* flag) {
+    std::lock_guard<std::mutex> lock(translation_stale_flags_mutex_);
+    translation_stale_flags_.push_back(flag);
+  }
+  static void UnregisterTranslationStaleFlag(uint32_t* flag) {
+    std::lock_guard<std::mutex> lock(translation_stale_flags_mutex_);
+    std::erase(translation_stale_flags_, flag);
   }
 
   // Gets the heap for the address space containing the given address.
@@ -660,8 +675,17 @@ class Memory {
 
   friend class PhysicalHeap;
   xe::global_critical_region global_critical_region_;
+  static void MarkTranslationTablesStale() {
+    std::lock_guard<std::mutex> lock(translation_stale_flags_mutex_);
+    for (uint32_t* flag : translation_stale_flags_) {
+      std::atomic_ref<uint32_t>(*flag).store(1, std::memory_order_seq_cst);
+    }
+  }
+
   inline static std::atomic<uint64_t> translation_epoch_{1};
   inline static std::atomic<uint64_t> translation_clear_epoch_{1};
+  inline static std::mutex translation_stale_flags_mutex_;
+  inline static std::vector<uint32_t*> translation_stale_flags_;
   static_assert(std::atomic<uint64_t>::is_always_lock_free);
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;

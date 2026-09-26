@@ -34,9 +34,14 @@ constexpr uint32_t kCheckedTlbValidBit = 0x40000000u;
 // Generated code may access host_delta + ea directly. Set on every read entry
 // and on write entries that go through a watched guest view.
 constexpr uint32_t kCheckedTlbInlineBit = 0x80000000u;
+// Accessor ids up to kCheckedTlbMaxPackedAccessorId sit in tag bits 20-29, so
+// generated code matches page and accessor with one compare. Entries of larger
+// ids carry 0 there and serve the host only.
+constexpr uint32_t kCheckedTlbAccessorShift = 20;
+constexpr uint32_t kCheckedTlbMaxPackedAccessorId = 0x3FF;
 
 struct CheckedTlbEntry {
-  // Effective page | kCheckedTlbValidBit [| kCheckedTlbInlineBit]; 0 is empty.
+  // CheckedTlb::TagFor(ea, accessor_id) [| kCheckedTlbInlineBit]; 0 is empty.
   uint32_t tag;
   // GuestMemoryAccessor::inline_tlb_accessor_id() of the accessor that
   // translated the page. Ids are never reused.
@@ -64,7 +69,10 @@ struct alignas(64) CheckedTlb {
   uint64_t clear_epoch;
   // The memory the entries translate into.
   const void* owner;
-  uint8_t padding[40];
+  // Set by every translation epoch advance (Memory::MarkTranslationTablesStale)
+  // while the table is registered; generated code misses while it is set.
+  uint32_t stale;
+  uint8_t padding[36];
   CheckedTlbEntry read[kCheckedTlbEntryCount];
   CheckedTlbEntry write[kCheckedTlbEntryCount];
   CheckedTlbSource read_source[kCheckedTlbEntryCount];
@@ -84,8 +92,12 @@ struct alignas(64) CheckedTlb {
     return (page + (page >> kCheckedTlbIndexBits)) &
            (kCheckedTlbEntryCount - 1);
   }
-  static constexpr uint32_t TagFor(uint32_t effective_address) {
-    return (effective_address >> kCheckedTlbPageShift) | kCheckedTlbValidBit;
+  static constexpr uint32_t TagFor(uint32_t effective_address,
+                                   uint32_t accessor_id) {
+    return (effective_address >> kCheckedTlbPageShift) | kCheckedTlbValidBit |
+           (accessor_id <= kCheckedTlbMaxPackedAccessorId
+                ? accessor_id << kCheckedTlbAccessorShift
+                : 0);
   }
 };
 

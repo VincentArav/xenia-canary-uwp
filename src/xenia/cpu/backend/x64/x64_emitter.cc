@@ -511,6 +511,14 @@ CheckedResolutionEntry& CheckedResolutionFor(
       reinterpret_cast<X64BackendContext*>(
           reinterpret_cast<uint8_t*>(guest_context) - sizeof(X64BackendContext))
           ->checked_resolutions;
+  // Clear the flag before reading the epoch, so an advance racing with this
+  // sync is still seen.
+  std::atomic_ref<uint32_t> stale(table.stale);
+  if (stale.load(std::memory_order_relaxed)) {
+    stale.store(0, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    epoch = std::max(epoch, processor->checked_execution_epoch());
+  }
   if (table.processor != processor || table.epoch != epoch) {
     std::memset(table.entries, 0, sizeof(table.entries));
     table.processor = processor;
@@ -824,11 +832,8 @@ void X64Emitter::EmitCheckedResolutionProbe(Xbyak::Label& miss) {
   };
   cmp(byte[context + offsetof(ppc::PPCContext, guest_interrupt_pending)], 0);
   jne(miss, T_NEAR);
-  mov(rax, reinterpret_cast<uint64_t>(
-               processor_->checked_execution_epoch_address()));
-  mov(rax, qword[rax]);
-  cmp(rax,
-      qword[context + displacement(offsetof(CheckedResolutionTable, epoch))]);
+  cmp(dword[context + displacement(offsetof(CheckedResolutionTable, stale))],
+      0);
   jne(miss, T_NEAR);
   // CheckedResolutionTable::IndexFor, scaled by the entry size.
   mov(eax, edx);

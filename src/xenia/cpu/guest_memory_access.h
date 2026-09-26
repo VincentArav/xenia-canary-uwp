@@ -214,11 +214,10 @@ class GuestMemoryAccessor {
     return false;
   }
 
-  // Non-zero when generated code may probe a checked TLB for this accessor's
-  // translations and access host_delta + ea itself on a hit: the id its
-  // entries carry (cpu/checked_tlb.h). The accessor's storage order must be
-  // the canonical big-endian order, an inline hit must be equivalent to
-  // TryFastLoad/TryFastStore succeeding, and the id is never reused.
+  // The id this accessor's checked TLB entries carry when generated code may
+  // probe them and access host_delta + ea itself, or 0. At most
+  // kCheckedTlbMaxPackedAccessorId and never reused. An inline hit must equal
+  // TryFastLoad/TryFastStore succeeding.
   virtual uint32_t inline_tlb_accessor_id() const noexcept { return 0; }
 };
 

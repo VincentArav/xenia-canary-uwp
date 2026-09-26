@@ -193,8 +193,10 @@ XexImportLibraryParseResult ParseXexImportLibraries(
                        offset);
     }
 
+    // Only the low byte names the library, as the console reads it; the high
+    // byte may be garbage.
     const uint16_t name_index =
-        ReadBe16(bytes, offset + kDescriptorNameIndexOffset);
+        ReadBe16(bytes, offset + kDescriptorNameIndexOffset) & 0xFF;
     if (name_index >= names.size()) {
       return MakeError(XexImportLibraryParseError::kInvalidNameIndex,
                        offset + kDescriptorNameIndexOffset);

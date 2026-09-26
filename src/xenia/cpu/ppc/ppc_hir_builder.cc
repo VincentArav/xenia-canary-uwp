@@ -389,9 +389,7 @@ void PPCHIRBuilder::StoreLR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, lr), value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 64;
-  trace_reg.value = value;
+  NoteTraceDest(64, value);
 }
 
 Value* PPCHIRBuilder::LoadCTR() {
@@ -402,9 +400,7 @@ void PPCHIRBuilder::StoreCTR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, ctr), value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 65;
-  trace_reg.value = value;
+  NoteTraceDest(65, value);
 }
 
 Value* PPCHIRBuilder::LoadCR() {
@@ -527,9 +523,7 @@ void PPCHIRBuilder::StoreFPSCR(Value* value) {
   assert_true(value->type == INT32_TYPE);
   StoreContext(offsetof(PPCContext, fpscr), value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 67;
-  trace_reg.value = value;
+  NoteTraceDest(67, value);
 }
 
 void PPCHIRBuilder::UpdateFPSCR(Value* result, bool update_cr1) {
@@ -584,12 +578,14 @@ void PPCHIRBuilder::CopyFPSCRToCR1() {
 }
 
 Value* PPCHIRBuilder::LoadXER() {
-  // SO, OV and CA are XER bits 31, 30 and 29. The string-instruction byte
-  // count is not modelled.
+  // SO, OV and CA are XER bits 31, 30 and 29; bits 0-6 are the string
+  // instructions' byte count.
   Value* v =
-      Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
-                     INT64_TYPE),
-          31);
+      ZeroExtend(LoadContext(offsetof(PPCContext, xer_string_count), INT8_TYPE),
+                 INT64_TYPE);
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
+                           INT64_TYPE),
+                31));
   v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_ov), INT8_TYPE),
                            INT64_TYPE),
                 30));
@@ -598,6 +594,8 @@ Value* PPCHIRBuilder::LoadXER() {
 }
 
 void PPCHIRBuilder::StoreXER(Value* value) {
+  StoreContext(offsetof(PPCContext, xer_string_count),
+               Truncate(And(value, LoadConstantInt64(0x7F)), INT8_TYPE));
   StoreContext(offsetof(PPCContext, xer_so),
                Truncate(And(Shr(value, 31), LoadConstantInt64(1)), INT8_TYPE));
   StoreContext(offsetof(PPCContext, xer_ov),
@@ -621,9 +619,7 @@ void PPCHIRBuilder::StoreCA(Value* value) {
   assert_true(value->type == INT8_TYPE);
   StoreContext(offsetof(PPCContext, xer_ca), value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 66;
-  trace_reg.value = value;
+  NoteTraceDest(66, value);
 }
 
 Value* PPCHIRBuilder::LoadSAT() {
@@ -634,9 +630,7 @@ void PPCHIRBuilder::StoreSAT(Value* value) {
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 44;
-  trace_reg.value = value;
+  NoteTraceDest(44, value);
 }
 
 Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
@@ -647,9 +641,7 @@ void PPCHIRBuilder::StoreGPR(uint32_t reg, Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, r) + reg * 8, value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg;
-  trace_reg.value = value;
+  NoteTraceDest(reg, value);
 }
 
 Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
@@ -660,9 +652,7 @@ void PPCHIRBuilder::StoreFPR(uint32_t reg, Value* value) {
   assert_true(value->type == FLOAT64_TYPE);
   StoreContext(offsetof(PPCContext, f) + reg * 8, value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg + 32;
-  trace_reg.value = value;
+  NoteTraceDest(reg + 32, value);
 }
 
 Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
@@ -673,9 +663,7 @@ void PPCHIRBuilder::StoreVR(uint32_t reg, Value* value) {
   assert_true(value->type == VEC128_TYPE);
   StoreContext(offsetof(PPCContext, v) + reg * 16, value);
 
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 128 + reg;
-  trace_reg.value = value;
+  NoteTraceDest(128 + reg, value);
 }
 
 void PPCHIRBuilder::StoreReserved(Value* val) {

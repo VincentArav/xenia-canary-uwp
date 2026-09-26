@@ -12,41 +12,40 @@
 #include <algorithm>
 #include <iterator>
 
+#include "xenia/base/memory.h"
+
 namespace xe::kernel {
 namespace {
 
+// The callers check the span sizes; the offsets need no alignment.
 uint32_t ReadBigEndian32(std::span<const uint8_t> bytes, size_t offset) {
-  return uint32_t(bytes[offset]) << 24 | uint32_t(bytes[offset + 1]) << 16 |
-         uint32_t(bytes[offset + 2]) << 8 | uint32_t(bytes[offset + 3]);
+  return xe::load_and_swap<uint32_t>(bytes.data() + offset);
 }
 
 uint64_t ReadBigEndian64(std::span<const uint8_t> bytes, size_t offset) {
-  return uint64_t(ReadBigEndian32(bytes, offset)) << 32 |
-         ReadBigEndian32(bytes, offset + 4);
+  return xe::load_and_swap<uint64_t>(bytes.data() + offset);
 }
 
 void WriteBigEndian32(std::span<uint8_t> bytes, size_t offset, uint32_t value) {
-  bytes[offset] = uint8_t(value >> 24);
-  bytes[offset + 1] = uint8_t(value >> 16);
-  bytes[offset + 2] = uint8_t(value >> 8);
-  bytes[offset + 3] = uint8_t(value);
+  xe::store_and_swap<uint32_t>(bytes.data() + offset, value);
 }
 
 void WriteBigEndian64(std::span<uint8_t> bytes, size_t offset, uint64_t value) {
-  WriteBigEndian32(bytes, offset, uint32_t(value >> 32));
-  WriteBigEndian32(bytes, offset + 4, uint32_t(value));
+  xe::store_and_swap<uint64_t>(bytes.data() + offset, value);
 }
 
 uint32_t CaptureXer(const cpu::ppc::PPCContext& context) {
   return uint32_t(context.xer_so & 1) << 31 |
          uint32_t(context.xer_ov & 1) << 30 |
-         uint32_t(context.xer_ca & 1) << 29;
+         uint32_t(context.xer_ca & 1) << 29 |
+         uint32_t(context.xer_string_count & 0x7F);
 }
 
 void ApplyXer(uint32_t xer, cpu::ppc::PPCContext& context) {
   context.xer_so = uint8_t((xer >> 31) & 1);
   context.xer_ov = uint8_t((xer >> 30) & 1);
   context.xer_ca = uint8_t((xer >> 29) & 1);
+  context.xer_string_count = uint8_t(xer & 0x7F);
 }
 
 }  // namespace

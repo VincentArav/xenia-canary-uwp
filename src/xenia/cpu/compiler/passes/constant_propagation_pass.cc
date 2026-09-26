@@ -782,7 +782,7 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
           if (i->src1.value->IsConstant() && i->src2.value->IsConstant() &&
               i->src3.value->IsConstant()) {
             v->set_from(i->src1.value);
-            v->Insert(i->src2.value, i->src3.value, (TypeName)i->flags);
+            v->Insert(i->src2.value, i->src3.value, i->src3.value->type);
             i->UnlinkAndNOP();
             result = true;
           }

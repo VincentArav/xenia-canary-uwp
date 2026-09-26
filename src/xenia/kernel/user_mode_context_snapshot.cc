@@ -139,7 +139,6 @@ UserModeContextWriteResult WriteUserModeIntegerContextSnapshot(
   UserModeContextWriteResult result;
   result.context_virtual_address = context_virtual_address;
 
-  std::array<uint8_t, kUserModeContextMinimumSize> snapshot_bytes{};
   {
     auto global_lock = global_critical_region::AcquireDirect();
     ValidatedContextRange range;
@@ -150,17 +149,15 @@ UserModeContextWriteResult WriteUserModeIntegerContextSnapshot(
       return result;
     }
 
-    std::memcpy(
-        snapshot_bytes.data(),
-        memory.TranslateVirtual<const uint8_t*>(context_virtual_address),
-        snapshot_bytes.size());
-    if (EncodeUserModeIntegerContext(context, snapshot_bytes) !=
+    // Encode in place; bytes outside the encoded fields keep their values.
+    if (EncodeUserModeIntegerContext(
+            context, std::span<uint8_t>(memory.TranslateVirtual<uint8_t*>(
+                                            context_virtual_address),
+                                        kUserModeContextMinimumSize)) !=
         UserModeContextCodecError::kNone) {
       result.diagnostic = UserModeContextSnapshotDiagnostic::kDecodeFailed;
       return result;
     }
-    std::memcpy(memory.TranslateVirtual<uint8_t*>(context_virtual_address),
-                snapshot_bytes.data(), snapshot_bytes.size());
   }
   return result;
 }

@@ -403,14 +403,33 @@ int InstrEmit_mffsx(PPCHIRBuilder& f, const InstrData& i) {
   return 0;
 }
 
+// FPSCR[crbD] <- 0 or 1. Bit 0 is the most significant. FEX and VX (bits 1
+// and 2) are summaries that these instructions cannot alter.
+static int EmitMoveToFpscrBit(PPCHIRBuilder& f, const InstrData& i, bool set) {
+  const uint32_t bit = i.X.RT;
+  if (bit != 1 && bit != 2) {
+    const uint32_t mask = 1u << (31 - bit);
+    Value* fpscr = f.LoadFPSCR();
+    fpscr = set ? f.Or(fpscr, f.LoadConstantUint32(mask))
+                : f.And(fpscr, f.LoadConstantUint32(~mask));
+    f.StoreFPSCR(fpscr);
+    // Update the system rounding mode (RN and NI).
+    if (mask & 0x7) {
+      f.SetRoundingMode(f.And(fpscr, f.LoadConstantUint32(7)));
+    }
+  }
+  if (i.X.Rc) {
+    f.CopyFPSCRToCR1();
+  }
+  return 0;
+}
+
 int InstrEmit_mtfsb0x(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMoveToFpscrBit(f, i, false);
 }
 
 int InstrEmit_mtfsb1x(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return EmitMoveToFpscrBit(f, i, true);
 }
 
 int InstrEmit_mtfsfx(PPCHIRBuilder& f, const InstrData& i) {

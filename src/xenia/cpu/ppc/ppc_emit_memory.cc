@@ -724,24 +724,79 @@ int InstrEmit_lmw(PPCHIRBuilder& f, const InstrData& i) {
 
 // Integer load and store string (A-17)
 
+// Bytes fill (or come from) the low words of consecutive registers from RT,
+// most significant byte first, wrapping from r31 to r0; the rest of a partly
+// filled last register is zero. The upper words are zero.
+namespace {
+
+void EmitLoadStringByte(PPCHIRBuilder& f, Value* ea, uint32_t k, uint32_t rt) {
+  const uint32_t reg = (rt + k / 4) % 32;
+  Value* byte =
+      f.Shl(f.ZeroExtend(f.Load(f.Add(ea, f.LoadConstantUint64(k)), INT8_TYPE),
+                         INT64_TYPE),
+            int8_t(24 - 8 * (k % 4)));
+  f.StoreGPR(reg, k % 4 ? f.Or(f.LoadGPR(reg), byte) : byte);
+}
+
+void EmitStoreStringByte(PPCHIRBuilder& f, Value* ea, uint32_t k, uint32_t rs) {
+  const uint32_t reg = (rs + k / 4) % 32;
+  f.Store(
+      f.Add(ea, f.LoadConstantUint64(k)),
+      f.Truncate(f.Shr(f.LoadGPR(reg), int8_t(24 - 8 * (k % 4))), INT8_TYPE));
+}
+
+// The byte count of lswx and stswx is XER[57:63]. Each byte is its own
+// access, so a fault reports the byte that faulted. The EA is recomputed per
+// byte: RA or RB among the loaded registers is an invalid form.
+template <typename EmitByte>
+void EmitIndexedString(PPCHIRBuilder& f, const InstrData& i, EmitByte emit) {
+  Label* done = f.NewLabel();
+  for (uint32_t k = 0; k < 127; ++k) {
+    Value* count = f.ZeroExtend(
+        f.LoadContext(offsetof(PPCContext, xer_string_count), INT8_TYPE),
+        INT64_TYPE);
+    f.BranchFalse(f.CompareUGT(count, f.LoadConstantUint64(k)), done);
+    emit(CalculateEA_0(f, i.X.RA, i.X.RB), k);
+  }
+  f.MarkLabel(done);
+}
+
+}  // namespace
+
 int InstrEmit_lswi(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // EA <- (RA|0); NB bytes (0 means 32) into RT, RT+1, ...
+  Value* ea = i.X.RA ? f.LoadGPR(i.X.RA) : f.LoadZeroInt64();
+  const uint32_t count = i.X.RB ? i.X.RB : 32;
+  for (uint32_t k = 0; k < count; ++k) {
+    EmitLoadStringByte(f, ea, k, i.X.RT);
+  }
+  return 0;
 }
 
 int InstrEmit_lswx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // EA <- (RA|0) + (RB); XER[57:63] bytes into RT, RT+1, ...
+  EmitIndexedString(f, i, [&](Value* ea, uint32_t k) {
+    EmitLoadStringByte(f, ea, k, i.X.RT);
+  });
+  return 0;
 }
 
 int InstrEmit_stswi(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // EA <- (RA|0); NB bytes (0 means 32) from RS, RS+1, ...
+  Value* ea = i.X.RA ? f.LoadGPR(i.X.RA) : f.LoadZeroInt64();
+  const uint32_t count = i.X.RB ? i.X.RB : 32;
+  for (uint32_t k = 0; k < count; ++k) {
+    EmitStoreStringByte(f, ea, k, i.X.RT);
+  }
+  return 0;
 }
 
 int InstrEmit_stswx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // EA <- (RA|0) + (RB); XER[57:63] bytes from RS, RS+1, ...
+  EmitIndexedString(f, i, [&](Value* ea, uint32_t k) {
+    EmitStoreStringByte(f, ea, k, i.X.RT);
+  });
+  return 0;
 }
 
 // Memory synchronization (A-18)
@@ -757,7 +812,7 @@ int InstrEmit_sync(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_isync(PPCHIRBuilder& f, const InstrData& i) {
-  // XEINSTRNOTIMPLEMENTED();
+  // Translated code sees no stale instructions to discard.
   f.Nop();
   return 0;
 }
@@ -1181,7 +1236,7 @@ int InstrEmit_dcbz(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_icbi(PPCHIRBuilder& f, const InstrData& i) {
-  // XEINSTRNOTIMPLEMENTED();
+  // Code invalidation follows the guest's explicit sweeps and TB flushes.
   f.Nop();
   return 0;
 }

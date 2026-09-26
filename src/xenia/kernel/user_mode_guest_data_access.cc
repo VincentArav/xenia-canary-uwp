@@ -471,9 +471,18 @@ cpu::CheckedTlb& AcquireTlb(cpu::CheckedTlb* tlb, const Memory& memory,
       fallback_tlb->epoch = 0;
       fallback_tlb->clear_epoch = 0;
       fallback_tlb->owner = nullptr;
+      fallback_tlb->stale = 0;
       fallback_tlb->ClearEntries();
     }
     tlb = fallback_tlb.get();
+  }
+  // Clear the flag before reading the epoch, so an advance racing with this
+  // sync is still seen.
+  std::atomic_ref<uint32_t> stale(tlb->stale);
+  if (stale.load(std::memory_order_relaxed) || tlb->epoch != epoch) {
+    stale.store(0, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    epoch = std::max(epoch, Memory::translation_epoch());
   }
   if (tlb->epoch != epoch) {
     const uint64_t clear_epoch = Memory::translation_clear_epoch();
@@ -502,7 +511,7 @@ const cpu::CheckedTlbEntry* LookupCachedTranslation(
   const cpu::CheckedTlbEntry& entry =
       entries[cpu::CheckedTlb::IndexFor(effective_address)];
   if ((entry.tag & ~cpu::kCheckedTlbInlineBit) !=
-          cpu::CheckedTlb::TagFor(effective_address) ||
+          cpu::CheckedTlb::TagFor(effective_address, accessor_id) ||
       entry.accessor_id != accessor_id) {
     return nullptr;
   }
@@ -529,7 +538,7 @@ void InsertCachedTranslation(cpu::CheckedTlbEntry* entries,
   }
   sources[cpu::CheckedTlb::IndexFor(effective_address)] = source;
   entries[cpu::CheckedTlb::IndexFor(effective_address)] = {
-      cpu::CheckedTlb::TagFor(effective_address) |
+      cpu::CheckedTlb::TagFor(effective_address, accessor_id) |
           (inline_usable ? cpu::kCheckedTlbInlineBit : 0),
       accessor_id,
       reinterpret_cast<uint64_t>(host_page) -
@@ -1836,7 +1845,10 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
   // Big-endian storage is the canonical order, so a cached translation is
   // usable by generated code as it is.
   uint32_t inline_tlb_accessor_id() const noexcept override {
-    return accessor_.little_endian() ? 0 : accessor_.tlb_accessor_id();
+    const uint32_t id = accessor_.tlb_accessor_id();
+    return accessor_.little_endian() || id > cpu::kCheckedTlbMaxPackedAccessorId
+               ? 0
+               : id;
   }
 
   cpu::GuestMemoryAccessResult Access(

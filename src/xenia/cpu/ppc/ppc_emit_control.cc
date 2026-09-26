@@ -486,6 +486,20 @@ int InstrEmit_mcrxr(PPCHIRBuilder& f, const InstrData& i) {
 
 // System linkage (A-24)
 
+// An instruction form the processor rejects: a program exception in a checked
+// domain, as the console raises; skipped in DefaultDirect code, as invalid
+// instructions are.
+static int EmitIllegalInstructionForm(PPCHIRBuilder& f, const InstrData& i,
+                                      const char* what) {
+  if (f.is_checked_user_mode()) {
+    f.RaiseProgramException(i.address,
+                            GuestProgramExceptionKind::kIllegalInstruction);
+  } else {
+    XELOGE("{:08X} {:08X}: {} skipped", i.address, i.code, what);
+  }
+  return 0;
+}
+
 int InstrEmit_sc(PPCHIRBuilder& f, const InstrData& i) {
   // Game code should only ever use LEV=0.
   // LEV=2 is to signify 'call import' from Xenia.
@@ -508,8 +522,8 @@ int InstrEmit_sc(PPCHIRBuilder& f, const InstrData& i) {
     f.CallExtern(f.function());
     return 0;
   }
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // LEV=1 is a hypervisor call, which titles cannot make.
+  return EmitIllegalInstructionForm(f, i, "sc with an unsupported LEV");
 }
 
 // Trap (A-25)
@@ -765,8 +779,8 @@ int InstrEmit_mfspr(PPCHIRBuilder& f, const InstrData& i) {
       v = f.LoadConstantUint64(cvars::pvr);
       break;
     default:
-      XEINSTRNOTIMPLEMENTED();
-      return 1;
+      // Other SPRs are privileged or absent.
+      return EmitIllegalInstructionForm(f, i, "mfspr of an unsupported SPR");
   }
   f.StoreGPR(i.XFX.RT, v);
   return 0;
@@ -853,8 +867,8 @@ int InstrEmit_mtspr(PPCHIRBuilder& f, const InstrData& i) {
       // VRSAVE
       break;
     default:
-      XEINSTRNOTIMPLEMENTED();
-      return 1;
+      // Other SPRs are privileged, read-only or absent.
+      return EmitIllegalInstructionForm(f, i, "mtspr of an unsupported SPR");
   }
 
   return 0;

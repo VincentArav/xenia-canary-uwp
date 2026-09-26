@@ -211,6 +211,7 @@ struct UserModeOuterIntegerState {
   uint8_t xer_ca = 0;
   uint8_t xer_ov = 0;
   uint8_t xer_so = 0;
+  uint8_t xer_string_count = 0;
 };
 
 struct UserModeEnterRequest {

@@ -16,8 +16,13 @@
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait_strategy.hpp"
 #include "xenia/base/assert.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/threading_timer_queue.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#endif
 
 namespace dp = disruptorplus;
 
@@ -42,7 +47,85 @@ using WaitItem = TimerQueueWaitItem;
     edit2: (30.12.2024) After uplifting version of MSVC compiler Xenia cannot be
    correctly initialized if you're using proton.
 */
-using WaitStrat = dp::spin_wait_strategy;
+/*
+    The spin_wait_strategy restarted a PAUSE loop of about 4,000 iterations on
+   every publish and every expiry and only then checked its deadline: with a
+   title re-arming a 1 ms timer that kept most of a core busy. This strategy
+   checks the deadline on every round, spins only within kSpinWindow of it,
+   and otherwise sleeps in chunks of at most kSleepChunk, so publishers never
+   have to wake it and a new earlier item is seen within one chunk.
+*/
+class ChunkedSleepWaitStrategy {
+ public:
+  static constexpr auto kSpinWindow = std::chrono::microseconds(20);
+  static constexpr auto kSleepChunk = std::chrono::microseconds(200);
+
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[]) {
+    return wait_until_published(sequence, count, sequences,
+                                std::chrono::steady_clock::time_point::max());
+  }
+
+  template <typename Rep, typename Period>
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[],
+      const std::chrono::duration<Rep, Period>& timeout) {
+    return wait_until_published(sequence, count, sequences,
+                                std::chrono::steady_clock::now() + timeout);
+  }
+
+  template <typename Clock, typename Duration>
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[],
+      const std::chrono::time_point<Clock, Duration>& timeout_time) {
+    assert(count > 0);
+    dp::sequence_t result =
+        dp::minimum_sequence_after(sequence, count, sequences);
+    while (dp::difference(result, sequence) < 0) {
+      const auto now = Clock::now();
+      if (timeout_time <= now) {
+        return result;
+      }
+      const auto remaining = timeout_time - now;
+      if (remaining <= kSpinWindow) {
+        MaybeYield();
+      } else {
+        SleepChunk(std::min<std::chrono::nanoseconds>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining -
+                                                                 kSpinWindow),
+            kSleepChunk));
+      }
+      result = dp::minimum_sequence_after(sequence, count, sequences);
+    }
+    return result;
+  }
+
+  void signal_all_when_blocking() {}
+
+ private:
+  static void SleepChunk(std::chrono::nanoseconds duration) {
+#if XE_PLATFORM_WIN32
+    // Sleep() rounds up to the system tick; a high-resolution timer does not.
+    thread_local HANDLE timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    if (timer) {
+      LARGE_INTEGER due;
+      due.QuadPart = -std::max<int64_t>(1, duration.count() / 100);
+      if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+      }
+    }
+#endif
+    std::this_thread::sleep_for(duration);
+  }
+};
+
+using WaitStrat = ChunkedSleepWaitStrategy;
 
 class TimerQueue {
  public:

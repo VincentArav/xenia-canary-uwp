@@ -64,6 +64,7 @@
 #include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/virtual_file_system.h"
+#include "xenia/xefu/xbe_metadata.h"
 #include "xenia/xefu/xefu_launch.h"
 #include "xenia/xefu/xefu_launch_coordinator.h"
 #include "xenia/xefu/xefu_selection.h"
@@ -92,14 +93,35 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DEFINE_string(
-    xefu_build, "retail7b",
-    "Exact XeFu build used when launching an original-Xbox XBE. Examples: "
+    xefu_build, "auto",
+    "XeFu build used when launching an original-Xbox XBE. \"auto\" picks the "
+    "one each game should use from xefu_pack; or an exact build such as "
     "retail7b, hacked7b, hacked-config-loader7, hacked-hud2021c.",
     "XeFu");
+DEFINE_string(
+    xefu_pack, "hacked",
+    "Pack xefu_build=auto chooses from: hacked, retail or hacked-hud. "
+    "Only hacked and hacked-hud carry the Xbox One / Series builds "
+    "and accept modified games.",
+    "XeFu");
+DEFINE_path(xefu_hacked_root, "",
+            "Compatibility folder of the hacked XeFu pack. If empty, "
+            "xefu_compatibility_root is used.",
+            "XeFu");
+DEFINE_path(
+    xefu_retail_root, "",
+    "Compatibility folder of the unmodified retail XeFu pack. If empty, "
+    "xefu_compatibility_root is used.",
+    "XeFu");
+DEFINE_path(xefu_hacked_hud_root, "",
+            "Compatibility folder of the hacked-with-HUD XeFu pack. If empty, "
+            "xefu_compatibility_root is used.",
+            "XeFu");
 DEFINE_path(
     xefu_compatibility_root, "",
     "Directory containing the exact hash-pinned XeFu runtime, selector and "
-    "companion assets. If empty, <storage_root>/Compatibility is used.",
+    "companion assets, for any pack without its own folder setting. If empty, "
+    "<storage_root>/Compatibility is used.",
     "XeFu");
 DEFINE_path(xefu_config, "",
             "Optional exact Compatibility/Configs/{TITLEID}.bin file for a "
@@ -639,18 +661,6 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
 
   switch (GetFileSignature(path)) {
     case FileSignatureType::XBE: {
-      const std::optional<xefu::XefuBuildId> build =
-          xefu::XefuBuildForCommandLineName(cvars::xefu_build);
-      if (!build) {
-        XELOGE("Unknown --xefu_build '{}'.", cvars::xefu_build);
-        return X_STATUS_INVALID_PARAMETER;
-      }
-      const xefu::XefuBuildDescriptor* descriptor =
-          xefu::FindKnownXefuBuild(*build);
-      if (!descriptor) {
-        return X_STATUS_INVALID_PARAMETER;
-      }
-
       std::error_code path_error;
       const std::filesystem::path absolute_xbe =
           std::filesystem::absolute(path, path_error);
@@ -659,12 +669,85 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
                path_error.message());
         return X_STATUS_INVALID_PARAMETER;
       }
-      std::filesystem::path compatibility_root =
-          cvars::xefu_compatibility_root.empty()
-              ? storage_root_ / "Compatibility"
-              : cvars::xefu_compatibility_root;
-      compatibility_root =
-          std::filesystem::absolute(compatibility_root, path_error);
+      // Each pack has its own folder: they hold different files of the same
+      // names.
+      const auto root_for_pack =
+          [this](xefu::XefuAssetProvenance pack) -> std::filesystem::path {
+        const std::filesystem::path* pack_root = nullptr;
+        switch (pack) {
+          case xefu::XefuAssetProvenance::kRetail:
+            pack_root = &cvars::xefu_retail_root;
+            break;
+          case xefu::XefuAssetProvenance::kModified:
+            pack_root = &cvars::xefu_hacked_root;
+            break;
+          case xefu::XefuAssetProvenance::kModifiedWithHud:
+            pack_root = &cvars::xefu_hacked_hud_root;
+            break;
+        }
+        if (pack_root && !pack_root->empty()) {
+          return *pack_root;
+        }
+        return cvars::xefu_compatibility_root.empty()
+                   ? storage_root_ / "Compatibility"
+                   : cvars::xefu_compatibility_root;
+      };
+
+      std::optional<xefu::XefuBuildId> build;
+      std::filesystem::path automatic_config;
+      if (xe::utf8::equal_case(cvars::xefu_build, "auto")) {
+        std::optional<xefu::XefuAssetProvenance> pack;
+        if (xe::utf8::equal_case(cvars::xefu_pack, "hacked")) {
+          pack = xefu::XefuAssetProvenance::kModified;
+        } else if (xe::utf8::equal_case(cvars::xefu_pack, "retail")) {
+          pack = xefu::XefuAssetProvenance::kRetail;
+        } else if (xe::utf8::equal_case(cvars::xefu_pack, "hacked-hud")) {
+          pack = xefu::XefuAssetProvenance::kModifiedWithHud;
+        }
+        if (!pack) {
+          XELOGE("Unknown --xefu_pack '{}' (use hacked, retail or hacked-hud).",
+                 cvars::xefu_pack);
+          return X_STATUS_INVALID_PARAMETER;
+        }
+        const xefu::XbeMetadataResult xbe = xefu::ReadXbeMetadata(absolute_xbe);
+        if (!xbe) {
+          XELOGE("Unable to read the XBE's title ID: {}",
+                 xefu::XbeMetadataErrorToString(xbe.error));
+          return X_STATUS_INVALID_PARAMETER;
+        }
+        const uint32_t title_id = xbe.metadata.title_id;
+        const std::filesystem::path config_candidate =
+            std::filesystem::absolute(root_for_pack(*pack) / "Configs" /
+                                          fmt::format("{:08X}.bin", title_id),
+                                      path_error);
+        const bool config_available =
+            !path_error &&
+            std::filesystem::is_regular_file(config_candidate, path_error);
+        const xefu::XefuAutomaticSelection selection =
+            xefu::SelectAutomaticXefuBuild(title_id, *pack, config_available);
+        build = selection.build;
+        if (selection.reason == xefu::XefuAutomaticReason::kCommunityConfig) {
+          automatic_config = config_candidate;
+        }
+        XELOGI("XeFu: title {:08X} ({}) uses {}: {}.", title_id,
+               xe::to_utf8(xbe.metadata.title_name),
+               xefu::XefuBuildCommandLineName(selection.build),
+               xefu::XefuAutomaticReasonToString(selection.reason));
+      } else {
+        build = xefu::XefuBuildForCommandLineName(cvars::xefu_build);
+        if (!build) {
+          XELOGE("Unknown --xefu_build '{}'.", cvars::xefu_build);
+          return X_STATUS_INVALID_PARAMETER;
+        }
+      }
+      const xefu::XefuBuildDescriptor* descriptor =
+          xefu::FindKnownXefuBuild(*build);
+      if (!descriptor) {
+        return X_STATUS_INVALID_PARAMETER;
+      }
+
+      std::filesystem::path compatibility_root = std::filesystem::absolute(
+          root_for_pack(xefu::XefuPackForBuild(*build)), path_error);
       if (path_error) {
         XELOGE("Unable to resolve XeFu compatibility root: {}",
                path_error.message());
@@ -679,7 +762,11 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
       request.writable_root = storage_root_ / "xefu";
       request.build = *build;
       request.live_enabled = cvars::xefu_live_enabled ? 1u : 0u;
-      if (!cvars::xefu_config.empty()) {
+      if (!automatic_config.empty()) {
+        request.external_config =
+            xefu::XefuConfigRequest{std::move(automatic_config),
+                                    *descriptor->required_external_config_pack};
+      } else if (!cvars::xefu_config.empty()) {
         if (!descriptor->required_external_config_pack) {
           XELOGE("XeFu build '{}' does not accept an external config.",
                  cvars::xefu_build);

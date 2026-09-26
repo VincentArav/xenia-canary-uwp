@@ -13,6 +13,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -194,7 +195,21 @@ class Processor {
     return checked_execution_epoch_.load(std::memory_order_acquire);
   }
   void AdvanceCheckedExecutionEpoch() {
-    checked_execution_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    checked_execution_epoch_.fetch_add(1, std::memory_order_seq_cst);
+    std::lock_guard<std::mutex> lock(checked_resolution_stale_flags_mutex_);
+    for (uint32_t* flag : checked_resolution_stale_flags_) {
+      std::atomic_ref<uint32_t>(*flag).store(1, std::memory_order_seq_cst);
+    }
+  }
+  // Per-thread resolution tables' stale flags, set by every advance after it
+  // is published (see Memory::RegisterTranslationStaleFlag).
+  void RegisterCheckedResolutionStaleFlag(uint32_t* flag) {
+    std::lock_guard<std::mutex> lock(checked_resolution_stale_flags_mutex_);
+    checked_resolution_stale_flags_.push_back(flag);
+  }
+  void UnregisterCheckedResolutionStaleFlag(uint32_t* flag) {
+    std::lock_guard<std::mutex> lock(checked_resolution_stale_flags_mutex_);
+    std::erase(checked_resolution_stale_flags_, flag);
   }
 
   // DefaultDirect always; a checked domain while it is registered and the
@@ -496,6 +511,8 @@ class Processor {
   std::unordered_map<TranslationDomainKey, uint64_t>
       checked_guest_code_generations_;
   std::atomic<uint64_t> checked_execution_epoch_{1};
+  std::mutex checked_resolution_stale_flags_mutex_;
+  std::vector<uint32_t*> checked_resolution_stale_flags_;
   // Per checked domain, the physical 4 KiB page each effective page holding
   // translated code fetched from, so a TB flush probes pages rather than
   // every translation. kUnknownInstructionSource marks a page whose source is
