@@ -279,6 +279,7 @@ UserModeAddressTranslationResult ResolveUserModeLiveAddressForSegment(
                         &result.root_entry_physical_address)) {
         return result;
       }
+      result.root_entry = root;
       if (!root) {
         result.diagnostic =
             UserModeAddressTranslationDiagnostic::kRootNotPresent;
@@ -312,6 +313,7 @@ UserModeAddressTranslationResult ResolveUserModeLiveAddressForSegment(
                         &result.root_entry_physical_address)) {
         return result;
       }
+      result.root_entry = root;
       if (!root) {
         result.diagnostic =
             UserModeAddressTranslationDiagnostic::kRootNotPresent;

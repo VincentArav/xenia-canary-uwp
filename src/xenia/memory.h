@@ -451,6 +451,8 @@ class Memory {
 
   // Gets the defined MMIO range for the given virtual address, if any.
   cpu::MMIORange* LookupVirtualMappedRange(uint32_t virtual_address);
+  // Whether any address in [begin, end] (inclusive) is in a mapped range.
+  bool OverlapsVirtualMappedRange(uint32_t begin, uint32_t end) const;
 
   // Physical memory access callbacks, two types of them.
   //
@@ -548,11 +550,30 @@ class Memory {
   // Frees memory allocated with SystemHeapAlloc.
   void SystemHeapFree(uint32_t address, uint32_t* out_region_size = nullptr);
 
-  // Changes whenever a physical page may lose access (decommit, release or a
-  // protection change), so cached translations to physical pages can tell
-  // they are stale.
-  uint64_t physical_access_generation() const {
-    return physical_access_generation_.load(std::memory_order_acquire);
+  // The epoch of cached guest translations (cpu/checked_tlb.h). It advances
+  // after any change that can make one stale: a physical page losing access
+  // or changing protection, a guest TB flush, a mapping retiring. It is
+  // process-wide, so its values never repeat across Memory instances, and
+  // starts at 1, so a zeroed table never matches.
+  static uint64_t translation_epoch() {
+    return translation_epoch_.load(std::memory_order_acquire);
+  }
+  static const std::atomic<uint64_t>* translation_epoch_address() {
+    return &translation_epoch_;
+  }
+  // Advances only for changes that page-table words cannot show.
+  static uint64_t translation_clear_epoch() {
+    return translation_clear_epoch_.load(std::memory_order_acquire);
+  }
+  // Cached translations must be dropped.
+  static void AdvanceTranslationEpoch() {
+    translation_clear_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    translation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  // A guest TB flush: cached translations must be checked against the page
+  // tables again.
+  static void AdvanceTranslationEpochForTbFlush() {
+    translation_epoch_.fetch_add(1, std::memory_order_acq_rel);
   }
 
   // Gets the heap for the address space containing the given address.
@@ -639,7 +660,9 @@ class Memory {
 
   friend class PhysicalHeap;
   xe::global_critical_region global_critical_region_;
-  std::atomic<uint64_t> physical_access_generation_{0};
+  inline static std::atomic<uint64_t> translation_epoch_{1};
+  inline static std::atomic<uint64_t> translation_clear_epoch_{1};
+  static_assert(std::atomic<uint64_t>::is_always_lock_free);
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
 };

@@ -89,7 +89,9 @@ class UserModePhysicalReadTransaction final {
 
   // Copies the complete range only after every touched 4 KiB physical page is
   // confirmed reserved, committed and readable. Empty, overflowing and
-  // non-29-bit ranges fail without modifying destination.
+  // non-29-bit ranges fail without modifying destination. A page this thread
+  // confirmed since the last change to physical heap state is not queried
+  // again, and a read of such pages alone takes no lock.
   UserModePhysicalReadResult TryRead(uint32_t physical_address,
                                      std::span<uint8_t> destination) const;
 
@@ -120,8 +122,13 @@ class UserModePhysicalReadTransaction final {
   void CopyWritePrevalidated(uint32_t physical_address,
                              std::span<const uint8_t> source) const;
 
+  // Takes the global lock for the rest of the transaction.
+  void EnsureLocked() const;
+
   Memory& memory_;
-  xe::global_unique_lock_type global_lock_;
+  // Taken on first use: reads of pages this thread already validated need no
+  // lock (see TryRead). Every other operation holds it.
+  mutable xe::global_unique_lock_type global_lock_;
   bool physical_heap_is_valid_ = false;
 };
 

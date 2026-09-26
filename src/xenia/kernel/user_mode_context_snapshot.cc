@@ -66,11 +66,9 @@ UserModeContextSnapshotDiagnostic ValidateContextRangeLocked(
     return UserModeContextSnapshotDiagnostic::kUnsupportedMapping;
   }
 
-  for (uint64_t address = context_virtual_address; address <= context_end_64;
-       ++address) {
-    if (memory.LookupVirtualMappedRange(static_cast<uint32_t>(address))) {
-      return UserModeContextSnapshotDiagnostic::kUnsupportedMapping;
-    }
+  if (memory.OverlapsVirtualMappedRange(
+          context_virtual_address, static_cast<uint32_t>(context_end_64))) {
+    return UserModeContextSnapshotDiagnostic::kUnsupportedMapping;
   }
 
   const uint64_t page_size = start_heap->page_size();

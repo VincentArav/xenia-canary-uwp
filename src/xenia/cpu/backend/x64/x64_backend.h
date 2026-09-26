@@ -15,6 +15,7 @@
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
 #include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/checked_tlb.h"
 
 #if XE_PLATFORM_WIN32 == 1
 // we use KUSER_SHARED's systemtime field, which is at a fixed address and
@@ -86,11 +87,42 @@ enum : uint32_t {
   // Set while checked_reserve_identity holds a checked reservation.
   kX64BackendHasCheckedReserveBit = 4,
 };
+// A thread's resolved checked-domain branch targets. Generated code probes it
+// before calling ResolveFunction, which fills it. Valid while the processor's
+// checked execution epoch equals epoch.
+struct CheckedResolutionEntry {
+  uint32_t guest_address;
+  // The translation domain's id; domains whose id needs more bits are not
+  // cached.
+  uint32_t domain_id;
+  uint64_t machine_code;
+};
+static_assert(sizeof(CheckedResolutionEntry) == 16);
+constexpr uint32_t kCheckedResolutionShift = 15;
+constexpr uint32_t kCheckedResolutionCount = 1u << kCheckedResolutionShift;
+struct alignas(64) CheckedResolutionTable {
+  uint64_t epoch;
+  const void* processor;
+  uint8_t padding[48];
+  CheckedResolutionEntry entries[kCheckedResolutionCount];
+
+  // The instruction index folded with the bits above it.
+  static constexpr uint32_t IndexFor(uint32_t guest_address) {
+    return ((guest_address >> 2) +
+            (guest_address >> (2 + kCheckedResolutionShift))) &
+           (kCheckedResolutionCount - 1);
+  }
+};
+
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
 // context (somehow placing a global X64BackendCtx prior to membase, so we can
 // negatively index the membase reg)
 struct X64BackendContext {
+  // Probed by generated code. Placed first so the fields below stay within
+  // short displacements of the context.
+  CheckedResolutionTable checked_resolutions;
+  CheckedTlb checked_tlb;
   union {
     __m128 helper_scratch_xmms[4];
     uint64_t helper_scratch_u64s[8];
@@ -121,6 +153,8 @@ struct X64BackendContext {
   // owns its meaning; it is valid only while the checked reserve flag is set.
   uint32_t checked_reserve_identity[4];
 };
+// The context allocation reserves 832 KiB before every context.
+static_assert(sizeof(X64BackendContext) <= 0xD0000);
 constexpr unsigned int DEFAULT_VMX_MXCSR =
     0x8000 |                   // flush to zero
     0x0040 | (_MM_MASK_MASK);  // default rounding mode for vmx

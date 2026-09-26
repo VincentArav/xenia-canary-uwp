@@ -453,6 +453,13 @@ class XThread : public XObject, public cpu::Thread {
       std::shared_ptr<const cpu::TranslationDomainTransitionPermit>
           transition_permit);
   [[noreturn]] virtual void ReenterPrepared(uint32_t address);
+  // ReenterPrepared for a caller whose frames, from it down to the guest code
+  // that raised the transition, own nothing: no lock, no object with a
+  // non-trivial destructor, no cleanup. On Windows it then restores the
+  // registers setjmp saved without unwinding (nothing needs to run), unless
+  // guest code is dispatched nested (a DPC, APC or callback) or the process
+  // enforces CFG or shadow stacks; those take ReenterPrepared.
+  [[noreturn]] void ReenterPreparedFromPlainFrames(uint32_t address);
 
   void EnterCriticalRegion();
   void LeaveCriticalRegion();
@@ -462,7 +469,7 @@ class XThread : public XObject, public cpu::Thread {
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
-  void SetPriority(int32_t increment);
+  void SetPriority(int32_t priority);
 
   // Called periodically (~20ms) by KernelState's timestamp timer to simulate
   // the Xenon scheduler's quantum-based priority decay for non-real-time
@@ -581,6 +588,13 @@ class XThread : public XObject, public cpu::Thread {
 #if XE_PLATFORM_WIN32
   std::jmp_buf reentry_jmp_buf_;
   uint32_t reentry_address_ = 0;
+  // The jmp_buf Frame setjmp recorded: an unwinding longjmp needs it, a
+  // non-unwinding one clears it.
+  uint64_t reentry_setjmp_frame_ = 0;
+  bool reentry_anchor_armed_ = false;
+  uint32_t reentry_anchor_dispatch_depth_ = 0;
+  uint64_t fast_reentry_count_ = 0;
+  uint64_t unwinding_reentry_count_ = 0;
 #endif
 
   std::mutex thread_lock_;

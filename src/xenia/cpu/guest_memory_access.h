@@ -17,6 +17,10 @@
 #include "xenia/cpu/translation_domain.h"
 
 namespace xe::cpu {
+struct CheckedTlb;
+}  // namespace xe::cpu
+
+namespace xe::cpu {
 
 class TranslationDomainDescriptor;
 
@@ -117,6 +121,10 @@ struct GuestMemoryAccessRequest {
   std::array<uint8_t, 16> compare_bytes{};
   GuestMemoryReservationIdentity reservation_identity;
   bool reservation_identity_valid = false;
+
+  // The checked TLB of the context the access runs on, if any. The accessor
+  // caches the translations it walks there.
+  CheckedTlb* checked_tlb = nullptr;
 };
 
 enum class GuestMemoryAccessDiagnostic : uint8_t {
@@ -193,17 +201,25 @@ class GuestMemoryAccessor {
       const GuestMemoryAccessRequest& request) const noexcept = 0;
 
   // A plain load or store of byte_count canonical bytes that can complete
-  // without the full request (a cached translation). False leaves the access,
-  // and any fault, to Access().
+  // without the full request (a translation cached in checked_tlb). False
+  // leaves the access, and any fault, to Access().
   virtual bool TryFastLoad(uint32_t effective_address,
-                           std::span<uint8_t> canonical_bytes) const noexcept {
+                           std::span<uint8_t> canonical_bytes,
+                           CheckedTlb* checked_tlb) const noexcept {
     return false;
   }
-  virtual bool TryFastStore(
-      uint32_t effective_address,
-      std::span<const uint8_t> canonical_bytes) const noexcept {
+  virtual bool TryFastStore(uint32_t effective_address,
+                            std::span<const uint8_t> canonical_bytes,
+                            CheckedTlb* checked_tlb) const noexcept {
     return false;
   }
+
+  // Non-zero when generated code may probe a checked TLB for this accessor's
+  // translations and access host_delta + ea itself on a hit: the id its
+  // entries carry (cpu/checked_tlb.h). The accessor's storage order must be
+  // the canonical big-endian order, an inline hit must be equivalent to
+  // TryFastLoad/TryFastStore succeeding, and the id is never reused.
+  virtual uint32_t inline_tlb_accessor_id() const noexcept { return 0; }
 };
 
 GuestMemoryAccessDiagnostic ValidateGuestMemoryAccessRequest(

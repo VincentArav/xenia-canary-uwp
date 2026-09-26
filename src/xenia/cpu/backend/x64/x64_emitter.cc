@@ -44,6 +44,10 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/translation_domain_registry.h"
 
+DEFINE_bool(x64_inline_checked_resolution, true,
+            "Checked-domain branches probe the thread's resolved targets "
+            "inline and call the resolver only on a miss.",
+            "x64");
 DEFINE_bool(debugprint_trap_log, false,
             "Log debugprint traps to the active debugger", "CPU");
 DEFINE_bool(ignore_undefined_externs, true,
@@ -497,33 +501,22 @@ void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
 
 namespace {
 
-// Checked domains branch through the resolver every time. This thread's
-// resolutions stay valid while the processor's checked execution epoch holds:
-// it advances when a translation retires or authorization changes.
-struct CheckedResolution {
-  TranslationDomainKey::Id domain_id = TranslationDomainKey::kDefaultDirectId;
-  uint32_t guest_address = 0;
-  uint64_t machine_code = 0;
-};
-
-struct CheckedResolutionCache {
-  const xe::cpu::Processor* processor = nullptr;
-  uint64_t epoch = 0;
-  std::array<CheckedResolution, 4096> entries{};
-};
-
-thread_local CheckedResolutionCache checked_resolution_cache;
-
-CheckedResolution& CheckedResolutionFor(const xe::cpu::Processor* processor,
-                                        uint64_t epoch,
-                                        uint32_t guest_address) {
-  CheckedResolutionCache& cache = checked_resolution_cache;
-  if (cache.processor != processor || cache.epoch != epoch) {
-    cache.entries.fill({});
-    cache.processor = processor;
-    cache.epoch = epoch;
+// This thread's resolution slot for a checked branch target. Resolutions stay
+// valid while the processor's checked execution epoch holds; it advances when
+// a translation retires or authorization changes.
+CheckedResolutionEntry& CheckedResolutionFor(
+    void* guest_context, const xe::cpu::Processor* processor, uint64_t epoch,
+    uint32_t guest_address) {
+  CheckedResolutionTable& table =
+      reinterpret_cast<X64BackendContext*>(
+          reinterpret_cast<uint8_t*>(guest_context) - sizeof(X64BackendContext))
+          ->checked_resolutions;
+  if (table.processor != processor || table.epoch != epoch) {
+    std::memset(table.entries, 0, sizeof(table.entries));
+    table.processor = processor;
+    table.epoch = epoch;
   }
-  return cache.entries[(guest_address >> 2) % cache.entries.size()];
+  return table.entries[CheckedResolutionTable::IndexFor(guest_address)];
 }
 
 }  // namespace
@@ -544,10 +537,11 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       !thread_state->guest_interrupt_pending()) {
     const uint32_t guest_address =
         static_cast<uint32_t>(target_address) & ~uint32_t(3);
-    const CheckedResolution& cached =
-        CheckedResolutionFor(processor, checked_epoch, guest_address);
+    const CheckedResolutionEntry& cached = CheckedResolutionFor(
+        raw_context, processor, checked_epoch, guest_address);
     if (cached.domain_id == translation_domain_key.id() &&
-        cached.guest_address == guest_address && cached.machine_code) {
+        cached.guest_address == guest_address && cached.machine_code &&
+        translation_domain_key.id() <= UINT32_MAX) {
       return cached.machine_code;
     }
   }
@@ -805,14 +799,58 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
 
-  if (checked && addr &&
+  if (checked && addr && translation_domain_key.id() <= UINT32_MAX &&
       processor->checked_execution_epoch() == checked_epoch) {
-    CheckedResolutionFor(processor, checked_epoch,
+    CheckedResolutionFor(raw_context, processor, checked_epoch,
                          static_cast<uint32_t>(target_address)) = {
-        translation_domain_key.id(), static_cast<uint32_t>(target_address),
-        addr};
+        static_cast<uint32_t>(target_address),
+        static_cast<uint32_t>(translation_domain_key.id()), addr};
   }
   return addr;
+}
+
+// With the branch target in edx, leaves the machine code ResolveFunction would
+// return in rax, or jumps to miss when an interrupt is pending, the table is
+// stale, or it has no resolution of the target for this function's domain.
+// Preserves edx; clobbers rax, rcx and flags. The domain id must fit 32 bits.
+void X64Emitter::EmitCheckedResolutionProbe(Xbyak::Label& miss) {
+  const Xbyak::Reg64 context = GetContextReg();
+  const auto displacement = [](size_t offset_in_table) {
+    return static_cast<int32_t>(
+        -static_cast<ptrdiff_t>(sizeof(X64BackendContext)) +
+        static_cast<ptrdiff_t>(
+            offsetof(X64BackendContext, checked_resolutions) +
+            offset_in_table));
+  };
+  cmp(byte[context + offsetof(ppc::PPCContext, guest_interrupt_pending)], 0);
+  jne(miss, T_NEAR);
+  mov(rax, reinterpret_cast<uint64_t>(
+               processor_->checked_execution_epoch_address()));
+  mov(rax, qword[rax]);
+  cmp(rax,
+      qword[context + displacement(offsetof(CheckedResolutionTable, epoch))]);
+  jne(miss, T_NEAR);
+  // CheckedResolutionTable::IndexFor, scaled by the entry size.
+  mov(eax, edx);
+  shr(eax, 2);
+  mov(ecx, edx);
+  shr(ecx, 2 + kCheckedResolutionShift);
+  add(eax, ecx);
+  and_(eax, kCheckedResolutionCount - 1);
+  shl(eax, 4);
+  static_assert(sizeof(CheckedResolutionEntry) == 16);
+  const int32_t entries =
+      displacement(offsetof(CheckedResolutionTable, entries));
+  cmp(edx, dword[context + rax +
+                 (entries + offsetof(CheckedResolutionEntry, guest_address))]);
+  jne(miss, T_NEAR);
+  cmp(dword[context + rax +
+            (entries + offsetof(CheckedResolutionEntry, domain_id))],
+      static_cast<uint32_t>(
+          checked_memory_descriptor_->translation_domain_key().id()));
+  jne(miss, T_NEAR);
+  mov(rax, qword[context + rax +
+                 (entries + offsetof(CheckedResolutionEntry, machine_code))]);
 }
 
 void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
@@ -857,7 +895,18 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     // Old-style resolve.
     // Not too important because indirection table is almost always available.
     // TODO: Overwrite the call-site with a straight call.
+    Xbyak::Label resolved;
+    if (checked_memory_descriptor_ && cvars::x64_inline_checked_resolution &&
+        checked_memory_descriptor_->translation_domain_key().id() <=
+            UINT32_MAX) {
+      Xbyak::Label resolve;
+      mov(edx, function->address());
+      EmitCheckedResolutionProbe(resolve);
+      jmp(resolved, T_NEAR);
+      L(resolve);
+    }
     CallNative(&ResolveFunction, function->address());
+    L(resolved);
   }
 
   test(rax, rax);
@@ -909,9 +958,19 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     // Old-style resolve.
     // Not too important because indirection table is almost always available.
     mov(edx, reg.cvt32());
+    Xbyak::Label resolved;
+    if (checked_memory_descriptor_ && cvars::x64_inline_checked_resolution &&
+        checked_memory_descriptor_->translation_domain_key().id() <=
+            UINT32_MAX) {
+      Xbyak::Label resolve;
+      EmitCheckedResolutionProbe(resolve);
+      jmp(resolved, T_NEAR);
+      L(resolve);
+    }
     mov(rax, reinterpret_cast<uint64_t>(ResolveFunction));
     mov(rcx, GetContextReg());
     call(rax);
+    L(resolved);
   }
 
   test(rax, rax);

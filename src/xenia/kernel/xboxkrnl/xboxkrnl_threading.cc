@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
+#include <algorithm>
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/platform.h"
@@ -396,15 +398,34 @@ DECLARE_XBOXKRNL_EXPORT1(KeQueryBasePriorityThread, kThreading, kImplemented);
 
 dword_result_t KeSetBasePriorityThread_entry(lpvoid_t thread_ptr,
                                              dword_t increment) {
-  int32_t prev_priority = 0;
   auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr);
-
-  if (thread) {
-    prev_priority = thread->QueryPriority();
-    thread->SetPriority(increment);
+  if (!thread) {
+    return 0;
   }
-
-  return prev_priority;
+  // As in NT, the increment is relative to the process's default priority and
+  // stays within its class; +-16 saturates to the class bounds. The previous
+  // increment is returned.
+  int32_t process_base =
+      13;  // The title process (KernelState::InitializeProcess).
+  if (thread->is_guest_thread()) {
+    auto* kthread = thread->guest_object<X_KTHREAD>();
+    if (kthread->process != 0) {
+      process_base = kernel_memory()
+                         ->TranslateVirtual(kthread->process)
+                         ->default_thread_priority;
+    }
+  }
+  const bool realtime = process_base >= 16;
+  const int32_t low = realtime ? 16 : 1;
+  const int32_t high = realtime ? 31 : 15;
+  const int32_t delta = static_cast<int32_t>(static_cast<uint32_t>(increment));
+  const int32_t new_base = delta >= 16 ? high
+                           : delta <= -16
+                               ? low
+                               : std::clamp(process_base + delta, low, high);
+  const int32_t previous_increment = thread->QueryPriority() - process_base;
+  thread->SetPriority(new_base);
+  return static_cast<uint32_t>(previous_increment);
 }
 DECLARE_XBOXKRNL_EXPORT1(KeSetBasePriorityThread, kThreading, kImplemented);
 
@@ -2018,7 +2039,8 @@ dword_result_t KeSetTimerEx_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
              ? 1
              : 0;
 }
-DECLARE_XBOXKRNL_EXPORT1(KeSetTimerEx, kThreading, kImplemented);
+DECLARE_XBOXKRNL_EXPORT2(KeSetTimerEx, kThreading, kImplemented,
+                         kHighFrequency);
 
 dword_result_t KeSetTimer_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
                                 pointer_t<XDPC> dpc) {

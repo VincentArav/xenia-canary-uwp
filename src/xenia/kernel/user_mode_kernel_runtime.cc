@@ -415,6 +415,9 @@ X_STATUS UserModeKernelRuntime::Enter(uint32_t context_virtual_address,
             } catch (...) {
               inserted = false;
             }
+            if (inserted) {
+              TrackThreadLocked(thread->thread_id());
+            }
             const cpu::TranslationDomainKey target_domain =
                 SelectDomain(*lease, prepared_entry.context.user_mode_control);
             if (inserted && prepared_entry.context.entry_address != 0 &&
@@ -432,6 +435,7 @@ X_STATUS UserModeKernelRuntime::Enter(uint32_t context_virtual_address,
             if (!staged) {
               if (inserted) {
                 thread_states_.erase(thread->thread_id());
+                UntrackThreadLocked(thread->thread_id());
               }
               manager_->Leave(thread->thread_id());
               kernel_state_->memory()->SystemHeapFree(exception_record);
@@ -445,7 +449,7 @@ X_STATUS UserModeKernelRuntime::Enter(uint32_t context_virtual_address,
   if (!staged) {
     return failure_status;
   }
-  thread->ReenterPrepared(entry_address);
+  thread->ReenterPreparedFromPlainFrames(entry_address);
   std::abort();
 }
 
@@ -564,7 +568,7 @@ bool UserModeKernelRuntime::DispatchGuestSyscall(
   if (invariant_failure || !staged || !reentry_address) {
     FailInvariant("problem-state system call", ppc_context);
   }
-  thread->ReenterPrepared(reentry_address);
+  thread->ReenterPreparedFromPlainFrames(reentry_address);
   std::abort();
 }
 
@@ -596,7 +600,7 @@ bool UserModeKernelRuntime::DispatchGuestSyscall(
     if (!staged) {
       FailInvariant("checked-memory translation retry", ppc_context);
     }
-    thread->ReenterPrepared(request.instruction_address);
+    thread->ReenterPreparedFromPlainFrames(request.instruction_address);
   }
 
   const bool guest_fault =
@@ -759,7 +763,7 @@ bool UserModeKernelRuntime::DispatchGuestProgramException(
   if (invariant_failure || !staged || !handler_address) {
     FailInvariant(operation, ppc_context);
   }
-  thread.ReenterPrepared(handler_address);
+  thread.ReenterPreparedFromPlainFrames(handler_address);
 }
 
 void UserModeKernelRuntime::Flush(uint32_t selector,
@@ -811,7 +815,7 @@ void UserModeKernelRuntime::Flush(uint32_t selector,
   if (!staged || !continuation_address) {
     FailInvariant("checked-domain TLB flush", ppc_context);
   }
-  thread->ReenterPrepared(continuation_address);
+  thread->ReenterPreparedFromPlainFrames(continuation_address);
 }
 
 bool UserModeKernelRuntime::QueueThreadDpc(uint32_t thread_id, uint32_t dpc_ptr,
@@ -930,51 +934,69 @@ void UserModeKernelRuntime::PollGuestInterrupt(
     ApplyUserModeOuterIntegerState(active->outer_state, *ppc_context);
     continuation_address = continuation_function_->address();
   }
-  thread->ReenterPrepared(continuation_address);
+  thread->ReenterPreparedFromPlainFrames(continuation_address);
 }
 
 [[noreturn]] void UserModeKernelRuntime::ReturnFromInterrupt(
     XThread& thread, cpu::ppc::PPCContext* ppc_context) {
-  std::vector<PendingDpc> dpcs;
   uint32_t trap_frame = 0;
+  uint32_t written_condition_register = 0;
+  // The pending DPCs, copied out under the lock. Nothing owning may be alive
+  // at the reentry below, so the overflow vector lives in this scope.
+  constexpr size_t kDpcBatch = 16;
+  std::array<PendingDpc, kDpcBatch> dpc_batch;
+  size_t dpc_count = 0;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto state_it = thread_states_.find(thread.thread_id());
-    if (state_it != thread_states_.end()) {
-      ThreadRuntimeState& state = state_it->second;
-      dpcs.swap(state.pending_dpcs);
-      thread.thread_state()->set_guest_interrupt_pending(false);
-      // The interrupted context goes into the thread's trap frame while its
-      // DPCs run, as for an interrupt taken in user mode: XeFu's clock DPC
-      // sets CR1.LT there so its translated loops leave to take the x86
-      // interrupt.
-      if (state.pending_action == UserModePendingKernelAction::kInterrupt &&
-          state.interrupted_context.size() == sizeof(*ppc_context)) {
-        auto interrupted = std::make_unique<cpu::ppc::PPCContext>();
-        std::memcpy(interrupted.get(), state.interrupted_context.data(),
-                    sizeof(*ppc_context));
-        ApplyTrapFrameMarksLocked(state, *interrupted);
-        UserModeIntegerContext frame_context{};
-        SaveUserModeIntegerContext(*interrupted, frame_context);
-        frame_context.entry_address = state.pending_resume_address;
-        if (WriteHandlerTrapFrame(*kernel_state_->memory(),
-                                  state.exception_record_virtual_address,
-                                  frame_context)) {
-          trap_frame =
-              HandlerTrapFrameAddress(state.exception_record_virtual_address);
-          state.trap_frame_condition_register =
-              frame_context.condition_register;
+    std::vector<PendingDpc> dpc_overflow;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto state_it = thread_states_.find(thread.thread_id());
+      if (state_it != thread_states_.end()) {
+        ThreadRuntimeState& state = state_it->second;
+        for (const PendingDpc& dpc : state.pending_dpcs) {
+          if (dpc_count < kDpcBatch) {
+            dpc_batch[dpc_count++] = dpc;
+          } else {
+            dpc_overflow.push_back(dpc);
+          }
+        }
+        state.pending_dpcs.clear();
+        thread.thread_state()->set_guest_interrupt_pending(false);
+        // The interrupted context goes into the thread's trap frame while its
+        // DPCs run, as for an interrupt taken in user mode; DPCs may mark it.
+        if (state.pending_action == UserModePendingKernelAction::kInterrupt &&
+            state.interrupted_context.size() == sizeof(*ppc_context)) {
+          cpu::ppc::PPCContext interrupted;
+          std::memcpy(&interrupted, state.interrupted_context.data(),
+                      sizeof(*ppc_context));
+          ApplyTrapFrameMarksLocked(state, interrupted);
+          UserModeIntegerContext frame_context{};
+          SaveUserModeIntegerContext(interrupted, frame_context);
+          frame_context.entry_address = state.pending_resume_address;
+          if (WriteHandlerTrapFrame(*kernel_state_->memory(),
+                                    state.exception_record_virtual_address,
+                                    frame_context)) {
+            trap_frame =
+                HandlerTrapFrameAddress(state.exception_record_virtual_address);
+            state.trap_frame_condition_register =
+                frame_context.condition_register;
+            written_condition_register = frame_context.condition_register;
+          }
         }
       }
     }
+    // DPCs queued meanwhile (a DPC re-arming its timer) wait for the next
+    // interrupt.
+    for (size_t i = 0; i < dpc_count; ++i) {
+      xboxkrnl::xeKeExecuteDpc(dpc_batch[i].dpc_ptr, dpc_batch[i].arg1,
+                               dpc_batch[i].arg2);
+    }
+    for (const PendingDpc& dpc : dpc_overflow) {
+      xboxkrnl::xeKeExecuteDpc(dpc.dpc_ptr, dpc.arg1, dpc.arg2);
+    }
   }
-  // DPCs queued meanwhile (a DPC re-arming its timer) wait for the next
-  // interrupt.
-  for (const PendingDpc& dpc : dpcs) {
-    xboxkrnl::xeKeExecuteDpc(dpc.dpc_ptr, dpc.arg1, dpc.arg2);
-  }
-  // Only the condition register is taken back: that is what the DPC marks,
-  // and the frame's 32-bit LR field would truncate the saved LR.
+  // Only the CR1 marks are taken back from the frame; its 32-bit LR field
+  // would truncate LR.
   std::optional<uint32_t> frame_condition_register;
   if (trap_frame) {
     UserModeIntegerContext frame_context{};
@@ -1008,7 +1030,9 @@ void UserModeKernelRuntime::PollGuestInterrupt(
         std::memcpy(ppc_context, state.interrupted_context.data(),
                     sizeof(*ppc_context));
         if (frame_condition_register) {
-          ppc_context->set_cr(*frame_condition_register);
+          ppc_context->set_cr(ApplyTrapFrameConditionRegisterMarks(
+              written_condition_register, *frame_condition_register,
+              written_condition_register));
           state.trap_frame_condition_register = *frame_condition_register;
         }
         reentry_address = state.pending_resume_address;
@@ -1025,7 +1049,7 @@ void UserModeKernelRuntime::PollGuestInterrupt(
   if (!staged) {
     FailInvariant("user-mode interrupt return", ppc_context);
   }
-  thread.ReenterPrepared(reentry_address);
+  thread.ReenterPreparedFromPlainFrames(reentry_address);
 }
 
 void UserModeKernelRuntime::FlushEntireTb(cpu::ppc::PPCContext* ppc_context) {
@@ -1061,7 +1085,7 @@ void UserModeKernelRuntime::ContinuationThunk(cpu::ppc::PPCContext* ppc_context,
   }
 
   // A pending TB flush runs live and outside mutex_: it takes the resolution
-  // and global locks, which are never acquired under the runtime lock.
+  // lock, which is never acquired under the runtime lock.
   std::optional<UserModeMappingHandle> flush_mapping;
   bool interrupt = false;
   {
@@ -1198,7 +1222,7 @@ void UserModeKernelRuntime::ContinuationThunk(cpu::ppc::PPCContext* ppc_context,
   XELOGD("XeFU user-mode continuation resumes at {:08X} (r3 {:08X} r11 {:08X})",
          reentry_address, static_cast<uint32_t>(ppc_context->r[3]),
          static_cast<uint32_t>(ppc_context->r[11]));
-  thread->ReenterPrepared(reentry_address);
+  thread->ReenterPreparedFromPlainFrames(reentry_address);
 }
 
 bool UserModeKernelRuntime::ClearThreadRuntimeStateLocked(
@@ -1218,8 +1242,39 @@ bool UserModeKernelRuntime::ClearThreadRuntimeStateLocked(
     *dpcs_out = std::move(state_it->second.pending_dpcs);
   }
   PublishTrapFrameLocked(state_it->second, false);
+  UntrackThreadLocked(state_it->first);
   thread_states_.erase(state_it);
   return true;
+}
+
+void UserModeKernelRuntime::TrackThreadLocked(uint32_t thread_id) {
+  for (auto& slot : tracked_threads_) {
+    if (!slot.load(std::memory_order_relaxed)) {
+      slot.store(thread_id, std::memory_order_release);
+      return;
+    }
+  }
+  tracked_threads_overflow_.store(true, std::memory_order_release);
+}
+
+void UserModeKernelRuntime::UntrackThreadLocked(uint32_t thread_id) {
+  for (auto& slot : tracked_threads_) {
+    if (slot.load(std::memory_order_relaxed) == thread_id) {
+      slot.store(0, std::memory_order_release);
+    }
+  }
+}
+
+bool UserModeKernelRuntime::MayHaveThreadState(uint32_t thread_id) const {
+  if (tracked_threads_overflow_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  for (const auto& slot : tracked_threads_) {
+    if (slot.load(std::memory_order_acquire) == thread_id) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void UserModeKernelRuntime::Leave(cpu::ppc::PPCContext* ppc_context) {
@@ -1233,33 +1288,35 @@ void UserModeKernelRuntime::Leave(cpu::ppc::PPCContext* ppc_context) {
   bool staged = false;
   uint32_t exception_record = 0;
   uint32_t resume_address = 0;
-  std::vector<PendingDpc> dpcs;
+  // Nothing owning may be alive at the reentry below.
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (thread->thread_state()->translation_domain_key() ==
-        cpu::TranslationDomainKey::DefaultDirect()) {
-      UserModeLeaveResult leave = manager_->Leave(thread->thread_id());
-      if (leave) {
-        ApplyRetailUserModeLeaveState(*leave.outer_state, *ppc_context);
-        success = ClearThreadRuntimeStateLocked(thread->thread_id(),
-                                                &exception_record, &dpcs);
-        // Retail Leave returns into the caller of KeEnterUserMode, at the
-        // restored LR. Enter already discarded that caller's host frames when
-        // it reentered, so resume through the same nonlocal reentry rather than
-        // returning into the handler's host stack with the outer guest stack.
-        resume_address = static_cast<uint32_t>(ppc_context->lr);
-        staged = success && resume_address &&
-                 thread->StageTranslationDomainReentry(
-                     cpu::TranslationDomainKey::DefaultDirect(), nullptr);
+    std::vector<PendingDpc> dpcs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (thread->thread_state()->translation_domain_key() ==
+          cpu::TranslationDomainKey::DefaultDirect()) {
+        UserModeLeaveResult leave = manager_->Leave(thread->thread_id());
+        if (leave) {
+          ApplyRetailUserModeLeaveState(*leave.outer_state, *ppc_context);
+          success = ClearThreadRuntimeStateLocked(thread->thread_id(),
+                                                  &exception_record, &dpcs);
+          // Leave returns to KeEnterUserMode's caller at the restored LR,
+          // through a reentry: Enter already discarded that caller's host
+          // frames.
+          resume_address = static_cast<uint32_t>(ppc_context->lr);
+          staged = success && resume_address &&
+                   thread->StageTranslationDomainReentry(
+                       cpu::TranslationDomainKey::DefaultDirect(), nullptr);
+        }
       }
     }
-  }
-  if (exception_record) {
-    kernel_state_->memory()->SystemHeapFree(exception_record);
-  }
-  // DPCs that were waiting for user mode run on the timer DPC thread now.
-  for (const PendingDpc& dpc : dpcs) {
-    kernel_state_->QueueTimerDpc(dpc.dpc_ptr, dpc.arg1, dpc.arg2);
+    if (exception_record) {
+      kernel_state_->memory()->SystemHeapFree(exception_record);
+    }
+    // DPCs that were waiting for user mode run on the timer DPC thread now.
+    for (const PendingDpc& dpc : dpcs) {
+      kernel_state_->QueueTimerDpc(dpc.dpc_ptr, dpc.arg1, dpc.arg2);
+    }
   }
   if (!success) {
     FailInvariant("KeLeaveUserMode without an active handler frame",
@@ -1270,12 +1327,12 @@ void UserModeKernelRuntime::Leave(cpu::ppc::PPCContext* ppc_context) {
   }
   XELOGD("XeFU KeLeaveUserMode resumes at {:08X} with r3={:08X}",
          resume_address, static_cast<uint32_t>(ppc_context->r[3]));
-  thread->ReenterPrepared(resume_address);
+  thread->ReenterPreparedFromPlainFrames(resume_address);
 }
 
 void UserModeKernelRuntime::OnThreadDestroyed(uint32_t thread_id) {
   uint32_t exception_record = 0;
-  {
+  if (MayHaveThreadState(thread_id)) {
     std::lock_guard<std::mutex> lock(mutex_);
     ClearThreadRuntimeStateLocked(thread_id, &exception_record);
   }
@@ -1298,6 +1355,10 @@ void UserModeKernelRuntime::ResetTitle() {
       }
     }
     thread_states_.clear();
+    for (auto& slot : tracked_threads_) {
+      slot.store(0, std::memory_order_release);
+    }
+    tracked_threads_overflow_.store(false, std::memory_order_release);
   }
   manager_->ResetTitle();
   for (uint32_t exception_record : exception_records) {

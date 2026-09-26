@@ -10,6 +10,8 @@
 #ifndef XENIA_KERNEL_USER_MODE_KERNEL_RUNTIME_H_
 #define XENIA_KERNEL_USER_MODE_KERNEL_RUNTIME_H_
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -232,6 +234,15 @@ class UserModeKernelRuntime final : public cpu::ppc::GuestSyscallDispatcher,
 
   mutable std::mutex mutex_;
   std::unordered_map<uint32_t, ThreadRuntimeState> thread_states_;
+  // The ids in thread_states_, readable without mutex_ so thread teardown
+  // takes mutex_ only for a thread that has state. Written under mutex_; 0 is
+  // a free slot.
+  static constexpr size_t kTrackedThreadSlots = 16;
+  std::array<std::atomic<uint32_t>, kTrackedThreadSlots> tracked_threads_{};
+  std::atomic<bool> tracked_threads_overflow_{false};
+  void TrackThreadLocked(uint32_t thread_id);
+  void UntrackThreadLocked(uint32_t thread_id);
+  bool MayHaveThreadState(uint32_t thread_id) const;
 };
 
 }  // namespace xe::kernel

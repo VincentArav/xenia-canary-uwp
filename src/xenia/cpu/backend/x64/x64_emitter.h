@@ -322,6 +322,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
   SimdDomain DeduceSimdDomain(const hir::Value* for_value);
 
   void ForgetMxcsrMode() { mxcsr_mode_ = MXCSRMode::Unknown; }
+  MXCSRMode mxcsr_mode() const { return mxcsr_mode_; }
+  void EmitCheckedResolutionProbe(Xbyak::Label& miss);
   /*
         returns true if had to load mxcsr. DOT_PRODUCT can use this to skip
      clearing the overflow flag, as it will never be set in the vmx fpscr

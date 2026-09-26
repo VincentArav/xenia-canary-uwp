@@ -268,28 +268,40 @@ class UserModeGuestDataAccessor final {
       const UserModeGuestDataReservationIdentity*
           required_reservation_identity = nullptr) const;
 
-  // Loads and stores like ReadAligned and CommitSyntheticAlignedStore, but
-  // through translations this thread cached from earlier accesses, as the
-  // console's TLB does: the page table is walked only on a miss. A cached
-  // read reports no translations. Stores still notify the physical write
-  // observers and hold the mapping's operation lease.
+  // ReadAligned and CommitSyntheticAlignedStore through this thread's cached
+  // translations, walking the page table only on a miss. A cached read
+  // reports no translations; stores still notify the write observers and hold
+  // the operation lease. The translations live in checked_tlb, or in a
+  // thread-local table when it is null.
   UserModeGuestDataReadResult ReadAlignedCached(
-      UserModeGuestDataOperand operand, uint32_t effective_address) const;
+      UserModeGuestDataOperand operand, uint32_t effective_address,
+      cpu::CheckedTlb* checked_tlb = nullptr) const;
   UserModeGuestDataStoreResult StoreAlignedCached(
       UserModeGuestDataOperand operand, uint32_t effective_address,
-      std::span<const uint8_t> canonical_input) const;
+      std::span<const uint8_t> canonical_input,
+      cpu::CheckedTlb* checked_tlb = nullptr) const;
+  // CommitSyntheticAlignedMemset through a cached write translation.
+  UserModeGuestDataStoreResult MemsetAlignedCached(
+      uint32_t effective_address, uint8_t value, uint32_t byte_count,
+      cpu::CheckedTlb* checked_tlb = nullptr) const;
   // Whether this thread holds a write translation for the byte's page.
-  bool HasCachedWriteTranslation(uint32_t effective_address) const;
+  bool HasCachedWriteTranslation(uint32_t effective_address,
+                                 cpu::CheckedTlb* checked_tlb = nullptr) const;
   // Big-endian storage only: copies the bytes at any alignment, across at
   // most one page boundary, when this thread caches every page they touch.
   // False (and nothing copied) otherwise; the caller takes the checked path.
   bool TryReadBytesCached(uint32_t effective_address,
-                          std::span<uint8_t> destination) const;
+                          std::span<uint8_t> destination,
+                          cpu::CheckedTlb* checked_tlb = nullptr) const;
   bool TryWriteBytesCached(uint32_t effective_address,
-                           std::span<const uint8_t> source) const;
+                           std::span<const uint8_t> source,
+                           cpu::CheckedTlb* checked_tlb = nullptr) const;
 
   // Drops every thread's cached translations (a TB flush).
   static void InvalidateTranslationCaches();
+
+  // The id this accessor's cached translations carry. Never reused.
+  uint32_t tlb_accessor_id() const { return tlb_accessor_id_; }
 
   UserModeMappingHandle mapping_handle() const {
     return generation_token_ ? generation_token_->handle()
@@ -314,6 +326,7 @@ class UserModeGuestDataAccessor final {
   const UserModeProblemStateKey problem_state_key_;
   const bool little_endian_;
   const UserModeGuestDataStoreMode store_mode_;
+  const uint32_t tlb_accessor_id_;
 };
 
 // Creates the GuestMemoryAccessor of a checked domain. It supports stores only

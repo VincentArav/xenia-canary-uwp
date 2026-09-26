@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "xenia/base/assert.h"
+#include "xenia/memory.h"
 
 namespace xe::kernel {
 namespace {
@@ -66,6 +67,8 @@ UserModeMappingGenerationToken::RetireAndTakeRetirementListener() {
   if (!current_.exchange(false, std::memory_order_acq_rel)) {
     return nullptr;
   }
+  // Generated code uses cached translations without checking the mapping.
+  Memory::AdvanceTranslationEpoch();
   lifecycle_condition_.wait(lock,
                             [this] { return active_operation_count_ == 0; });
   return retirement_listener_.lock();

@@ -503,19 +503,22 @@ StringBuffer* thread_local_string_buffer();
 template <typename Tuple>
 XE_NOALIAS void PrintKernelCall(cpu::Export* export_entry,
                                 const Tuple& params) {
+  const bool important = export_entry->tags & xe::cpu::ExportTag::kImportant;
+  const xe::LogLevel log_level =
+      important ? xe::LogLevel::Info : xe::LogLevel::Debug;
+  // Formatting every argument costs more than most calls; skip it when the
+  // line would be discarded.
+  if (!xe::logging::ShouldLog(log_level, LogSrc::Kernel)) {
+    return;
+  }
   auto& string_buffer = *thread_local_string_buffer();
   string_buffer.Reset();
   string_buffer.Append(export_entry->name);
   string_buffer.Append('(');
   AppendKernelCallParams(string_buffer, export_entry, params);
   string_buffer.Append(')');
-  if (export_entry->tags & xe::cpu::ExportTag::kImportant) {
-    xe::logging::AppendLogLine(xe::LogLevel::Info, 'i',
-                               string_buffer.to_string_view(), LogSrc::Kernel);
-  } else {
-    xe::logging::AppendLogLine(xe::LogLevel::Debug, 'd',
-                               string_buffer.to_string_view(), LogSrc::Kernel);
-  }
+  xe::logging::AppendLogLine(log_level, important ? 'i' : 'd',
+                             string_buffer.to_string_view(), LogSrc::Kernel);
 }
 /*
         todo: need faster string formatting/concatenation (all arguments are

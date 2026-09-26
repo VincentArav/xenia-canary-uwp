@@ -1710,6 +1710,14 @@ void X64HelperEmitter::EmitLoadNonvolatileRegs() {
 }
 void X64Backend::InitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  bctx->checked_resolutions.epoch = 0;
+  bctx->checked_resolutions.processor = nullptr;
+  std::memset(bctx->checked_resolutions.entries, 0,
+              sizeof(bctx->checked_resolutions.entries));
+  bctx->checked_tlb.epoch = 0;
+  bctx->checked_tlb.clear_epoch = 0;
+  bctx->checked_tlb.owner = nullptr;
+  bctx->checked_tlb.ClearEntries();
   bctx->mxcsr_fpu =
       DEFAULT_FPU_MXCSR;  // idk if this is right, check on rgh what the
                           // rounding on ppc is at startup

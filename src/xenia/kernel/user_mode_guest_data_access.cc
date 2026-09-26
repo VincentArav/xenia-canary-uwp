@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "xenia/base/mutex.h"
+#include "xenia/cpu/checked_tlb.h"
 #include "xenia/memory.h"
 
 namespace xe::kernel {
@@ -431,97 +432,108 @@ void AddPhysicalMutationRange(uint32_t physical_address, uint32_t byte_count,
   (*ranges)[(*range_count)++] = {physical_address, byte_count};
 }
 
-// A thread's cached translations for one accessor: direct-mapped by
-// effective 4 KiB page, reads and writes apart, since a write translation
-// needs write permission and a PTE whose C bit is already set.
-constexpr uint32_t kCachedTranslationPageShift = 12;
-constexpr size_t kCachedTranslationCount = 256;
+// A thread's cached translations (cpu/checked_tlb.h): direct-mapped by
+// effective 4 KiB page and tagged with the accessor's id, reads and writes
+// apart, since a write translation needs write permission and a PTE whose C
+// bit is already set. Callers without a context's table use this thread's.
+thread_local std::unique_ptr<cpu::CheckedTlb> fallback_tlb;
 
-struct CachedTranslation {
-  // Effective page number plus one; 0 is empty.
-  uint32_t tag = 0;
-  uint32_t physical_page = 0;
-  // For a write: the page in the guest view that maps the physical page
-  // writable, or null. Writing there raises the physical write observers the
-  // way title code does: the page faults into them only while one watches it.
-  uint8_t* alias_page = nullptr;
-};
+std::atomic<uint32_t> next_tlb_accessor_id{1};
 
-struct TranslationCache {
-  const void* owner = nullptr;
-  uint64_t tb_generation = 0;
-  uint64_t physical_generation = 0;
-  std::array<CachedTranslation, kCachedTranslationCount> read{};
-  std::array<CachedTranslation, kCachedTranslationCount> write{};
-};
-
-std::atomic<uint64_t> translation_cache_generation{1};
-thread_local std::array<TranslationCache, 4> translation_caches;
-thread_local uint32_t translation_cache_victim = 0;
-
-struct TranslationCacheGenerations {
-  uint64_t tb = 0;
-  uint64_t physical = 0;
-
-  bool operator==(const TranslationCacheGenerations&) const = default;
-};
-
-TranslationCacheGenerations CurrentTranslationCacheGenerations(
-    const Memory& memory) {
-  return {translation_cache_generation.load(std::memory_order_acquire),
-          memory.physical_access_generation()};
+bool TranslationSourceCurrent(const Memory& memory,
+                              const cpu::CheckedTlbSource& source) {
+  if (source.root_entry_physical_address &&
+      xe::load_and_swap<uint16_t>(memory.TranslatePhysical<const uint8_t*>(
+          source.root_entry_physical_address)) != source.root_entry) {
+    return false;
+  }
+  return xe::load_and_swap<uint32_t>(memory.TranslatePhysical<const uint8_t*>(
+             source.pte_physical_address)) == source.raw_pte;
 }
 
-TranslationCache& TranslationCacheFor(
-    const void* owner, const TranslationCacheGenerations& generations) {
-  TranslationCache* cache = nullptr;
-  for (TranslationCache& candidate : translation_caches) {
-    if (candidate.owner == owner) {
-      cache = &candidate;
-      break;
+void RevalidateEntries(const Memory& memory, cpu::CheckedTlbEntry* entries,
+                       const cpu::CheckedTlbSource* sources) {
+  for (uint32_t i = 0; i < cpu::kCheckedTlbEntryCount; ++i) {
+    if (entries[i].tag && !TranslationSourceCurrent(memory, sources[i])) {
+      entries[i] = {};
     }
   }
-  if (!cache) {
-    cache = &translation_caches[translation_cache_victim++ %
-                                translation_caches.size()];
-    cache->owner = owner;
-    cache->tb_generation = 0;
-  }
-  if (cache->tb_generation != generations.tb ||
-      cache->physical_generation != generations.physical) {
-    cache->read.fill({});
-    cache->write.fill({});
-    cache->tb_generation = generations.tb;
-    cache->physical_generation = generations.physical;
-  }
-  return *cache;
 }
 
-const CachedTranslation* LookupCachedTranslation(
-    const std::array<CachedTranslation, kCachedTranslationCount>& entries,
-    uint32_t effective_address, uint32_t* physical_address) {
-  const uint32_t page = effective_address >> kCachedTranslationPageShift;
-  const CachedTranslation& entry = entries[page % kCachedTranslationCount];
-  if (entry.tag != page + 1) {
+// The table, brought up to the epoch sampled before the lookup: after TB
+// flushes alone it keeps the entries whose page-table words are unchanged;
+// otherwise it empties.
+cpu::CheckedTlb& AcquireTlb(cpu::CheckedTlb* tlb, const Memory& memory,
+                            uint64_t epoch) {
+  if (!tlb) {
+    if (!fallback_tlb) {
+      fallback_tlb = std::make_unique<cpu::CheckedTlb>();
+      fallback_tlb->epoch = 0;
+      fallback_tlb->clear_epoch = 0;
+      fallback_tlb->owner = nullptr;
+      fallback_tlb->ClearEntries();
+    }
+    tlb = fallback_tlb.get();
+  }
+  if (tlb->epoch != epoch) {
+    const uint64_t clear_epoch = Memory::translation_clear_epoch();
+    if (tlb->clear_epoch != clear_epoch || tlb->owner != &memory) {
+      tlb->ClearEntries();
+    } else {
+      RevalidateEntries(memory, tlb->read, tlb->read_source);
+      RevalidateEntries(memory, tlb->write, tlb->write_source);
+    }
+    tlb->epoch = epoch;
+    tlb->clear_epoch = clear_epoch;
+    tlb->owner = &memory;
+  }
+  return *tlb;
+}
+
+cpu::CheckedTlbSource SourceOf(const UserModeAddressTranslationResult& walk,
+                               uint32_t raw_pte) {
+  return {walk.root_entry_physical_address, walk.root_entry,
+          walk.pte_physical_address, raw_pte};
+}
+
+const cpu::CheckedTlbEntry* LookupCachedTranslation(
+    const cpu::CheckedTlbEntry* entries, uint32_t accessor_id,
+    uint32_t effective_address) {
+  const cpu::CheckedTlbEntry& entry =
+      entries[cpu::CheckedTlb::IndexFor(effective_address)];
+  if ((entry.tag & ~cpu::kCheckedTlbInlineBit) !=
+          cpu::CheckedTlb::TagFor(effective_address) ||
+      entry.accessor_id != accessor_id) {
     return nullptr;
   }
-  *physical_address =
-      entry.physical_page |
-      (effective_address & ((1u << kCachedTranslationPageShift) - 1));
   return &entry;
 }
 
-void InsertCachedTranslation(
-    std::array<CachedTranslation, kCachedTranslationCount>& entries,
-    uint32_t effective_address, uint32_t physical_address,
-    uint8_t* alias_page = nullptr) {
-  constexpr uint32_t kOffsetMask = (1u << kCachedTranslationPageShift) - 1;
+uint8_t* CachedHostAddress(const cpu::CheckedTlbEntry& entry,
+                           uint32_t effective_address) {
+  return reinterpret_cast<uint8_t*>(entry.host_delta + effective_address);
+}
+
+// host_page holds the physical page's bytes: physical memory, or for a write
+// the guest view page that maps it writable, which only inline_usable entries
+// use.
+void InsertCachedTranslation(cpu::CheckedTlbEntry* entries,
+                             cpu::CheckedTlbSource* sources,
+                             uint32_t accessor_id, uint32_t effective_address,
+                             uint32_t physical_address,
+                             const uint8_t* host_page, bool inline_usable,
+                             const cpu::CheckedTlbSource& source) {
+  constexpr uint32_t kOffsetMask = (1u << cpu::kCheckedTlbPageShift) - 1;
   if ((effective_address & kOffsetMask) != (physical_address & kOffsetMask)) {
     return;
   }
-  const uint32_t page = effective_address >> kCachedTranslationPageShift;
-  entries[page % kCachedTranslationCount] = {
-      page + 1, physical_address & ~kOffsetMask, alias_page};
+  sources[cpu::CheckedTlb::IndexFor(effective_address)] = source;
+  entries[cpu::CheckedTlb::IndexFor(effective_address)] = {
+      cpu::CheckedTlb::TagFor(effective_address) |
+          (inline_usable ? cpu::kCheckedTlbInlineBit : 0),
+      accessor_id,
+      reinterpret_cast<uint64_t>(host_page) -
+          (effective_address & ~kOffsetMask)};
 }
 
 // The page of a guest physical view that maps the physical page committed
@@ -615,45 +627,43 @@ UserModeGuestDataAccessor::UserModeGuestDataAccessor(
       generation_token_(std::move(generation_token)),
       problem_state_key_(problem_state_key),
       little_endian_(little_endian),
-      store_mode_(store_mode) {
-  // A new accessor may reuse a destroyed one's address.
-  InvalidateTranslationCaches();
-}
+      store_mode_(store_mode),
+      tlb_accessor_id_(
+          next_tlb_accessor_id.fetch_add(1, std::memory_order_relaxed)) {}
 
-UserModeGuestDataAccessor::~UserModeGuestDataAccessor() {
-  InvalidateTranslationCaches();
-}
+UserModeGuestDataAccessor::~UserModeGuestDataAccessor() = default;
 
 void UserModeGuestDataAccessor::InvalidateTranslationCaches() {
-  translation_cache_generation.fetch_add(1, std::memory_order_acq_rel);
+  Memory::AdvanceTranslationEpochForTbFlush();
 }
 
 UserModeGuestDataReadResult UserModeGuestDataAccessor::ReadAlignedCached(
-    UserModeGuestDataOperand operand, uint32_t effective_address) const {
+    UserModeGuestDataOperand operand, uint32_t effective_address,
+    cpu::CheckedTlb* checked_tlb) const {
   UserModeGuestDataTransferPlan plan =
       PlanUserModeGuestDataTransfer(operand, effective_address, little_endian_);
   if (!plan || !memory_ || !HasValidConfiguration()) {
     return ReadAligned(operand, effective_address);
   }
-  const TranslationCacheGenerations generations =
-      CurrentTranslationCacheGenerations(*memory_);
+  const uint64_t epoch = Memory::translation_epoch();
   if (IsMappingCurrent()) {
-    TranslationCache& cache = TranslationCacheFor(this, generations);
-    std::array<uint32_t, 2> physical_addresses{};
+    cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
+    std::array<const uint8_t*, 2> sources{};
     bool hit = true;
     for (size_t i = 0; hit && i < plan.fragment_count; ++i) {
-      hit = LookupCachedTranslation(cache.read,
-                                    plan.fragments[i].storage_effective_address,
-                                    &physical_addresses[i]) != nullptr;
+      const uint32_t storage_address =
+          plan.fragments[i].storage_effective_address;
+      const cpu::CheckedTlbEntry* entry =
+          LookupCachedTranslation(tlb.read, tlb_accessor_id_, storage_address);
+      hit = entry != nullptr;
+      sources[i] = hit ? CachedHostAddress(*entry, storage_address) : nullptr;
     }
     if (hit) {
       std::array<uint8_t, 16> canonical_bytes{};
       for (size_t i = 0; i < plan.fragment_count; ++i) {
         const UserModeGuestDataTransferFragment& fragment = plan.fragments[i];
-        std::memcpy(
-            canonical_bytes.data() + fragment.canonical_byte_offset,
-            memory_->TranslatePhysical<const uint8_t*>(physical_addresses[i]),
-            fragment.byte_count);
+        std::memcpy(canonical_bytes.data() + fragment.canonical_byte_offset,
+                    sources[i], fragment.byte_count);
       }
       UserModeGuestDataReadResult result;
       result.plan = plan;
@@ -663,14 +673,20 @@ UserModeGuestDataReadResult UserModeGuestDataAccessor::ReadAlignedCached(
   }
 
   UserModeGuestDataReadResult result = ReadAligned(operand, effective_address);
-  // Cache only what was walked under the generations looked up first: a TB
-  // flush during the walk may have changed it.
-  if (result && CurrentTranslationCacheGenerations(*memory_) == generations) {
-    TranslationCache& cache = TranslationCacheFor(this, generations);
+  // Cache only what was walked under the epoch looked up first: a TB flush
+  // during the walk may have changed it.
+  if (result && Memory::translation_epoch() == epoch) {
+    cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
     for (size_t i = 0; i < result.plan.fragment_count; ++i) {
+      const uint32_t physical_address =
+          result.translations[i]->physical_address;
       InsertCachedTranslation(
-          cache.read, result.plan.fragments[i].storage_effective_address,
-          result.translations[i]->physical_address);
+          tlb.read, tlb.read_source, tlb_accessor_id_,
+          result.plan.fragments[i].storage_effective_address, physical_address,
+          memory_->TranslatePhysical<const uint8_t*>(physical_address &
+                                                     ~0xFFFu),
+          true,
+          SourceOf(*result.translations[i], result.translations[i]->raw_pte));
     }
   }
   return result;
@@ -678,7 +694,8 @@ UserModeGuestDataReadResult UserModeGuestDataAccessor::ReadAlignedCached(
 
 UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
     UserModeGuestDataOperand operand, uint32_t effective_address,
-    std::span<const uint8_t> canonical_input) const {
+    std::span<const uint8_t> canonical_input,
+    cpu::CheckedTlb* checked_tlb) const {
   UserModeGuestDataTransferPlan plan =
       PlanUserModeGuestDataTransfer(operand, effective_address, little_endian_);
   if (!plan || !memory_ || !HasValidConfiguration() ||
@@ -687,29 +704,34 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
     return CommitSyntheticAlignedStore(operand, effective_address,
                                        canonical_input);
   }
-  const TranslationCacheGenerations generations =
-      CurrentTranslationCacheGenerations(*memory_);
+  const uint64_t epoch = Memory::translation_epoch();
   if (IsMappingCurrent()) {
-    TranslationCache& cache = TranslationCacheFor(this, generations);
-    std::array<uint32_t, 2> physical_addresses{};
-    std::array<uint8_t*, 2> alias_pages{};
-    bool hit = true;
-    for (size_t i = 0; hit && i < plan.fragment_count; ++i) {
-      const CachedTranslation* entry = LookupCachedTranslation(
-          cache.write, plan.fragments[i].storage_effective_address,
-          &physical_addresses[i]);
-      hit = entry != nullptr;
-      alias_pages[i] = hit ? entry->alias_page : nullptr;
+    cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
+    std::array<uint8_t*, 2> destinations{};
+    size_t hits = 0;
+    size_t alias_hits = 0;
+    for (size_t i = 0; i < plan.fragment_count; ++i) {
+      const uint32_t storage_address =
+          plan.fragments[i].storage_effective_address;
+      const cpu::CheckedTlbEntry* entry =
+          LookupCachedTranslation(tlb.write, tlb_accessor_id_, storage_address);
+      if (!entry) {
+        break;
+      }
+      ++hits;
+      alias_hits += (entry->tag & cpu::kCheckedTlbInlineBit) ? 1 : 0;
+      destinations[i] = CachedHostAddress(*entry, storage_address);
     }
     // The input may alias the destination.
     std::array<uint8_t, 16> canonical_bytes{};
     std::copy(canonical_input.begin(), canonical_input.end(),
               canonical_bytes.begin());
-    if (hit && alias_pages[0] && (plan.fragment_count < 2 || alias_pages[1])) {
-      // The mapping cannot be deleted while this thread runs in it.
+    if (hits == plan.fragment_count && alias_hits == hits) {
+      // Through the guest views that map the pages writable. The mapping
+      // cannot be deleted while this thread runs in it.
       for (size_t i = 0; i < plan.fragment_count; ++i) {
         const UserModeGuestDataTransferFragment& fragment = plan.fragments[i];
-        std::memcpy(alias_pages[i] + (physical_addresses[i] & 0xFFF),
+        std::memcpy(destinations[i],
                     canonical_bytes.data() + fragment.canonical_byte_offset,
                     fragment.byte_count);
       }
@@ -718,28 +740,30 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
       result.write_performed = true;
       return result;
     }
-    if (hit) {
-      // As in CommitSyntheticPlannedStore: observers first, under the global
-      // lock, then the lease that mapping retirement waits for.
+    if (hits == plan.fragment_count && alias_hits == 0) {
+      // Straight to physical memory. As in CommitSyntheticPlannedStore:
+      // observers first, under the global lock, then the lease that mapping
+      // retirement waits for.
+      const uint8_t* const physical_base =
+          memory_->TranslatePhysical<const uint8_t*>(0);
       auto global_lock = global_critical_region::AcquireDirect();
       bool notified = true;
       for (size_t i = 0; notified && i < plan.fragment_count; ++i) {
         notified =
             memory_->NotifyPhysicalMemoryWriteInvalidationCallbacksLocked(
-                global_lock, physical_addresses[i],
+                global_lock,
+                static_cast<uint32_t>(destinations[i] - physical_base),
                 plan.fragments[i].byte_count);
       }
       UserModeMappingGenerationOperationLease operation_lease(
           generation_token_);
       // A callback may have flushed the TB or retired the mapping.
-      if (notified && operation_lease &&
-          CurrentTranslationCacheGenerations(*memory_) == generations) {
+      if (notified && operation_lease && Memory::translation_epoch() == epoch) {
         for (size_t i = 0; i < plan.fragment_count; ++i) {
           const UserModeGuestDataTransferFragment& fragment = plan.fragments[i];
-          std::memcpy(
-              memory_->TranslatePhysical<uint8_t*>(physical_addresses[i]),
-              canonical_bytes.data() + fragment.canonical_byte_offset,
-              fragment.byte_count);
+          std::memcpy(destinations[i],
+                      canonical_bytes.data() + fragment.canonical_byte_offset,
+                      fragment.byte_count);
         }
         UserModeGuestDataStoreResult result;
         result.plan = plan;
@@ -754,78 +778,142 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
       CommitSyntheticAlignedStore(operand, effective_address, canonical_input);
   // The commit set the PTE's C bit if it was clear, so later stores need no
   // page-table write.
-  if (result.write_performed &&
-      CurrentTranslationCacheGenerations(*memory_) == generations) {
-    TranslationCache& cache = TranslationCacheFor(this, generations);
+  if (result.write_performed && Memory::translation_epoch() == epoch) {
+    cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
     for (size_t i = 0; i < result.plan.fragment_count; ++i) {
-      const uint32_t physical_address =
-          result.commit_translations[i]->physical_address;
+      const UserModeAddressTranslationResult& walk =
+          *result.commit_translations[i];
+      const uint32_t physical_address = walk.physical_address;
+      const uint32_t physical_page = physical_address & ~0xFFFu;
+      // Writing through a guest view raises the physical write observers the
+      // way title code does: the page faults into them only while one
+      // watches it.
+      uint8_t* const alias_page =
+          FindWritableAliasPage(*memory_, physical_page);
+      // The commit set the C bit if the walk found it clear.
       InsertCachedTranslation(
-          cache.write, result.plan.fragments[i].storage_effective_address,
-          physical_address,
-          FindWritableAliasPage(*memory_, physical_address & ~0xFFFu));
+          tlb.write, tlb.write_source, tlb_accessor_id_,
+          result.plan.fragments[i].storage_effective_address, physical_address,
+          alias_page
+              ? alias_page
+              : memory_->TranslatePhysical<const uint8_t*>(physical_page),
+          alias_page != nullptr,
+          SourceOf(walk, walk.raw_pte | (walk.changed_bit_writeback_required
+                                             ? kUserModePteChanged
+                                             : 0)));
     }
   }
   return result;
 }
 
+UserModeGuestDataStoreResult UserModeGuestDataAccessor::MemsetAlignedCached(
+    uint32_t effective_address, uint8_t value, uint32_t byte_count,
+    cpu::CheckedTlb* checked_tlb) const {
+  // The commit validates the size and alignment, which keep the range within
+  // one page.
+  if (!memory_ || little_endian_ || !StoreModeAllowsCommit(store_mode_) ||
+      (byte_count != 32 && byte_count != 128) ||
+      (effective_address & (byte_count - 1)) != 0) {
+    return CommitSyntheticAlignedMemset(effective_address, value, byte_count);
+  }
+  const uint64_t epoch = Memory::translation_epoch();
+  if (IsMappingCurrent()) {
+    const cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
+    const cpu::CheckedTlbEntry* entry =
+        LookupCachedTranslation(tlb.write, tlb_accessor_id_, effective_address);
+    if (entry && (entry->tag & cpu::kCheckedTlbInlineBit)) {
+      std::memset(CachedHostAddress(*entry, effective_address), value,
+                  byte_count);
+      UserModeGuestDataStoreResult result;
+      result.plan.operand = UserModeGuestDataOperand::kVector128;
+      result.plan.effective_address = effective_address;
+      result.plan.canonical_byte_count = byte_count;
+      result.plan.fragment_count = 1;
+      result.plan.fragments[0] = {effective_address, byte_count, 0};
+      result.write_performed = true;
+      return result;
+    }
+  }
+  UserModeGuestDataStoreResult result =
+      CommitSyntheticAlignedMemset(effective_address, value, byte_count);
+  if (result.write_performed && result.commit_translations[0] &&
+      Memory::translation_epoch() == epoch) {
+    cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
+    const UserModeAddressTranslationResult& walk =
+        *result.commit_translations[0];
+    const uint32_t physical_page = walk.physical_address & ~0xFFFu;
+    uint8_t* const alias_page = FindWritableAliasPage(*memory_, physical_page);
+    InsertCachedTranslation(
+        tlb.write, tlb.write_source, tlb_accessor_id_, effective_address,
+        walk.physical_address,
+        alias_page ? alias_page
+                   : memory_->TranslatePhysical<const uint8_t*>(physical_page),
+        alias_page != nullptr,
+        SourceOf(walk, walk.raw_pte | (walk.changed_bit_writeback_required
+                                           ? kUserModePteChanged
+                                           : 0)));
+  }
+  return result;
+}
+
 bool UserModeGuestDataAccessor::TryReadBytesCached(
-    uint32_t effective_address, std::span<uint8_t> destination) const {
-  constexpr uint32_t kPageSize = 1u << kCachedTranslationPageShift;
+    uint32_t effective_address, std::span<uint8_t> destination,
+    cpu::CheckedTlb* checked_tlb) const {
+  constexpr uint32_t kPageSize = 1u << cpu::kCheckedTlbPageShift;
   if (little_endian_ || destination.empty() || destination.size() > kPageSize ||
       !memory_ || !IsMappingCurrent()) {
     return false;
   }
-  TranslationCache& cache =
-      TranslationCacheFor(this, CurrentTranslationCacheGenerations(*memory_));
+  const cpu::CheckedTlb& tlb =
+      AcquireTlb(checked_tlb, *memory_, Memory::translation_epoch());
   const uint32_t size = static_cast<uint32_t>(destination.size());
   const uint32_t first_size =
       std::min(size, kPageSize - (effective_address & (kPageSize - 1)));
-  uint32_t first_physical = 0;
-  uint32_t second_physical = 0;
-  if (!LookupCachedTranslation(cache.read, effective_address,
-                               &first_physical) ||
-      (first_size < size &&
-       !LookupCachedTranslation(cache.read, effective_address + first_size,
-                                &second_physical))) {
+  const cpu::CheckedTlbEntry* first =
+      LookupCachedTranslation(tlb.read, tlb_accessor_id_, effective_address);
+  const cpu::CheckedTlbEntry* second =
+      first && first_size < size
+          ? LookupCachedTranslation(tlb.read, tlb_accessor_id_,
+                                    effective_address + first_size)
+          : nullptr;
+  if (!first || (first_size < size && !second)) {
     return false;
   }
-  std::memcpy(destination.data(),
-              memory_->TranslatePhysical<const uint8_t*>(first_physical),
+  std::memcpy(destination.data(), CachedHostAddress(*first, effective_address),
               first_size);
   if (first_size < size) {
     std::memcpy(destination.data() + first_size,
-                memory_->TranslatePhysical<const uint8_t*>(second_physical),
+                CachedHostAddress(*second, effective_address + first_size),
                 size - first_size);
   }
   return true;
 }
 
 bool UserModeGuestDataAccessor::TryWriteBytesCached(
-    uint32_t effective_address, std::span<const uint8_t> source) const {
-  constexpr uint32_t kPageSize = 1u << kCachedTranslationPageShift;
+    uint32_t effective_address, std::span<const uint8_t> source,
+    cpu::CheckedTlb* checked_tlb) const {
+  constexpr uint32_t kPageSize = 1u << cpu::kCheckedTlbPageShift;
   if (little_endian_ || source.empty() || source.size() > kPageSize ||
       !memory_ || !StoreModeAllowsCommit(store_mode_) || !IsMappingCurrent()) {
     return false;
   }
-  TranslationCache& cache =
-      TranslationCacheFor(this, CurrentTranslationCacheGenerations(*memory_));
+  const cpu::CheckedTlb& tlb =
+      AcquireTlb(checked_tlb, *memory_, Memory::translation_epoch());
   const uint32_t size = static_cast<uint32_t>(source.size());
   const uint32_t first_size =
       std::min(size, kPageSize - (effective_address & (kPageSize - 1)));
-  uint32_t first_physical = 0;
-  uint32_t second_physical = 0;
-  const CachedTranslation* first =
-      LookupCachedTranslation(cache.write, effective_address, &first_physical);
-  const CachedTranslation* second =
-      first_size < size
-          ? LookupCachedTranslation(cache.write, effective_address + first_size,
-                                    &second_physical)
+  const cpu::CheckedTlbEntry* first =
+      LookupCachedTranslation(tlb.write, tlb_accessor_id_, effective_address);
+  const cpu::CheckedTlbEntry* second =
+      first && first_size < size
+          ? LookupCachedTranslation(tlb.write, tlb_accessor_id_,
+                                    effective_address + first_size)
           : nullptr;
   // Only writes through a watched guest view reach the physical write
   // observers without the global lock.
-  if (!first || !first->alias_page ||
-      (first_size < size && (!second || !second->alias_page))) {
+  if (!first || !(first->tag & cpu::kCheckedTlbInlineBit) ||
+      (first_size < size &&
+       (!second || !(second->tag & cpu::kCheckedTlbInlineBit)))) {
     return false;
   }
   // The source may alias the destination.
@@ -834,29 +922,28 @@ bool UserModeGuestDataAccessor::TryWriteBytesCached(
     return false;
   }
   std::copy(source.begin(), source.end(), bytes.begin());
-  std::memcpy(first->alias_page + (first_physical & (kPageSize - 1)),
-              bytes.data(), first_size);
+  std::memcpy(CachedHostAddress(*first, effective_address), bytes.data(),
+              first_size);
   if (first_size < size) {
-    std::memcpy(second->alias_page + (second_physical & (kPageSize - 1)),
+    std::memcpy(CachedHostAddress(*second, effective_address + first_size),
                 bytes.data() + first_size, size - first_size);
   }
   return true;
 }
 
 bool UserModeGuestDataAccessor::HasCachedWriteTranslation(
-    uint32_t effective_address) const {
+    uint32_t effective_address, cpu::CheckedTlb* checked_tlb) const {
   if (!memory_ || !IsMappingCurrent()) {
     return false;
   }
   const UserModeGuestDataTransferPlan plan = PlanUserModeGuestDataTransfer(
       UserModeGuestDataOperand::kScalar8, effective_address, little_endian_);
-  uint32_t physical_address = 0;
-  return plan && LookupCachedTranslation(
-                     TranslationCacheFor(
-                         this, CurrentTranslationCacheGenerations(*memory_))
-                         .write,
-                     plan.fragments[0].storage_effective_address,
-                     &physical_address) != nullptr;
+  return plan &&
+         LookupCachedTranslation(
+             AcquireTlb(checked_tlb, *memory_, Memory::translation_epoch())
+                 .write,
+             tlb_accessor_id_,
+             plan.fragments[0].storage_effective_address) != nullptr;
 }
 
 bool UserModeGuestDataAccessor::HasValidConfiguration() const {
@@ -1728,19 +1815,28 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
   }
 
   bool TryFastLoad(uint32_t effective_address,
-                   std::span<uint8_t> canonical_bytes) const noexcept override {
+                   std::span<uint8_t> canonical_bytes,
+                   cpu::CheckedTlb* checked_tlb) const noexcept override {
     // Vectors must be aligned; scalars may be misaligned.
     return (canonical_bytes.size() <= 8 ||
             (effective_address & (canonical_bytes.size() - 1)) == 0) &&
-           accessor_.TryReadBytesCached(effective_address, canonical_bytes);
+           accessor_.TryReadBytesCached(effective_address, canonical_bytes,
+                                        checked_tlb);
   }
 
-  bool TryFastStore(
-      uint32_t effective_address,
-      std::span<const uint8_t> canonical_bytes) const noexcept override {
+  bool TryFastStore(uint32_t effective_address,
+                    std::span<const uint8_t> canonical_bytes,
+                    cpu::CheckedTlb* checked_tlb) const noexcept override {
     return (canonical_bytes.size() <= 8 ||
             (effective_address & (canonical_bytes.size() - 1)) == 0) &&
-           accessor_.TryWriteBytesCached(effective_address, canonical_bytes);
+           accessor_.TryWriteBytesCached(effective_address, canonical_bytes,
+                                         checked_tlb);
+  }
+
+  // Big-endian storage is the canonical order, so a cached translation is
+  // usable by generated code as it is.
+  uint32_t inline_tlb_accessor_id() const noexcept override {
+    return accessor_.little_endian() ? 0 : accessor_.tlb_accessor_id();
   }
 
   cpu::GuestMemoryAccessResult Access(
@@ -1768,7 +1864,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
         if (accessor_.TryReadBytesCached(
                 request.effective_address,
                 std::span<uint8_t>(result.output_bytes.data(),
-                                   request.byte_count))) {
+                                   request.byte_count),
+                request.checked_tlb)) {
           result.output_byte_count = request.byte_count;
           return result;
         }
@@ -1776,7 +1873,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
                  accessor_.TryWriteBytesCached(
                      request.effective_address,
                      std::span<const uint8_t>(request.input_bytes.data(),
-                                              request.byte_count))) {
+                                              request.byte_count),
+                     request.checked_tlb)) {
         return {};
       }
     }
@@ -1799,8 +1897,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
         // A reservation needs the walked translation.
         const UserModeGuestDataReadResult read =
             request.operation == cpu::GuestMemoryAccessOperation::kLoad
-                ? accessor_.ReadAlignedCached(*operand,
-                                              request.effective_address)
+                ? accessor_.ReadAlignedCached(
+                      *operand, request.effective_address, request.checked_tlb)
                 : accessor_.ReadAligned(*operand, request.effective_address);
         if (!read) {
           return MakeCpuAccessFailure(request, read.diagnostic,
@@ -1822,7 +1920,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
         const UserModeGuestDataStoreResult store = accessor_.StoreAlignedCached(
             *operand, request.effective_address,
             std::span<const uint8_t>(request.input_bytes.data(),
-                                     request.byte_count));
+                                     request.byte_count),
+            request.checked_tlb);
         if (!store) {
           return MakeCpuAccessFailure(request, store.diagnostic,
                                       store.physical_failure_stage);
@@ -1850,8 +1949,9 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
           }
           return result;
         }
-        const UserModeGuestDataReadResult read = accessor_.ReadAligned(
-            UserModeGuestDataOperand::kVector128, aligned_address);
+        const UserModeGuestDataReadResult read =
+            accessor_.ReadAlignedCached(UserModeGuestDataOperand::kVector128,
+                                        aligned_address, request.checked_tlb);
         if (!read) {
           return MakeCpuAccessFailure(request, read.diagnostic,
                                       read.physical_failure_stage);
@@ -1906,9 +2006,9 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
       }
       case cpu::GuestMemoryAccessOperation::kMemset: {
         const UserModeGuestDataStoreResult store =
-            accessor_.CommitSyntheticAlignedMemset(request.effective_address,
-                                                   request.fill_value,
-                                                   request.byte_count);
+            accessor_.MemsetAlignedCached(
+                request.effective_address, request.fill_value,
+                request.byte_count, request.checked_tlb);
         if (!store) {
           return MakeCpuAccessFailure(request, store.diagnostic,
                                       store.physical_failure_stage);
@@ -1970,7 +2070,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
       cpu::GuestMemoryAccessResult result;
       for (uint32_t i = 0; i < request.byte_count; ++i) {
         const UserModeGuestDataReadResult read = accessor_.ReadAlignedCached(
-            UserModeGuestDataOperand::kScalar8, request.effective_address + i);
+            UserModeGuestDataOperand::kScalar8, request.effective_address + i,
+            request.checked_tlb);
         if (!read) {
           return FailAtByte(request, i, read.diagnostic,
                             read.physical_failure_stage);
@@ -1983,7 +2084,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
     // Probe every byte before storing any, so a fault on the second page does
     // not leave the first page partially written.
     for (uint32_t i = 0; i < request.byte_count; ++i) {
-      if (accessor_.HasCachedWriteTranslation(request.effective_address + i)) {
+      if (accessor_.HasCachedWriteTranslation(request.effective_address + i,
+                                              request.checked_tlb)) {
         continue;
       }
       const UserModeGuestDataWriteProbeResult probe =
@@ -1997,7 +2099,8 @@ class UserModeCpuGuestMemoryAccessor final : public cpu::GuestMemoryAccessor {
     for (uint32_t i = 0; i < request.byte_count; ++i) {
       const UserModeGuestDataStoreResult store = accessor_.StoreAlignedCached(
           UserModeGuestDataOperand::kScalar8, request.effective_address + i,
-          std::span<const uint8_t>(request.input_bytes.data() + i, 1));
+          std::span<const uint8_t>(request.input_bytes.data() + i, 1),
+          request.checked_tlb);
       if (!store) {
         return FailAtByte(request, i, store.diagnostic,
                           store.physical_failure_stage);

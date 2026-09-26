@@ -156,6 +156,8 @@ Memory::Memory() {
 Memory::~Memory() {
   assert_true(active_memory_ == this);
   active_memory_ = nullptr;
+  // Another Memory may be created at this address.
+  AdvanceTranslationEpoch();
 
   // Uninstall the MMIO handler, as we won't be able to service more
   // requests.
@@ -598,6 +600,10 @@ cpu::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+bool Memory::OverlapsVirtualMappedRange(uint32_t begin, uint32_t end) const {
+  return mmio_handler_->OverlapsRange(begin, end);
+}
+
 bool Memory::AccessViolationCallback(
     global_unique_lock_type global_lock_locked_once, void* host_address,
     bool is_write) {
@@ -804,6 +810,29 @@ uint32_t FromPageAccess(xe::memory::PageAccess protect) {
 
   return kMemoryProtectNoAccess;
 }
+
+namespace {
+
+// Advances the translation epoch when a physical heap change is complete,
+// still under the global lock. A fill samples the epoch before it walks and
+// inserts only if it is unchanged, so no translation walked before the change
+// survives it.
+class TranslationEpochAdvance {
+ public:
+  explicit TranslationEpochAdvance(bool enabled) : enabled_(enabled) {}
+  ~TranslationEpochAdvance() {
+    if (enabled_) {
+      Memory::AdvanceTranslationEpoch();
+    }
+  }
+  TranslationEpochAdvance(const TranslationEpochAdvance&) = delete;
+  TranslationEpochAdvance& operator=(const TranslationEpochAdvance&) = delete;
+
+ private:
+  const bool enabled_;
+};
+
+}  // namespace
 
 BaseHeap::BaseHeap()
     : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
@@ -1096,6 +1125,10 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
   }
 
   auto global_lock = global_critical_region_.Acquire();
+  // A commit over committed pages may lower their protection.
+  const TranslationEpochAdvance translation_epoch_advance(
+      heap_type_ == HeapType::kGuestPhysical &&
+      (allocation_type & kMemoryAllocationCommit));
 
   // - If we are reserving, the entire range must not be already reserved.
   // - If we are committing it's ok for pages within the range to already be
@@ -1379,10 +1412,8 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   end_page_number = std::min(uint32_t(page_table_.size()) - 1, end_page_number);
 
   auto global_lock = global_critical_region_.Acquire();
-  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
-    memory_->physical_access_generation_.fetch_add(1,
-                                                   std::memory_order_acq_rel);
-  }
+  const TranslationEpochAdvance translation_epoch_advance(
+      heap_type_ == HeapType::kGuestPhysical);
 
   // Release from host.
   // TODO(benvanik): find a way to actually decommit memory;
@@ -1407,10 +1438,8 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto global_lock = global_critical_region_.Acquire();
-  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
-    memory_->physical_access_generation_.fetch_add(1,
-                                                   std::memory_order_acq_rel);
-  }
+  const TranslationEpochAdvance translation_epoch_advance(
+      heap_type_ == HeapType::kGuestPhysical);
 
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) / page_size_;
@@ -1477,10 +1506,6 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
     XELOGE("BaseHeap::Protect failed due to zero size");
     return false;
   }
-  if (heap_type_ == HeapType::kGuestPhysical && memory_) {
-    memory_->physical_access_generation_.fetch_add(1,
-                                                   std::memory_order_acq_rel);
-  }
 
   // From the VirtualProtect MSDN page:
   //
@@ -1511,6 +1536,8 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
 
   auto global_lock = global_critical_region_.Acquire();
+  const TranslationEpochAdvance translation_epoch_advance(
+      heap_type_ == HeapType::kGuestPhysical);
 
   // Ensure all pages are in the same reserved region and all are committed.
   uint32_t first_base_address = UINT_MAX;

@@ -187,6 +187,9 @@ class Processor {
   // Changes whenever checked-domain code may stop running as resolved: a
   // translation retires, or a domain's execution authorization changes.
   // Resolutions cached under one value stay valid while it holds.
+  const std::atomic<uint64_t>* checked_execution_epoch_address() const {
+    return &checked_execution_epoch_;
+  }
   uint64_t checked_execution_epoch() const {
     return checked_execution_epoch_.load(std::memory_order_acquire);
   }
@@ -415,14 +418,6 @@ class Processor {
       const std::function<bool(TranslationDomainKey)>& include_domain,
       const Module::GuestFunctionInvalidationFilter& select,
       bool invalidate_whole_domains);
-  // Where each checked page fetched from during one flush, keyed by domain
-  // and page: functions share pages, so each is read only once.
-  using CheckedPageSources =
-      std::map<std::pair<TranslationDomainKey, uint32_t>, uint32_t>;
-  // Whether every page of a checked translation still fetches from the
-  // physical bytes it was translated from.
-  bool CheckedGuestCodeSourcesCurrent(const GuestFunction& function,
-                                      CheckedPageSources* page_sources) const;
   // Records the pages a new checked translation fetched from.
   void RecordCheckedCodePages(const GuestFunction& function);
   void ForgetCheckedCodePages(TranslationDomainKey translation_domain_key);
@@ -501,9 +496,9 @@ class Processor {
   std::unordered_map<TranslationDomainKey, uint64_t>
       checked_guest_code_generations_;
   std::atomic<uint64_t> checked_execution_epoch_{1};
-  // Per checked domain, where each effective 4 KiB page holding translated
-  // code fetched from, so a TB flush probes pages rather than every
-  // translation. kUnknownInstructionSource marks a page whose source is
+  // Per checked domain, the physical 4 KiB page each effective page holding
+  // translated code fetched from, so a TB flush probes pages rather than
+  // every translation. kUnknownInstructionSource marks a page whose source is
   // unknown; a flush treats it as moved. Also counts each domain's failed
   // entries, which a flush retries.
   std::mutex checked_code_pages_mutex_;

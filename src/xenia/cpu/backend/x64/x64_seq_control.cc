@@ -83,7 +83,7 @@ struct DEBUG_BREAK_TRUE_I8
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.DebugBreak();
     e.L(skip);
   }
@@ -94,7 +94,7 @@ struct DEBUG_BREAK_TRUE_I16
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.DebugBreak();
     e.L(skip);
   }
@@ -112,7 +112,7 @@ struct DEBUG_BREAK_TRUE_I32
     } else {
       e.test(i.src1, i.src1);
       Xbyak::Label skip;
-      e.jz(skip);
+      e.jz(skip, X64Emitter::T_NEAR);
       e.DebugBreak();
       e.L(skip);
     }
@@ -131,7 +131,7 @@ struct DEBUG_BREAK_TRUE_I64
     } else {
       e.test(i.src1, i.src1);
       Xbyak::Label skip;
-      e.jz(skip);
+      e.jz(skip, X64Emitter::T_NEAR);
       e.DebugBreak();
       e.L(skip);
     }
@@ -143,7 +143,7 @@ struct DEBUG_BREAK_TRUE_F32
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.vptest(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.DebugBreak();
     e.L(skip);
   }
@@ -154,7 +154,7 @@ struct DEBUG_BREAK_TRUE_F64
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.vptest(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.DebugBreak();
     e.L(skip);
   }
@@ -248,7 +248,7 @@ struct CALL_TRUE_I8
     assert_true(i.src2.value->is_guest());
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetMxcsrMode();
@@ -260,7 +260,7 @@ struct CALL_TRUE_I16
     assert_true(i.src2.value->is_guest());
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetMxcsrMode();
@@ -272,7 +272,7 @@ struct CALL_TRUE_I32
     assert_true(i.src2.value->is_guest());
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetMxcsrMode();
@@ -284,7 +284,7 @@ struct CALL_TRUE_I64
     assert_true(i.src2.value->is_guest());
     e.test(i.src1, i.src1);
     Xbyak::Label skip;
-    e.jz(skip);
+    e.jz(skip, X64Emitter::T_NEAR);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetMxcsrMode();
@@ -375,7 +375,10 @@ struct CALL_INDIRECT_TRUE_I32
     : Sequence<CALL_INDIRECT_TRUE_I32,
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I32Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    if (e.IsFeatureEnabled(kX64FastJrcx)) {
+    // jrcxz reaches only 127 bytes, less than a checked resolution.
+    if (e.IsFeatureEnabled(kX64FastJrcx) &&
+        e.current_guest_call_dispatch_mode() !=
+            GuestCallDispatchMode::kResolverOnly) {
       e.mov(e.ecx, i.src1);
       Xbyak::Label skip;
       e.jrcxz(skip);
@@ -394,7 +397,10 @@ struct CALL_INDIRECT_TRUE_I64
     : Sequence<CALL_INDIRECT_TRUE_I64,
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    if (e.IsFeatureEnabled(kX64FastJrcx)) {
+    // jrcxz reaches only 127 bytes, less than a checked resolution.
+    if (e.IsFeatureEnabled(kX64FastJrcx) &&
+        e.current_guest_call_dispatch_mode() !=
+            GuestCallDispatchMode::kResolverOnly) {
       e.mov(e.rcx, i.src1);
       Xbyak::Label skip;
       e.jrcxz(skip);

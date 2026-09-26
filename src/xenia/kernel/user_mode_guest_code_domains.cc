@@ -1046,6 +1046,9 @@ cpu::GuestCodeInvalidationResult InvalidateLeaseDomainsLive(
 cpu::GuestCodeInvalidationResult
 UserModeGuestCodeDomainCoordinator::InvalidateMappingDomainsLive(
     UserModeMappingHandle mapping) {
+  // A TB flush drops cached data translations whether or not code can be
+  // invalidated.
+  UserModeGuestDataAccessor::InvalidateTranslationCaches();
   if (mode_ != UserModeGuestCodeDomainCoordinatorMode::kExecutionEnabled ||
       !processor_) {
     cpu::GuestCodeInvalidationResult result;
@@ -1066,6 +1069,9 @@ UserModeGuestCodeDomainCoordinator::InvalidateMappingDomainsLive(
 
 cpu::GuestCodeInvalidationResult
 UserModeGuestCodeDomainCoordinator::InvalidateAllMappingDomainsLive() {
+  // A TB flush drops cached data translations whether or not code can be
+  // invalidated.
+  UserModeGuestDataAccessor::InvalidateTranslationCaches();
   if (mode_ != UserModeGuestCodeDomainCoordinatorMode::kExecutionEnabled ||
       !processor_) {
     cpu::GuestCodeInvalidationResult result;

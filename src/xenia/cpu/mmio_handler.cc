@@ -98,6 +98,30 @@ MMIORange* MMIOHandler::LookupRange(uint32_t virtual_address) {
   return nullptr;
 }
 
+bool MMIOHandler::OverlapsRange(uint32_t begin, uint32_t end) const {
+  for (const auto& range : mapped_ranges_) {
+    const uint32_t span = ~range.mask;
+    if (range.address & span) {
+      // LookupRange can never match such a range.
+      continue;
+    }
+    if (!(span & (span + 1))) {
+      // The mask's clear bits are the low ones, so the range is exactly
+      // [address, address | span].
+      if (begin <= (range.address | span) && end >= range.address) {
+        return true;
+      }
+      continue;
+    }
+    for (uint64_t address = begin; address <= end; ++address) {
+      if ((static_cast<uint32_t>(address) & range.mask) == range.address) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
   for (const auto& range : mapped_ranges_) {
     if ((virtual_address & range.mask) == range.address) {

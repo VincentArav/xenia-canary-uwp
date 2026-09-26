@@ -185,6 +185,7 @@ struct UserModeAddressTranslationResult {
   uint32_t segment_index = 0;
 
   uint32_t root_entry_physical_address = 0;
+  uint16_t root_entry = 0;
   uint32_t pte_physical_address = 0;
   uint32_t raw_pte = 0;
 

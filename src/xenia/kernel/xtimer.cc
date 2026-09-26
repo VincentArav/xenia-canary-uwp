@@ -158,17 +158,22 @@ bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
     previous_item->Disarm();
   }
 
-  // Guest timers expire only on a clock interrupt, never sooner than the next
-  // tick. XeFu's emulated x86 clock re-arms a timer with DueTime = -1 from its
-  // own DPC, which would otherwise run back to back.
+  // Guest timers expire on clock interrupts: the first 1 ms tick boundary at or
+  // after the due time, and never before the next one. The grid is fixed, so a
+  // timer re-armed from its own DPC keeps its rate.
   using WinDuration = xe::chrono::WinSystemClock::duration;
-  const WinDuration tick =
-      std::chrono::duration_cast<WinDuration>(std::chrono::milliseconds(1));
+  const int64_t tick =
+      std::chrono::duration_cast<WinDuration>(std::chrono::milliseconds(1))
+          .count();
   const auto now = xe::chrono::WinSystemClock::now();
-  const WinDuration requested = GuestDueTimeToHost(due_time) - now;
-  const WinDuration delay =
-      tick * std::max<int64_t>(
-                 1, (requested.count() + tick.count() - 1) / tick.count());
+  const int64_t now_count = now.time_since_epoch().count();
+  const int64_t target =
+      GuestDueTimeToHost(due_time).time_since_epoch().count();
+  int64_t boundary = (target + tick - 1) / tick * tick;
+  if (boundary <= now_count) {
+    boundary = (now_count / tick + 1) * tick;
+  }
+  const WinDuration delay(boundary - now_count);
   const auto due_tp = now + delay;
 
   // The host waitable timer only provides the signal state for guest waits.

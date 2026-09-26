@@ -11,6 +11,7 @@
 
 #if !XE_PLATFORM_WIN32
 #include <signal.h>
+#include <algorithm>
 #endif
 
 #include "xenia/base/byte_stream.h"
@@ -26,6 +27,11 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
+DEFINE_bool(
+    fast_user_mode_reentry, true,
+    "Leave checked-domain code for XeFu's handler and resume it without "
+    "unwinding the host stack when nothing on it needs cleanup (Windows).",
+    "CPU");
 DEFINE_bool(ignore_thread_priorities, false,
             "Ignores game-specified thread priorities.", "Kernel");
 UPDATE_from_bool(ignore_thread_priorities, 2026, 4, 9, 12, true);
@@ -652,11 +658,10 @@ int XThread::ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
 #else
   while (next_address != 0) {
     if (setjmp(reentry_jmp_buf_) != 0) {
-      // Keep the owning permit in XThread across longjmp. A non-volatile
-      // automatic object modified after setjmp has indeterminate state after
-      // longjmp, and assigning over an indeterminate shared_ptr is undefined
-      // behavior. The staged member is outside this stack frame and remains a
-      // valid retirement pin until the post-unwind commit completes.
+      // The permit stays in XThread across longjmp: a local modified after
+      // setjmp is indeterminate after it. Dispatches above the anchor were
+      // abandoned without their decrements.
+      thread_state_->set_guest_dispatch_depth(reentry_anchor_dispatch_depth_);
       next_address = reentry_address_;
       mode = GuestExecutionMode::kRaw;
       if (!processor->CommitThreadTranslationDomain(
@@ -668,11 +673,17 @@ int XThread::ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
             thread_id_, staged_reentry_translation_domain_key_.id());
         staged_reentry_transition_permit_.reset();
         has_staged_domain_reentry_ = false;
+        reentry_anchor_armed_ = false;
         return static_cast<int>(X_STATUS_UNSUCCESSFUL);
       }
       staged_reentry_transition_permit_.reset();
       has_staged_domain_reentry_ = false;
+    } else {
+      reentry_setjmp_frame_ =
+          reinterpret_cast<const _JUMP_BUFFER*>(&reentry_jmp_buf_)->Frame;
     }
+    reentry_anchor_dispatch_depth_ = thread_state_->guest_dispatch_depth();
+    reentry_anchor_armed_ = true;
 
     if (mode == GuestExecutionMode::kCall) {
       exit_code = static_cast<int>(
@@ -683,6 +694,7 @@ int XThread::ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
     }
     next_address = 0;
   }
+  reentry_anchor_armed_ = false;
 #endif
 
   return exit_code;
@@ -739,8 +751,67 @@ bool XThread::StageTranslationDomainReentry(
                               staged_reentry_transition_permit_};
 #else
   reentry_address_ = address;
+  reinterpret_cast<_JUMP_BUFFER*>(&reentry_jmp_buf_)->Frame =
+      reentry_setjmp_frame_;
+  ++unwinding_reentry_count_;
   std::longjmp(reentry_jmp_buf_, 1);
 #endif
+}
+
+#if XE_PLATFORM_WIN32
+namespace {
+
+// A non-unwinding longjmp restores registers only. Under CFG the CRT rejects
+// a jmp_buf with no frame, and with user shadow stacks the shadow stack would
+// not follow; both then keep the unwinding path.
+bool NonUnwindingLongjmpAllowed() {
+  static const bool allowed = [] {
+    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg{};
+    if (GetProcessMitigationPolicy(GetCurrentProcess(),
+                                   ProcessControlFlowGuardPolicy, &cfg,
+                                   sizeof(cfg)) &&
+        cfg.EnableControlFlowGuard) {
+      return false;
+    }
+    PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY shadow_stack{};
+    if (GetProcessMitigationPolicy(GetCurrentProcess(),
+                                   ProcessUserShadowStackPolicy, &shadow_stack,
+                                   sizeof(shadow_stack)) &&
+        shadow_stack.EnableUserShadowStack) {
+      return false;
+    }
+    return true;
+  }();
+  return allowed;
+}
+
+}  // namespace
+#endif
+
+[[noreturn]] void XThread::ReenterPreparedFromPlainFrames(uint32_t address) {
+#if XE_PLATFORM_WIN32
+  // Only the dispatch the anchor started may be abandoned without unwinding:
+  // nested guest code (a DPC, APC or callback) sits on host frames that own
+  // state. A held global lock would never be released.
+  if (cvars::fast_user_mode_reentry && reentry_anchor_armed_ && thread_state_ &&
+      thread_state_->guest_dispatch_depth() ==
+          reentry_anchor_dispatch_depth_ + 1 &&
+      !xe::global_critical_region::mutex().owned_by_current_thread() &&
+      NonUnwindingLongjmpAllowed()) {
+    assert_true(XThread::GetCurrentThread() == this);
+    assert_true(has_staged_domain_reentry_);
+    kernel_state()->processor()->backend()->PrepareForReentry(
+        thread_state_->context());
+    reentry_address_ = address;
+    reinterpret_cast<_JUMP_BUFFER*>(&reentry_jmp_buf_)->Frame = 0;
+    if (!(++fast_reentry_count_ & 0xFFFFF)) {
+      XELOGI("XThread {:08X}: {} fast, {} unwinding user-mode reentries",
+             thread_id_, fast_reentry_count_, unwinding_reentry_count_);
+    }
+    std::longjmp(reentry_jmp_buf_, 1);
+  }
+#endif
+  ReenterPrepared(address);
 }
 
 void XThread::EnterCriticalRegion() {
@@ -784,7 +855,9 @@ int32_t XThread::QueryPriority() { return thread_->priority(); }
 static int32_t GuestPriorityToHost(int32_t guest_priority) {
   if (guest_priority >= 24) {
     return xe::threading::ThreadPriority::kHighest;
-  } else if (guest_priority >= 17) {
+  } else if (guest_priority >= 15) {
+    // A title's THREAD_PRIORITY_HIGHEST (base 13 + 2) runs ahead of its normal
+    // threads.
     return xe::threading::ThreadPriority::kAboveNormal;
   } else if (guest_priority >= 10) {
     return xe::threading::ThreadPriority::kNormal;
@@ -795,10 +868,9 @@ static int32_t GuestPriorityToHost(int32_t guest_priority) {
   }
 }
 
-void XThread::SetPriority(int32_t increment) {
-  // Clamp to valid Xenon priority range.  Negative values can arrive via
-  // KeSetBasePriorityThread (signed offset from process base).
-  int32_t clamped = std::max(increment, 0);
+void XThread::SetPriority(int32_t priority) {
+  // Clamp to the valid Xenon priority range.
+  int32_t clamped = std::clamp(priority, 0, 31);
   if (is_guest_thread()) {
     guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(clamped);
   }

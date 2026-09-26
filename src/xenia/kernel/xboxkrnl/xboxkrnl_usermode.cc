@@ -43,14 +43,16 @@ void KeFlushUserModeCurrentTb_entry(dword_t selector,
                                     const ppc_context_t& context) {
   kernel_state()->user_mode_kernel_runtime()->Flush(selector, context.value());
 }
+// Called hundreds of times a second.
 DECLARE_XBOXKRNL_EXPORT2(KeFlushUserModeCurrentTb, kMemory, kImplemented,
-                         kImportant);
+                         kHighFrequency);
 
 void KeFlushUserModeTb_entry(dword_t selector, const ppc_context_t& context) {
   // Both flush variants flush the selected mapping.
   kernel_state()->user_mode_kernel_runtime()->Flush(selector, context.value());
 }
-DECLARE_XBOXKRNL_EXPORT2(KeFlushUserModeTb, kMemory, kImplemented, kImportant);
+DECLARE_XBOXKRNL_EXPORT2(KeFlushUserModeTb, kMemory, kImplemented,
+                         kHighFrequency);
 
 void KeFlushCurrentEntireTb_entry(const ppc_context_t& context) {
   kernel_state()->user_mode_kernel_runtime()->FlushEntireTb(context.value());

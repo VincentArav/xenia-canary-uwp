@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/thread_state.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -23,8 +24,15 @@ namespace cpu {
 
 thread_local ThreadState* thread_state_ = nullptr;
 
+// Backends keep per-thread data, such as the checked TLB, before the context.
+static size_t ContextPrefixSize() {
+  const size_t granularity = xe::memory::allocation_granularity();
+  return (std::max(size_t(0xD0000), granularity) + granularity - 1) /
+         granularity * granularity;
+}
+
 static void* AllocateContext() {
-  size_t granularity = xe::memory::allocation_granularity();
+  const size_t granularity = ContextPrefixSize();
   for (unsigned pos32 = 0x40; pos32 < 8192; ++pos32) {
     /*
         we want our register which points to the context to have 0xE0000000 in
@@ -56,7 +64,7 @@ static void* AllocateContext() {
 }
 
 static void FreeContext(void* ctx) {
-  size_t granularity = xe::memory::allocation_granularity();
+  const size_t granularity = ContextPrefixSize();
   char* true_start_of_ctx =
       &reinterpret_cast<char*>(ctx)[-static_cast<ptrdiff_t>(granularity)];
   memory::DeallocFixed(true_start_of_ctx, granularity + sizeof(ppc::PPCContext),

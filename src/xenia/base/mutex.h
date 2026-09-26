@@ -37,6 +37,10 @@ class alignas(4096) xe_global_mutex {
   void lock();
   void unlock();
   bool try_lock();
+  // Whether the calling thread holds the lock.
+  bool owned_by_current_thread() const {
+    return owner_thread_ == GetCurrentThreadId();
+  }
 };
 using global_mutex_type = xe_global_mutex;
 

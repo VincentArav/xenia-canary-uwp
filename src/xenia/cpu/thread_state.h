@@ -51,6 +51,14 @@ class ThreadState {
     context_->guest_interrupt_pending = pending ? 1 : 0;
   }
 
+  // How many Processor::ResolveAndCall frames are active on this thread: each
+  // host-to-guest dispatch, including guest code run from host code (DPCs,
+  // APCs, callbacks) nested inside another. Owner thread only.
+  uint32_t guest_dispatch_depth() const { return guest_dispatch_depth_; }
+  void set_guest_dispatch_depth(uint32_t depth) {
+    guest_dispatch_depth_ = depth;
+  }
+
   static void Bind(ThreadState* thread_state);
   static ThreadState* Get();
   static uint32_t GetThreadID();
@@ -71,6 +79,7 @@ class ThreadState {
   uint32_t thread_id_ = 0;
   TranslationDomainKey translation_domain_key_;
   std::atomic<bool> guest_interrupt_pending_{false};
+  uint32_t guest_dispatch_depth_ = 0;
 
   // NOTE: must be 64b aligned for SSE ops.
   ppc::PPCContext* context_;

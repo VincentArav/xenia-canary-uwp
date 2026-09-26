@@ -796,12 +796,16 @@ Processor::InvalidateRemappedCheckedGuestCodeDomains(
       return result;
     }
   }
-  // Probe each page holding translated code once. XeFu flushes after every
-  // page it maps for x86 code and data, which almost never moves a code page,
-  // so translations are scanned only when one did or a failed entry may now
-  // resolve.
-  std::unordered_map<TranslationDomainKey, std::vector<uint32_t>> moved_pages;
-  bool retry_failed_entries = false;
+  // Probe each recorded code page once; translations are scanned only when a
+  // page moved or a failed entry may now resolve. The probes take the global
+  // lock, so they run outside checked_code_pages_mutex_.
+  struct RecordedPage {
+    TranslationDomainKey translation_domain_key;
+    uint32_t page;
+    uint32_t physical_page;
+  };
+  std::vector<RecordedPage> recorded;
+  std::vector<std::pair<TranslationDomainKey, size_t>> failed_counts;
   {
     std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
     for (TranslationDomainKey translation_domain_key :
@@ -810,59 +814,91 @@ Processor::InvalidateRemappedCheckedGuestCodeDomains(
           checked_failed_entry_counts_.find(translation_domain_key);
       if (failed_it != checked_failed_entry_counts_.end() &&
           failed_it->second) {
-        failed_it->second = 0;
-        retry_failed_entries = true;
+        failed_counts.emplace_back(translation_domain_key, failed_it->second);
       }
       auto pages_it = checked_code_pages_.find(translation_domain_key);
       if (pages_it == checked_code_pages_.end()) {
         continue;
       }
-      const ppc::GuestCodeReader* reader =
-          frontend_->guest_code_reader(translation_domain_key);
-      auto& pages = pages_it->second;
-      for (auto page_it = pages.begin(); page_it != pages.end();) {
-        uint32_t instruction = 0;
-        uint32_t source_address = ppc::kUnknownInstructionSource;
-        if (reader && page_it->second != ppc::kUnknownInstructionSource &&
-            reader->TryReadInstructionWithSource(page_it->first, &instruction,
-                                                 &source_address) &&
-            source_address == page_it->second) {
-          ++page_it;
-          continue;
-        }
-        moved_pages[translation_domain_key].push_back(page_it->first);
-        page_it = pages.erase(page_it);
+      for (const auto& [page, physical_page] : pages_it->second) {
+        recorded.push_back({translation_domain_key, page, physical_page});
       }
     }
   }
-  if (moved_pages.empty() && !retry_failed_entries) {
+  std::vector<RecordedPage> moved;
+  for (const RecordedPage& entry : recorded) {
+    const ppc::GuestCodeReader* reader =
+        frontend_->guest_code_reader(entry.translation_domain_key);
+    uint32_t instruction = 0;
+    uint32_t source_address = ppc::kUnknownInstructionSource;
+    if (reader && entry.physical_page != ppc::kUnknownInstructionSource &&
+        reader->TryReadInstructionWithSource(entry.page, &instruction,
+                                             &source_address) &&
+        source_address != ppc::kUnknownInstructionSource &&
+        (source_address & ~uint32_t(0xFFF)) == entry.physical_page) {
+      continue;
+    }
+    moved.push_back(entry);
+  }
+  if (moved.empty() && failed_counts.empty()) {
     GuestCodeInvalidationResult result;
     result.status = GuestCodeInvalidationStatus::kSuccess;
     return result;
   }
-  return InvalidateCheckedGuestCode(
+  GuestCodeInvalidationResult result = InvalidateCheckedGuestCode(
       [translation_domain_keys](TranslationDomainKey translation_domain_key) {
         return std::find(translation_domain_keys.begin(),
                          translation_domain_keys.end(),
                          translation_domain_key) !=
                translation_domain_keys.end();
       },
-      [&moved_pages](const GuestFunction& function) {
-        auto moved_it = moved_pages.find(function.translation_domain_key());
-        if (moved_it == moved_pages.end()) {
-          return false;
+      [&moved, &failed_counts](const GuestFunction& function) {
+        const TranslationDomainKey key = function.translation_domain_key();
+        // A failed translation gets a fresh chance: its code may be mapped
+        // now.
+        if (function.status() == Symbol::Status::kFailed) {
+          for (const auto& [failed_key, count] : failed_counts) {
+            if (failed_key == key) {
+              return true;
+            }
+          }
         }
         const uint32_t begin = function.address();
         const uint32_t end =
             function.has_end_address() ? function.end_address() : begin;
-        for (uint32_t page : moved_it->second) {
-          if (begin <= page + 0xFFF && end >= page) {
+        for (const RecordedPage& entry : moved) {
+          if (entry.translation_domain_key == key &&
+              begin <= entry.page + 0xFFF && end >= entry.page) {
             return true;
           }
         }
         return false;
       },
       false);
+  // Forget the moved pages and the retried failures only once their
+  // translations are gone; after a failed invalidation the next flush tries
+  // again. A page re-recorded meanwhile keeps its new source.
+  if (result) {
+    std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+    for (const RecordedPage& entry : moved) {
+      auto pages_it = checked_code_pages_.find(entry.translation_domain_key);
+      if (pages_it == checked_code_pages_.end()) {
+        continue;
+      }
+      auto page_it = pages_it->second.find(entry.page);
+      if (page_it != pages_it->second.end() &&
+          page_it->second == entry.physical_page) {
+        pages_it->second.erase(page_it);
+      }
+    }
+    for (const auto& [key, count] : failed_counts) {
+      auto failed_it = checked_failed_entry_counts_.find(key);
+      if (failed_it != checked_failed_entry_counts_.end()) {
+        failed_it->second -= std::min(failed_it->second, count);
+      }
+    }
+  }
+  return result;
 }
 
 void Processor::RecordCheckedCodePages(const GuestFunction& function) {
@@ -875,11 +911,10 @@ void Processor::RecordCheckedCodePages(const GuestFunction& function) {
   const uint32_t begin = function.address();
   const uint32_t end =
       function.has_end_address() ? function.end_address() : begin;
-  std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
-  auto& pages = checked_code_pages_[translation_domain_key];
+  // Probe outside the pages mutex: the reader takes the global lock.
+  std::vector<std::pair<uint32_t, uint32_t>> probed;
   for (uint64_t page = begin & ~uint32_t(0xFFF); page <= end; page += 0x1000) {
-    // Where the page's first word fetches from, if this translation read
-    // its bytes from there.
+    // The physical page this translation read the page's bytes from.
     uint32_t source_page = ppc::kUnknownInstructionSource;
     const uint32_t probe = std::max(static_cast<uint32_t>(page), begin);
     uint32_t instruction = 0;
@@ -889,10 +924,14 @@ void Processor::RecordCheckedCodePages(const GuestFunction& function) {
                                              &source_address) &&
         source_address != ppc::kUnknownInstructionSource &&
         function.CodeSourcesMayOverlap(source_address, source_address + 4)) {
-      source_page = source_address - (probe - static_cast<uint32_t>(page));
+      source_page = source_address & ~uint32_t(0xFFF);
     }
-    auto [page_it, inserted] =
-        pages.try_emplace(static_cast<uint32_t>(page), source_page);
+    probed.emplace_back(static_cast<uint32_t>(page), source_page);
+  }
+  std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+  auto& pages = checked_code_pages_[translation_domain_key];
+  for (const auto& [page, source_page] : probed) {
+    auto [page_it, inserted] = pages.try_emplace(page, source_page);
     if (!inserted && page_it->second != source_page) {
       // Translations of the page disagree: the next flush rechecks them.
       page_it->second = ppc::kUnknownInstructionSource;
@@ -905,46 +944,6 @@ void Processor::ForgetCheckedCodePages(
   std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
   checked_code_pages_.erase(translation_domain_key);
   checked_failed_entry_counts_.erase(translation_domain_key);
-}
-
-bool Processor::CheckedGuestCodeSourcesCurrent(
-    const GuestFunction& function, CheckedPageSources* page_sources) const {
-  if (!function.code_sources_complete() || !function.has_end_address()) {
-    return false;
-  }
-  const ppc::GuestCodeReader* reader =
-      frontend_->guest_code_reader(function.translation_domain_key());
-  if (!reader) {
-    return false;
-  }
-  // The translation read every word of [address, end_address]; one word per
-  // page shows where that page is mapped now.
-  const uint32_t begin = function.address();
-  const uint32_t end = function.end_address();
-  for (uint64_t page = begin & ~uint32_t(0xFFF); page <= end; page += 0x1000) {
-    const uint32_t probe = std::max(static_cast<uint32_t>(page), begin);
-    const uint32_t probe_offset = probe - static_cast<uint32_t>(page);
-    auto [it, inserted] = page_sources->try_emplace(
-        {function.translation_domain_key(), static_cast<uint32_t>(page)},
-        ppc::kUnknownInstructionSource);
-    if (inserted) {
-      uint32_t instruction = 0;
-      uint32_t source_address = ppc::kUnknownInstructionSource;
-      if (reader->TryReadInstructionWithSource(probe, &instruction,
-                                               &source_address) &&
-          source_address != ppc::kUnknownInstructionSource) {
-        it->second = source_address - probe_offset;
-      }
-    }
-    if (it->second == ppc::kUnknownInstructionSource) {
-      return false;
-    }
-    const uint32_t source_address = it->second + probe_offset;
-    if (!function.CodeSourcesMayOverlap(source_address, source_address + 4)) {
-      return false;
-    }
-  }
-  return true;
 }
 
 GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
@@ -1192,6 +1191,10 @@ bool Processor::ResolveAndCall(ThreadState* thread_state, uint32_t address,
                                bool deliver_fetch_faults) {
   const TranslationDomainKey translation_domain_key =
       thread_state->translation_domain_key();
+  // Counted without RAII: a nonlocal reentry skips the decrement, and the
+  // XThread landing restores the depth it recorded.
+  const uint32_t dispatch_depth = thread_state->guest_dispatch_depth();
+  thread_state->set_guest_dispatch_depth(dispatch_depth + 1);
   // A checked function retired between resolution and the call is rejected
   // before it runs; resolve its replacement and try again.
   constexpr int kMaxRetiredRetries = 16;
@@ -1207,12 +1210,14 @@ bool Processor::ResolveAndCall(ThreadState* thread_state, uint32_t address,
       }
       // Symbol not found in any module.
       XELOGCPU("Execute({:08X}): failed to find function", address);
+      thread_state->set_guest_dispatch_depth(dispatch_depth);
       return false;
     }
     const bool result = function->Call(thread_state, return_address);
     const bool retired = function->is_guest() &&
                          static_cast<GuestFunction*>(function)->is_retired();
     if (result || !retired || attempt == kMaxRetiredRetries) {
+      thread_state->set_guest_dispatch_depth(dispatch_depth);
       return result;
     }
   }

@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/user_mode_physical_memory.h"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -23,17 +24,56 @@ namespace {
 constexpr uint32_t kUserModePhysicalAddressLimit = 0x20000000;
 constexpr uint32_t kUserModePhysicalPageSize = 0x1000;
 
+// Physical pages this thread found reserved, committed and readable. They stay
+// so until the translation clear epoch advances: every physical heap change
+// advances it once complete, still under the global lock.
+struct ValidatedReadPages {
+  const Memory* memory = nullptr;
+  uint64_t clear_epoch = 0;
+  // Page number + 1, direct-mapped; 0 is empty.
+  std::array<uint32_t, 1024> pages{};
+};
+thread_local ValidatedReadPages validated_read_pages;
+
+bool IsValidatedReadPage(const Memory& memory, uint32_t page) {
+  const ValidatedReadPages& validated = validated_read_pages;
+  const uint32_t page_number = page / kUserModePhysicalPageSize;
+  return validated.memory == &memory &&
+         validated.clear_epoch == Memory::translation_clear_epoch() &&
+         validated.pages[page_number % validated.pages.size()] ==
+             page_number + 1;
+}
+
+// Under the global lock, so no heap change is in progress.
+void MarkValidatedReadPage(const Memory& memory, uint32_t page) {
+  ValidatedReadPages& validated = validated_read_pages;
+  const uint64_t clear_epoch = Memory::translation_clear_epoch();
+  if (validated.memory != &memory || validated.clear_epoch != clear_epoch) {
+    validated.pages.fill(0);
+    validated.memory = &memory;
+    validated.clear_epoch = clear_epoch;
+  }
+  const uint32_t page_number = page / kUserModePhysicalPageSize;
+  validated.pages[page_number % validated.pages.size()] = page_number + 1;
+}
+
 }  // namespace
 
 UserModePhysicalReadTransaction::UserModePhysicalReadTransaction(Memory& memory)
     : memory_(memory),
-      global_lock_(xe::global_critical_region::AcquireDirect()) {
+      global_lock_(xe::global_critical_region::AcquireDeferred()) {
   const BaseHeap* const physical_heap = memory_.GetPhysicalHeap();
   physical_heap_is_valid_ =
       physical_heap && physical_heap->heap_base() == 0 &&
       physical_heap->heap_size() == kUserModePhysicalAddressLimit &&
       physical_heap->page_size() == kUserModePhysicalPageSize &&
       physical_heap->heap_type() == HeapType::kGuestPhysical;
+}
+
+void UserModePhysicalReadTransaction::EnsureLocked() const {
+  if (!global_lock_.owns_lock()) {
+    global_lock_.lock();
+  }
 }
 
 UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
@@ -72,6 +112,13 @@ UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
   const uint32_t last_page = last_address & ~(kUserModePhysicalPageSize - 1);
   BaseHeap* const physical_heap = memory_.GetPhysicalHeap();
   for (uint32_t page = first_page;; page += kUserModePhysicalPageSize) {
+    if (IsValidatedReadPage(memory_, page)) {
+      if (page == last_page) {
+        break;
+      }
+      continue;
+    }
+    EnsureLocked();
     const std::optional<HeapPageInfo> page_info =
         physical_heap->QueryPageInfo(page);
     if (!page_info.has_value()) {
@@ -94,6 +141,7 @@ UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
       result.failing_page_physical_address = page;
       return result;
     }
+    MarkValidatedReadPage(memory_, page);
     if (page == last_page) {
       break;
     }
@@ -135,6 +183,7 @@ UserModePhysicalWriteProbeResult UserModePhysicalReadTransaction::ProbeWrite(
     return result;
   }
 
+  EnsureLocked();
   const uint32_t first_page =
       physical_address & ~(kUserModePhysicalPageSize - 1);
   const uint32_t last_page = last_address & ~(kUserModePhysicalPageSize - 1);
@@ -180,6 +229,7 @@ bool UserModePhysicalReadTransaction::NotifyWriteInvalidationCallbacks(
   if (size > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
+  EnsureLocked();
   return memory_.NotifyPhysicalMemoryWriteInvalidationCallbacksLocked(
       global_lock_, physical_address, static_cast<uint32_t>(size));
 }
@@ -187,6 +237,7 @@ bool UserModePhysicalReadTransaction::NotifyWriteInvalidationCallbacks(
 bool UserModePhysicalReadTransaction::CompareExchangeBe32Prevalidated(
     uint32_t physical_address, uint32_t expected_raw_value,
     uint32_t desired_raw_value, uint32_t* observed_raw_value) const {
+  EnsureLocked();
   assert_zero(physical_address & (alignof(uint32_t) - 1));
   assert_not_null(observed_raw_value);
   xe::be<uint32_t> expected(expected_raw_value);
@@ -206,6 +257,7 @@ bool UserModePhysicalReadTransaction::CompareExchangeBe32Prevalidated(
 bool UserModePhysicalReadTransaction::CompareExchangeRaw32Prevalidated(
     uint32_t physical_address, uint32_t expected_value, uint32_t desired_value,
     uint32_t* observed_value) const {
+  EnsureLocked();
   assert_zero(physical_address & (alignof(uint32_t) - 1));
   assert_not_null(observed_value);
   uint32_t* const physical_word =
@@ -221,6 +273,7 @@ bool UserModePhysicalReadTransaction::CompareExchangeRaw32Prevalidated(
 bool UserModePhysicalReadTransaction::CompareExchangeRaw64Prevalidated(
     uint32_t physical_address, uint64_t expected_value, uint64_t desired_value,
     uint64_t* observed_value) const {
+  EnsureLocked();
   assert_zero(physical_address & (alignof(uint64_t) - 1));
   assert_not_null(observed_value);
   uint64_t* const physical_word =
@@ -235,6 +288,7 @@ bool UserModePhysicalReadTransaction::CompareExchangeRaw64Prevalidated(
 
 void UserModePhysicalReadTransaction::CopyWritePrevalidated(
     uint32_t physical_address, std::span<const uint8_t> source) const {
+  EnsureLocked();
   assert_false(source.empty());
   assert_not_null(source.data());
   std::memcpy(memory_.TranslatePhysical<uint8_t*>(physical_address),
