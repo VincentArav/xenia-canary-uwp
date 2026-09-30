@@ -64,6 +64,10 @@ std::string_view XefuLaunchDataErrorToString(XefuLaunchDataError error);
 
 struct XefuLaunchRequest {
   std::filesystem::path xbe_host_path;
+  // An original Xbox disc image (an XISO, as xemu plays, or a full dump) to
+  // mount as the disc instead of the XBE's folder. The game is then its
+  // default.xbe and xbe_host_path is unused.
+  std::filesystem::path media_image_path;
   std::string xbe_guest_path;
   std::filesystem::path compatibility_root;
   XefuBuildId build = XefuBuildId::kRetail7b;
@@ -86,6 +90,8 @@ enum class XefuPrepareError {
 
 struct PreparedXefuLaunch {
   std::filesystem::path xbe_host_path;
+  // Set for a disc image launch; see XefuLaunchRequest.
+  std::filesystem::path media_image_path;
   std::string guest_xbe_path;
   Sha1Digest xbe_sha1{};
   uint64_t xbe_size = 0;

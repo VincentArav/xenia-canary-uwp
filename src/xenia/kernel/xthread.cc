@@ -8,6 +8,7 @@
  */
 
 #include "xenia/kernel/xthread.h"
+#include "xenia/kernel/xfile.h"
 
 #if !XE_PLATFORM_WIN32
 #include <signal.h>
@@ -658,6 +659,9 @@ int XThread::ExecuteGuestWithReentry(uint32_t address, uint64_t* args,
 #else
   while (next_address != 0) {
     if (setjmp(reentry_jmp_buf_) != 0) {
+      // longjmp restored the MXCSR saved by setjmp, not the guest's.
+      processor->backend()->RestoreGuestFloatingPointState(
+          thread_state_->context());
       // The permit stays in XThread across longjmp: a local modified after
       // setjmp is indeterminate after it. Dispatches above the anchor were
       // abandoned without their decrements.
@@ -833,6 +837,42 @@ void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
       cpu::ThreadState::Get()->context());
 
   xenia_assert(success == X_STATUS_SUCCESS);
+}
+
+void XThread::EnqueueIoCompletionApc(uint32_t normal_routine,
+                                     uint32_t normal_context,
+                                     uint32_t io_status_block, uint32_t status,
+                                     uint32_t information) {
+  if (io_status_block && kernel_state()->emulator()->mounted_xefu_session()) {
+    std::lock_guard<std::mutex> lock(io_completion_mutex_);
+    io_completions_.push_back(
+        {normal_routine, normal_context, io_status_block, status, information});
+  }
+  EnqueueApc(normal_routine, normal_context, io_status_block, 0);
+}
+
+void XThread::RestoreIoCompletionStatus(uint32_t normal_routine,
+                                        uint32_t normal_context,
+                                        uint32_t io_status_block) {
+  IoCompletion completion;
+  {
+    std::lock_guard<std::mutex> lock(io_completion_mutex_);
+    auto it = std::find_if(io_completions_.begin(), io_completions_.end(),
+                           [&](const IoCompletion& entry) {
+                             return entry.normal_routine == normal_routine &&
+                                    entry.normal_context == normal_context &&
+                                    entry.io_status_block == io_status_block;
+                           });
+    if (it == io_completions_.end()) {
+      return;
+    }
+    completion = *it;
+    io_completions_.erase(it);
+  }
+  auto* status_block =
+      memory()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
+  status_block->status = completion.status;
+  status_block->information = completion.information;
 }
 
 void XThread::SetCurrentThread() { current_xthread_tls_ = this; }

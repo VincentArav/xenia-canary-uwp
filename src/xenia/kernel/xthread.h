@@ -11,13 +11,16 @@
 #define XENIA_KERNEL_XTHREAD_H_
 
 #include <atomic>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "xenia/base/mutex.h"
 #if !XE_PLATFORM_WIN32
 #include <condition_variable>
 #include <csignal>
+#include <deque>
 #include <mutex>
 #endif
 #if XE_PLATFORM_WIN32
@@ -466,6 +469,16 @@ class XThread : public XObject, public cpu::Thread {
 
   void EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
                   uint32_t arg1, uint32_t arg2);
+  // Queues the completion APC of an I/O request that completed inline. The
+  // I/O status block is written now and, in a XeFu session, again just before
+  // the APC runs, as an asynchronous completion would write it.
+  void EnqueueIoCompletionApc(uint32_t normal_routine, uint32_t normal_context,
+                              uint32_t io_status_block, uint32_t status,
+                              uint32_t information);
+  // Called with each user APC just before its normal routine runs.
+  void RestoreIoCompletionStatus(uint32_t normal_routine,
+                                 uint32_t normal_context,
+                                 uint32_t io_status_block);
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
@@ -598,6 +611,17 @@ class XThread : public XObject, public cpu::Thread {
 #endif
 
   std::mutex thread_lock_;
+
+  struct IoCompletion {
+    uint32_t normal_routine;
+    uint32_t normal_context;
+    uint32_t io_status_block;
+    uint32_t status;
+    uint32_t information;
+  };
+  std::mutex io_completion_mutex_;
+  // In queue order: APCs run in the order they were queued.
+  std::deque<IoCompletion> io_completions_;
 };
 
 class XHostThread : public XThread {

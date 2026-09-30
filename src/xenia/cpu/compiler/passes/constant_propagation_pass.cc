@@ -213,7 +213,8 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
           }
           break;
         case OPCODE_ROUND:
-          if (i->src1.value->IsConstant()) {
+          if (i->src1.value->IsConstant() &&
+              RoundMode(i->flags) != ROUND_DYNAMIC) {
             v->set_from(i->src1.value);
             v->Round(RoundMode(i->flags));
             i->UnlinkAndNOP();

@@ -39,6 +39,8 @@ DECLARE_bool(xstorage_backend);
 
 DECLARE_bool(xstorage_user_data_backend);
 
+DECLARE_bool(xefu_live_enabled);
+
 namespace xe {
 namespace kernel {
 namespace xam {
@@ -200,6 +202,11 @@ X_HRESULT XLiveBaseApp::ExecuteDispatchMessage(uint32_t message,
       assert_true(!buffer_ptr || !buffer_length);
       // Called on startup of dashboard
       XELOGD("XLiveBaseLogonGetHR({:08X}, {:08X})", buffer_ptr, buffer_length);
+      // XeFu uses system link only when not signed in to Live.
+      if (kernel_state_->emulator()->mounted_xefu_session() &&
+          !cvars::xefu_live_enabled) {
+        return X_ONLINE_S_LOGON_DISCONNECTED;
+      }
       const uint32_t live_connection_state =
           kernel_state_->xam_state()->user_tracker()->GetLogonState();
 

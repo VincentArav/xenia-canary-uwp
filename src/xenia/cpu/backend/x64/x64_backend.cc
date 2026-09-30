@@ -1762,6 +1762,14 @@ void X64Backend::PrepareForReentry(void* ctx) {
   bctx->current_stackpoint_depth = 0;
 }
 
+void X64Backend::RestoreGuestFloatingPointState(void* ctx) {
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  // Generated code reloads MXCSR only when the mode bit changes, so load the
+  // value the bit names.
+  _mm_setcsr((bctx->flags & (1u << kX64BackendMXCSRModeBit)) ? bctx->mxcsr_vmx
+                                                             : bctx->mxcsr_fpu);
+}
+
 constexpr uint32_t mxcsr_table[8] = {
     0x1F80, 0x7F80, 0x5F80, 0x3F80, 0x9F80, 0xFF80, 0xDF80, 0xBF80,
 };

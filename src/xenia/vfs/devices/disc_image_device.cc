@@ -69,9 +69,11 @@ Entry* DiscImageDevice::ResolvePath(const std::string_view path) {
 }
 
 DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
-  // Find sector 32 of the game partition - try at a few points.
+  // Find sector 32 of the game partition - try at a few points. The last is
+  // an original Xbox (XGD1) game partition in a full disc dump; an XISO has
+  // its partition at 0.
   static constexpr size_t likely_offsets[] = {
-      0x00000000, 0x0000FB20, 0x00020600, 0x02080000, 0x0FD90000,
+      0x00000000, 0x0000FB20, 0x00020600, 0x02080000, 0x0FD90000, 0x18300000,
   };
   bool magic_found = false;
   for (size_t n = 0; n < xe::countof(likely_offsets); n++) {

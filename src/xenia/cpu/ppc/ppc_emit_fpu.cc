@@ -258,18 +258,72 @@ int InstrEmit_fcfidx(PPCHIRBuilder& f, const InstrData& i) {
   return 0;
 }
 
+// In checked code an invalid conversion sets VXCVI and VX, FX when an exception
+// bit changes from 0 to 1, and VXSNAN for a signaling NaN, and clears FR and
+// FI, as the ISA specifies. Other code keeps the unflagged conversions.
+static void EmitInvalidConversion(PPCHIRBuilder& f, Value* snan_bit) {
+  constexpr uint32_t kFx = 0x80000000;
+  constexpr uint32_t kVx = 0x20000000;
+  constexpr uint32_t kFrFi = 0x00060000;
+  constexpr uint32_t kVxcvi = 0x00000100;
+  Value* fpscr = f.LoadFPSCR();
+  Value* raised = f.LoadConstantUint32(kVxcvi);
+  if (snan_bit) {
+    raised = f.Or(raised, f.Shl(snan_bit, int8_t(24)));  // VXSNAN
+  }
+  Value* newly_raised = f.And(f.Not(fpscr), raised);
+  Value* fx = f.Shl(
+      f.ZeroExtend(f.CompareNE(newly_raised, f.LoadZeroInt32()), INT32_TYPE),
+      int8_t(31));
+  static_assert(kFx == 1u << 31);
+  fpscr = f.And(fpscr, f.LoadConstantUint32(~kFrFi));
+  fpscr = f.Or(fpscr, f.Or(raised, f.Or(f.LoadConstantUint32(kVx), fx)));
+  f.StoreFPSCR(fpscr);
+}
+
+// Whether the rounded value lies outside [min, max_exclusive).
+static Value* ConversionOutOfRange(PPCHIRBuilder& f, Value* value,
+                                   RoundMode round_mode, double min,
+                                   double max_exclusive) {
+  Value* rounded = f.Round(value, round_mode);
+  return f.Or(f.CompareSGE(rounded, f.LoadConstantFloat64(max_exclusive)),
+              f.CompareSLT(rounded, f.LoadConstantFloat64(min)));
+}
+
+// 1 for a signaling NaN (its most significant fraction bit is clear).
+static Value* SignalingNanBit(PPCHIRBuilder& f, Value* nan) {
+  Value* bits = f.Cast(nan, INT64_TYPE);
+  return f.Truncate(
+      f.And(f.Shr(f.Not(bits), int8_t(51)), f.LoadConstantUint64(1)),
+      INT32_TYPE);
+}
+
 int InstrEmit_fctidxx_(PPCHIRBuilder& f, const InstrData& i,
                        RoundMode round_mode) {
   auto end = f.NewLabel();
   auto isnan = f.NewLabel();
+  const bool flag_invalid = f.is_checked_user_mode();
   Value* v;
   f.BranchTrue(f.IsNan(f.LoadFPR(i.X.RB)), isnan);
-  v = f.Convert(f.LoadFPR(i.X.RB), INT64_TYPE, round_mode);
+  Value* b = f.LoadFPR(i.X.RB);
+  Value* out_of_range =
+      flag_invalid
+          ? ConversionOutOfRange(f, b, round_mode, -9223372036854775808.0,
+                                 9223372036854775808.0)
+          : nullptr;
+  v = f.Convert(b, INT64_TYPE, round_mode);
   v = f.Cast(v, FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
+  if (out_of_range) {
+    f.BranchFalse(out_of_range, end);
+    EmitInvalidConversion(f, nullptr);
+  }
   f.Branch(end);
   f.MarkLabel(isnan);
+  if (flag_invalid) {
+    EmitInvalidConversion(f, SignalingNanBit(f, f.LoadFPR(i.X.RB)));
+  }
   v = f.Cast(f.LoadConstantUint64(0x8000000000000000u), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
@@ -290,14 +344,27 @@ int InstrEmit_fctiwxx_(PPCHIRBuilder& f, const InstrData& i,
                        RoundMode round_mode) {
   auto end = f.NewLabel();
   auto isnan = f.NewLabel();
+  const bool flag_invalid = f.is_checked_user_mode();
   Value* v;
   f.BranchTrue(f.IsNan(f.LoadFPR(i.X.RB)), isnan);
-  v = f.Convert(f.LoadFPR(i.X.RB), INT32_TYPE, round_mode);
+  Value* b = f.LoadFPR(i.X.RB);
+  Value* out_of_range =
+      flag_invalid
+          ? ConversionOutOfRange(f, b, round_mode, -2147483648.0, 2147483648.0)
+          : nullptr;
+  v = f.Convert(b, INT32_TYPE, round_mode);
   v = f.Cast(f.SignExtend(v, INT64_TYPE), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
+  if (out_of_range) {
+    f.BranchFalse(out_of_range, end);
+    EmitInvalidConversion(f, nullptr);
+  }
   f.Branch(end);
   f.MarkLabel(isnan);
+  if (flag_invalid) {
+    EmitInvalidConversion(f, SignalingNanBit(f, f.LoadFPR(i.X.RB)));
+  }
   v = f.Cast(f.LoadConstantUint32(0x80000000u), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
@@ -371,7 +438,12 @@ int InstrEmit_fcmpu(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_mcrfs(PPCHIRBuilder& f, const InstrData& i) {
   // mcrfs CRFD, CRFS
   // CR[4*CRFD:4*CRFD+3] <- FPSCR[4*CRFS:4*CRFS+3]
-  // FPSCR[4*CRFS:4*CRFS+3] <- 0 (exception bits cleared)
+  // Only the field's exception bits are cleared, and FEX and VX recomputed;
+  // the control bits (the enables, NI and RN) are kept.
+  constexpr uint32_t kExceptionBits = 0x9FF80700;
+  constexpr uint32_t kInvalidBits = 0x01F80700;  // VXSNAN-VXVC, VXSOFT-VXCVI
+  constexpr uint32_t kFex = 0x40000000;
+  constexpr uint32_t kVx = 0x20000000;
 
   uint32_t crfd = i.X.RT >> 2;  // Destination CR field
   uint32_t crfs = i.X.RA >> 2;  // Source FPSCR field
@@ -387,9 +459,26 @@ int InstrEmit_mcrfs(PPCHIRBuilder& f, const InstrData& i) {
   // Store to CR field (need to shift to proper position in 64-bit CR)
   f.StoreCR(crfd, f.Shl(f.ZeroExtend(fpscr_field, INT64_TYPE), 4 * (7 - crfd)));
 
-  // Clear the FPSCR field (set to 0)
-  uint32_t mask = ~(0xF << shift);
-  f.StoreFPSCR(f.And(fpscr, f.LoadConstantUint32(mask)));
+  const uint32_t clear = (0xFu << shift) & kExceptionBits;
+  if (clear) {
+    fpscr = f.And(fpscr, f.LoadConstantUint32(~(clear | kFex | kVx)));
+    Value* vx =
+        f.Shl(f.ZeroExtend(
+                  f.CompareNE(f.And(fpscr, f.LoadConstantUint32(kInvalidBits)),
+                              f.LoadZeroInt32()),
+                  INT32_TYPE),
+              int8_t(29));
+    fpscr = f.Or(fpscr, vx);
+    // VX, OX, UX, ZX and XX (bits 2-6) shifted right 22 line up with their
+    // enables VE, OE, UE, ZE and XE (bits 24-28).
+    Value* fex = f.Shl(
+        f.ZeroExtend(f.CompareNE(f.And(f.And(f.Shr(fpscr, int8_t(22)), fpscr),
+                                       f.LoadConstantUint32(0xF8)),
+                                 f.LoadZeroInt32()),
+                     INT32_TYPE),
+        int8_t(30));
+    f.StoreFPSCR(f.Or(fpscr, fex));
+  }
 
   return 0;
 }

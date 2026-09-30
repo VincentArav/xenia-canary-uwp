@@ -218,6 +218,7 @@ class X64Backend : public Backend {
   virtual void InitializeBackendContext(void* ctx) override;
   virtual void DeinitializeBackendContext(void* ctx) override;
   virtual void PrepareForReentry(void* ctx) override;
+  void RestoreGuestFloatingPointState(void* ctx) override;
   X64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));

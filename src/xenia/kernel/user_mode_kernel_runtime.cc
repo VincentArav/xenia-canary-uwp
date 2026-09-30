@@ -29,6 +29,7 @@
 #include "xenia/kernel/user_mode_enter.h"
 #include "xenia/kernel/user_mode_guest_code_domains.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include "xenia/kernel/xefu_link.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 
@@ -1343,6 +1344,8 @@ void UserModeKernelRuntime::OnThreadDestroyed(uint32_t thread_id) {
 }
 
 void UserModeKernelRuntime::ResetTitle() {
+  // The link's receive DPC must not outlive the title's threads.
+  xefu_link::Shutdown();
   std::vector<uint32_t> exception_records;
   {
     std::lock_guard<std::mutex> lock(mutex_);

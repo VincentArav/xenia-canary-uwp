@@ -108,6 +108,15 @@ class XLiveAPI {
 
   bool IsConnectedToServer() const;
 
+  // XeFu system link rendezvous (XLiveAPI_xefu_link.cpp), listed under the
+  // original Xbox title's ID.
+  bool XefuLinkRegister(uint32_t title_id, uint64_t session_id,
+                        const std::string& title_name, uint16_t port);
+  // The other instances' host:port, excluding own_session_id.
+  std::vector<std::pair<std::string, uint16_t>> XefuLinkPeers(
+      uint32_t title_id, uint64_t own_session_id);
+  void XefuLinkUnregister(uint32_t title_id, uint64_t session_id);
+
   uint16_t GetPlayerPort() const;
 
   int8_t GetVersionStatus() const;

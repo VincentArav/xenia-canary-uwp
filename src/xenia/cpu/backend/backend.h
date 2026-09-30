@@ -91,6 +91,9 @@ class Backend {
   // Called by XThread::Reenter just before the non-local transfer, to drop
   // state tied to the old guest stack (x64 resets its stackpoint index).
   virtual void PrepareForReentry(void* ctx) {}
+  // Called where a non-local transfer lands, to reload the guest
+  // floating-point control state that longjmp replaced.
+  virtual void RestoreGuestFloatingPointState(void* ctx) {}
 
   // returns true if populated st
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {

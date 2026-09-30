@@ -18,6 +18,7 @@
 #include "third_party/crypto/TinySHA1.hpp"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/mapped_memory.h"
+#include "xenia/xefu/xefu_media.h"
 
 namespace xe::xefu {
 namespace {
@@ -140,46 +141,69 @@ PrepareXefuLaunchResult PrepareXefuLaunch(
   }
 
   // Parse and hash the same bytes.
-  std::error_code xbe_status_error;
-  const std::filesystem::file_status xbe_status =
-      std::filesystem::symlink_status(request.xbe_host_path, xbe_status_error);
-  if (xbe_status_error || !std::filesystem::is_regular_file(xbe_status) ||
-      std::filesystem::is_symlink(xbe_status) ||
-      filesystem::IsSymlinkOrReparsePoint(request.xbe_host_path)) {
-    result.error = XefuPrepareError::kInvalidXbe;
-    result.xbe_error =
-        xbe_status_error == std::errc::no_such_file_or_directory ||
-                (!xbe_status_error &&
-                 xbe_status.type() == std::filesystem::file_type::not_found)
-            ? XbeMetadataError::kFileNotFound
-            : XbeMetadataError::kReadFailed;
-    return result;
-  }
-  std::unique_ptr<MappedMemory> xbe_mapping =
-      MappedMemory::Open(request.xbe_host_path, MappedMemory::Mode::kRead);
-  if (!xbe_mapping) {
-    result.error = XefuPrepareError::kInvalidXbe;
-    result.xbe_error = filesystem::GetInfo(request.xbe_host_path)
-                           ? XbeMetadataError::kReadFailed
-                           : XbeMetadataError::kFileNotFound;
-    return result;
-  }
-  // POSIX read mappings are shared, so another process may change their pages
-  // after a metadata read. Parse and hash one owned byte image instead; mount
-  // revalidation will reject a file that changes after this copy is made.
   std::vector<uint8_t> xbe_snapshot;
-  if (xbe_mapping->size() > xbe_snapshot.max_size()) {
-    result.error = XefuPrepareError::kInvalidXbe;
-    result.xbe_error = XbeMetadataError::kReadFailed;
-    return result;
-  }
-  try {
-    xbe_snapshot.assign(xbe_mapping->data(),
-                        xbe_mapping->data() + xbe_mapping->size());
-  } catch (const std::bad_alloc&) {
-    result.error = XefuPrepareError::kInvalidXbe;
-    result.xbe_error = XbeMetadataError::kReadFailed;
-    return result;
+  if (!request.media_image_path.empty()) {
+    // The same checks as a loose XBE: one regular file, not a link.
+    std::error_code image_status_error;
+    const std::filesystem::file_status image_status =
+        std::filesystem::symlink_status(request.media_image_path,
+                                        image_status_error);
+    if (image_status_error || !std::filesystem::is_regular_file(image_status) ||
+        filesystem::IsSymlinkOrReparsePoint(request.media_image_path)) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error = std::filesystem::exists(request.media_image_path)
+                             ? XbeMetadataError::kReadFailed
+                             : XbeMetadataError::kFileNotFound;
+      return result;
+    }
+    XefuDiscImageXbe disc_xbe = ReadXefuDiscImageXbe(request.media_image_path);
+    if (!disc_xbe) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error = disc_xbe.error;
+      return result;
+    }
+    xbe_snapshot = std::move(disc_xbe.bytes);
+  } else {
+    std::error_code xbe_status_error;
+    const std::filesystem::file_status xbe_status =
+        std::filesystem::symlink_status(request.xbe_host_path,
+                                        xbe_status_error);
+    if (xbe_status_error || !std::filesystem::is_regular_file(xbe_status) ||
+        std::filesystem::is_symlink(xbe_status) ||
+        filesystem::IsSymlinkOrReparsePoint(request.xbe_host_path)) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error =
+          xbe_status_error == std::errc::no_such_file_or_directory ||
+                  (!xbe_status_error &&
+                   xbe_status.type() == std::filesystem::file_type::not_found)
+              ? XbeMetadataError::kFileNotFound
+              : XbeMetadataError::kReadFailed;
+      return result;
+    }
+    std::unique_ptr<MappedMemory> xbe_mapping =
+        MappedMemory::Open(request.xbe_host_path, MappedMemory::Mode::kRead);
+    if (!xbe_mapping) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error = filesystem::GetInfo(request.xbe_host_path)
+                             ? XbeMetadataError::kReadFailed
+                             : XbeMetadataError::kFileNotFound;
+      return result;
+    }
+    // Another process can change a mapping's pages, so parse and hash a copy;
+    // mounting rejects a file changed after it.
+    if (xbe_mapping->size() > xbe_snapshot.max_size()) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error = XbeMetadataError::kReadFailed;
+      return result;
+    }
+    try {
+      xbe_snapshot.assign(xbe_mapping->data(),
+                          xbe_mapping->data() + xbe_mapping->size());
+    } catch (const std::bad_alloc&) {
+      result.error = XefuPrepareError::kInvalidXbe;
+      result.xbe_error = XbeMetadataError::kReadFailed;
+      return result;
+    }
   }
   const std::span<const uint8_t> xbe_bytes(xbe_snapshot);
   XbeMetadataResult xbe_result =
@@ -237,6 +261,7 @@ PrepareXefuLaunchResult PrepareXefuLaunch(
   }
 
   result.launch.xbe_host_path = request.xbe_host_path;
+  result.launch.media_image_path = request.media_image_path;
   result.launch.guest_xbe_path =
       std::move(launch_data_result.normalized_guest_xbe_path);
   result.launch.xbe_sha1 = xbe_sha1;

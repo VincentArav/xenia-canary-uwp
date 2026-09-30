@@ -12,6 +12,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xconfig.h"
+#include "xenia/kernel/xefu_link.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -31,6 +32,14 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category,
       return X_STATUS_BUFFER_TOO_SMALL;
     }
     kernel_state()->xconfig()->ReadSetting(category, setting_id, buffer);
+    // XeFu sessions see retail flag 0x4 (network card on); the stored
+    // setting is unchanged.
+    if (category == XCONFIG_USER_CATEGORY &&
+        setting_id == XCONFIG_USER_RETAIL_FLAGS && buffer_size >= 4 &&
+        xefu_link::IsEnabled(kernel_state())) {
+      auto* flags = static_cast<xe::be<uint32_t>*>(buffer);
+      *flags = *flags | 0x4u;
+    }
   }
 
   if (required_size) {

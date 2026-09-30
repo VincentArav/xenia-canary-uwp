@@ -253,6 +253,11 @@ class Emulator {
   // Launches a prepared XeFu session.
   X_STATUS LaunchXefuTitle(const xefu::XefuLaunchRequest& request);
 
+  // Launches an original Xbox game through XeFu from a loose XBE (its folder
+  // is the disc) or from a disc image (an XISO, as xemu plays, or a full
+  // dump), choosing the XeFu build per xefu_build.
+  X_STATUS LaunchXefuGame(const std::filesystem::path& path, bool disc_image);
+
   // Launches a game from a .xex file by mounting the containing folder as if it
   // was an extracted STFS container.
   X_STATUS LaunchXexFile(const std::filesystem::path& path);

@@ -499,6 +499,10 @@ struct ROUND_F64 : Sequence<ROUND_F64, I<OPCODE_ROUND, F64Op, F64Op>> {
       case ROUND_TO_POSITIVE_INFINITY:
         e.vroundsd(i.dest, src1, 0b00000010);
         break;
+      case ROUND_DYNAMIC:
+        // Bit 2 selects MXCSR.RC, which follows FPSCR[RN] in Fpu mode.
+        e.vroundsd(i.dest, src1, 0b00000100);
+        break;
     }
   }
 };

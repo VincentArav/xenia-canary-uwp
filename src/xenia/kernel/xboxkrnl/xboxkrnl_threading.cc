@@ -1468,6 +1468,9 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
     }
 
     if (normal_routine) {
+      if (XThread* thread = XThread::GetCurrentThread()) {
+        thread->RestoreIoCompletionStatus(normal_routine, normal_context, arg1);
+      }
       uint64_t normal_args[] = {normal_context, arg1, arg2};
       ctx->processor->Execute(ctx->thread_state, normal_routine, normal_args,
                               xe::countof(normal_args));

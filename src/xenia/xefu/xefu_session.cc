@@ -15,11 +15,14 @@
 #include <string>
 #include <vector>
 
+#include "third_party/crypto/TinySHA1.hpp"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/utf8.h"
+#include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/virtual_file_system.h"
+#include "xenia/xefu/xefu_media.h"
 
 namespace xe::xefu {
 namespace {
@@ -166,27 +169,51 @@ XefuSessionMountResult MountPreparedXefuSession(
     return MakeError(XefuSessionMountError::kGuestMediaPathMismatch);
   }
 
-  if (!RevalidateFile(prepared_launch.xbe_host_path, prepared_launch.xbe_size,
-                      prepared_launch.xbe_sha1, std::nullopt)) {
-    return MakeError(XefuSessionMountError::kXbeChanged);
-  }
-
-  // Resolve the selected media file to one exact native directory entry before
-  // constructing the full safe read-only media tree. The tree builder also
-  // rejects case-insensitive collisions globally; this early check preserves a
-  // precise error for ambiguity in the selected XBE itself.
-  std::vector<std::string> native_media_names;
-  const std::string selected_media_name =
-      path_to_utf8(prepared_launch.xbe_host_path.filename());
-  for (const filesystem::FileInfo& entry :
-       filesystem::ListFiles(prepared_launch.xbe_host_path.parent_path())) {
-    const std::string entry_name = path_to_utf8(entry.name);
-    if (utf8::equal_case(entry_name, selected_media_name)) {
-      native_media_names.push_back(entry_name);
+  const bool disc_image = !prepared_launch.media_image_path.empty();
+  // A disc image is opened once, and its default.xbe is revalidated through
+  // that same device, so the validated bytes are the ones the game reads.
+  std::unique_ptr<vfs::Device> disc_device;
+  std::string selected_media_name;
+  if (disc_image) {
+    disc_device = std::make_unique<vfs::DiscImageDevice>(
+        kXefuMediaDevice, prepared_launch.media_image_path);
+    if (filesystem::IsSymlinkOrReparsePoint(prepared_launch.media_image_path) ||
+        !disc_device->Initialize()) {
+      return MakeError(XefuSessionMountError::kMediaMountFailed);
     }
-  }
-  if (native_media_names.size() != 1) {
-    return MakeError(XefuSessionMountError::kMediaFilenameAmbiguous);
+    XefuDiscImageXbe disc_xbe = ReadXefuDiscImageXbe(disc_device.get());
+    Sha1Digest disc_xbe_sha1{};
+    if (disc_xbe) {
+      sha1::SHA1 hasher;
+      hasher.processBytes(disc_xbe.bytes.data(), disc_xbe.bytes.size());
+      hasher.finalize(disc_xbe_sha1.data());
+    }
+    if (!disc_xbe || disc_xbe.bytes.size() != prepared_launch.xbe_size ||
+        disc_xbe_sha1 != prepared_launch.xbe_sha1) {
+      return MakeError(XefuSessionMountError::kXbeChanged);
+    }
+    selected_media_name = std::move(disc_xbe.name);
+  } else {
+    if (!RevalidateFile(prepared_launch.xbe_host_path, prepared_launch.xbe_size,
+                        prepared_launch.xbe_sha1, std::nullopt)) {
+      return MakeError(XefuSessionMountError::kXbeChanged);
+    }
+
+    // Resolve the XBE to one directory entry first, for a precise error when
+    // its name is ambiguous; the tree builder rejects any case collision.
+    std::vector<std::string> native_media_names;
+    selected_media_name =
+        path_to_utf8(prepared_launch.xbe_host_path.filename());
+    for (const filesystem::FileInfo& entry :
+         filesystem::ListFiles(prepared_launch.xbe_host_path.parent_path())) {
+      const std::string entry_name = path_to_utf8(entry.name);
+      if (utf8::equal_case(entry_name, selected_media_name)) {
+        native_media_names.push_back(entry_name);
+      }
+    }
+    if (native_media_names.size() != 1) {
+      return MakeError(XefuSessionMountError::kMediaFilenameAmbiguous);
+    }
   }
   for (const ValidatedXefuAsset& asset : prepared_launch.assets.assets) {
     if (!RevalidateFile(asset.path, asset.size, asset.sha1, asset.sha256)) {
@@ -197,11 +224,13 @@ XefuSessionMountResult MountPreparedXefuSession(
       std::string_view(prepared_launch.guest_xbe_path)
           .substr(kMediaPrefix.size());
   if (guest_media_name.find('\\') != std::string_view::npos ||
-      !utf8::equal_case(
-          guest_media_name,
-          path_to_utf8(prepared_launch.xbe_host_path.filename()))) {
+      !utf8::equal_case(guest_media_name, selected_media_name)) {
     return MakeError(XefuSessionMountError::kGuestMediaPathMismatch);
   }
+  // The media tree: the XBE's folder, or the disc image file itself.
+  const std::filesystem::path media_host_path =
+      disc_image ? prepared_launch.media_image_path
+                 : prepared_launch.xbe_host_path.parent_path();
 
   // XeFu writes files in the system-partition Compatibility folder
   // (X:\config.bin) and in Partition1\Compatibility (its Y: link). Both live
@@ -222,8 +251,7 @@ XefuSessionMountResult MountPreparedXefuSession(
          {writable_compatibility_overlay, writable_partition1_compatibility}) {
       if (filesystem::HostPathsOverlap(writable_path,
                                        prepared_launch.assets.root) ||
-          filesystem::HostPathsOverlap(
-              writable_path, prepared_launch.xbe_host_path.parent_path()) ||
+          filesystem::HostPathsOverlap(writable_path, media_host_path) ||
           (prepared_launch.external_config &&
            filesystem::HostPathsOverlap(
                writable_path,
@@ -286,14 +314,17 @@ XefuSessionMountResult MountPreparedXefuSession(
   }
   mount_group.devices.push_back(std::move(raw_harddisk_device));
 
-  auto media_device = std::make_unique<vfs::HostPathDevice>(
-      kXefuMediaDevice, prepared_launch.xbe_host_path.parent_path(), true,
-      std::vector<std::string>{},
-      vfs::HostPathDevice::TraversalPolicy::kSafeReadOnlyTree);
-  if (!media_device->Initialize()) {
-    return MakeError(XefuSessionMountError::kMediaMountFailed);
+  if (disc_device) {
+    mount_group.devices.push_back(std::move(disc_device));
+  } else {
+    auto media_device = std::make_unique<vfs::HostPathDevice>(
+        kXefuMediaDevice, media_host_path, true, std::vector<std::string>{},
+        vfs::HostPathDevice::TraversalPolicy::kSafeReadOnlyTree);
+    if (!media_device->Initialize()) {
+      return MakeError(XefuSessionMountError::kMediaMountFailed);
+    }
+    mount_group.devices.push_back(std::move(media_device));
   }
-  mount_group.devices.push_back(std::move(media_device));
 
   mount_group.symbolic_links.push_back({std::string(kXefuHddxSymbolicLink),
                                         std::string(kXefuSystemPartitionPath)});

@@ -203,8 +203,10 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
       if ((uint32_t)apc_routine_ptr & ~1) {
         if (apc_context && result == X_STATUS_SUCCESS) {
           auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
-                             apc_context, io_status_block, 0);
+          thread->EnqueueIoCompletionApc(
+              static_cast<uint32_t>(apc_routine_ptr) & ~1u, apc_context,
+              io_status_block.guest_address(), result,
+              io_status_block ? uint32_t(io_status_block->information) : 0);
         }
       }
 
@@ -298,8 +300,10 @@ dword_result_t NtReadFileScatter_entry(
       if ((uint32_t)apc_routine_ptr & ~1) {
         if (apc_context) {
           auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
-                             apc_context, io_status_block, 0);
+          thread->EnqueueIoCompletionApc(
+              static_cast<uint32_t>(apc_routine_ptr) & ~1u, apc_context,
+              io_status_block.guest_address(), result,
+              io_status_block ? uint32_t(io_status_block->information) : 0);
         }
       }
 
@@ -393,8 +397,10 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
       if ((uint32_t)apc_routine & ~1) {
         if (apc_context) {
           auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u,
-                             apc_context, io_status_block, 0);
+          thread->EnqueueIoCompletionApc(
+              static_cast<uint32_t>(apc_routine) & ~1u, apc_context,
+              io_status_block.guest_address(), result,
+              io_status_block ? uint32_t(io_status_block->information) : 0);
         }
       }
 
