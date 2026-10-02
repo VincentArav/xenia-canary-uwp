@@ -518,7 +518,8 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
 // Send data to the server
 std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
                                                        const uint8_t* data,
-                                                       size_t data_size) {
+                                                       size_t data_size,
+                                                       const uint32_t timeout) {
   response_data chunk = {};
   CURL* curl_handle = curl_easy_init();
   CURLcode result;
@@ -539,6 +540,9 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
 
   curl_slist* headers = NULL;
 
+  if (timeout > 0) {
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, timeout);
+  }
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "POST");
   curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xenia");
@@ -586,7 +590,8 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
 }
 
 // Delete data from the server
-std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
+std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(
+    std::string endpoint, const uint32_t timeout) {
   response_data chunk = {};
   CURL* curl_handle = curl_easy_init();
   CURLcode result;
@@ -610,6 +615,9 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
   headers = curl_slist_append(headers, "Accept: application/json");
   headers = curl_slist_append(headers, "charset: utf-8");
 
+  if (timeout > 0) {
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, timeout);
+  }
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
 
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE");

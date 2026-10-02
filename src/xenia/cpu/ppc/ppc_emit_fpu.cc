@@ -321,13 +321,20 @@ int InstrEmit_fctidxx_(PPCHIRBuilder& f, const InstrData& i,
   }
   f.Branch(end);
   f.MarkLabel(isnan);
-  if (flag_invalid) {
-    EmitInvalidConversion(f, SignalingNanBit(f, f.LoadFPR(i.X.RB)));
-  }
+  // Read the input before the result may overwrite it (RT == RB).
+  Value* snan_bit =
+      flag_invalid ? SignalingNanBit(f, f.LoadFPR(i.X.RB)) : nullptr;
   v = f.Cast(f.LoadConstantUint64(0x8000000000000000u), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
+  if (flag_invalid) {
+    // After UpdateFPSCR, which clears FEX and VX.
+    EmitInvalidConversion(f, snan_bit);
+  }
   f.MarkLabel(end);
+  if (flag_invalid && i.X.Rc) {
+    f.CopyFPSCRToCR1();
+  }
   return 0;
 }
 
@@ -362,13 +369,20 @@ int InstrEmit_fctiwxx_(PPCHIRBuilder& f, const InstrData& i,
   }
   f.Branch(end);
   f.MarkLabel(isnan);
-  if (flag_invalid) {
-    EmitInvalidConversion(f, SignalingNanBit(f, f.LoadFPR(i.X.RB)));
-  }
+  // Read the input before the result may overwrite it (RT == RB).
+  Value* snan_bit =
+      flag_invalid ? SignalingNanBit(f, f.LoadFPR(i.X.RB)) : nullptr;
   v = f.Cast(f.LoadConstantUint32(0x80000000u), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
+  if (flag_invalid) {
+    // After UpdateFPSCR, which clears FEX and VX.
+    EmitInvalidConversion(f, snan_bit);
+  }
   f.MarkLabel(end);
+  if (flag_invalid && i.X.Rc) {
+    f.CopyFPSCRToCR1();
+  }
   return 0;
 }
 

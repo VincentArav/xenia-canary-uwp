@@ -8,7 +8,6 @@
  */
 
 #include "xenia/kernel/xthread.h"
-#include "xenia/kernel/xfile.h"
 
 #if !XE_PLATFORM_WIN32
 #include <signal.h>
@@ -27,6 +26,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include "xenia/kernel/xfile.h"
 
 DEFINE_bool(
     fast_user_mode_reentry, true,

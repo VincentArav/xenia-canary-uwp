@@ -12,7 +12,9 @@
 #include <memory>
 
 #include "xenia/base/filesystem.h"
+#include "xenia/base/mapped_memory.h"
 #include "xenia/vfs/devices/disc_image_device.h"
+#include "xenia/vfs/devices/disc_image_entry.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
 #include "xenia/xbox.h"
@@ -63,6 +65,15 @@ XefuDiscImageXbe ReadXefuDiscImageXbe(vfs::Device* device) {
   if (entry->size() > kXefuDiscXbeMaxSize) {
     result.error = XbeMetadataError::kReadFailed;
     return result;
+  }
+  // A truncated image: the entry's data must lie inside the mapping.
+  if (auto* disc_entry = dynamic_cast<vfs::DiscImageEntry*>(entry)) {
+    const MappedMemory* mapping = disc_entry->mmap();
+    if (!mapping || disc_entry->data_offset() > mapping->size() ||
+        disc_entry->data_size() > mapping->size() - disc_entry->data_offset()) {
+      result.error = XbeMetadataError::kReadFailed;
+      return result;
+    }
   }
   vfs::File* file = nullptr;
   if (entry->Open(filesystem::FileAccess::kFileReadData, &file) !=

@@ -323,11 +323,14 @@ class XLiveAPI {
   std::unique_ptr<HTTPResponseObjectJSON> Get(const std::string endpoint,
                                               const uint32_t timeout = 0);
 
+  // A timeout of 0 (seconds) leaves libcurl's defaults.
   std::unique_ptr<HTTPResponseObjectJSON> Post(const std::string endpoint,
                                                const uint8_t* data,
-                                               size_t data_size = 0);
+                                               size_t data_size = 0,
+                                               const uint32_t timeout = 0);
 
-  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint);
+  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint,
+                                                 const uint32_t timeout = 0);
 
   std::vector<HTTPResponseObjectJSON> GetMulti(
       std::vector<std::string> urls, const uint32_t per_request_timeout = 0);

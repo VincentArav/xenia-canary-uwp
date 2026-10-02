@@ -35,6 +35,10 @@ X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   size_t real_offset = entry_->data_offset() + byte_offset;
   size_t real_length =
       std::min(buffer.size(), entry_->data_size() - byte_offset);
+  // A truncated image: never copy past the end of the mapping.
+  real_length =
+      std::min(real_length, entry_->mmap()->size() -
+                                std::min(real_offset, entry_->mmap()->size()));
   std::memcpy(buffer.data(), entry_->mmap()->data() + real_offset, real_length);
   *out_bytes_read = real_length;
   return X_STATUS_SUCCESS;

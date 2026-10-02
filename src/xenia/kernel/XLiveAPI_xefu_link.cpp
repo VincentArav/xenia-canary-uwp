@@ -20,6 +20,10 @@ using namespace rapidjson;
 namespace xe {
 namespace kernel {
 
+// Seconds. The link calls these from its own thread, which title shutdown
+// joins.
+constexpr uint32_t kXefuLinkHttpTimeout = 5;
+
 bool XLiveAPI::XefuLinkRegister(uint32_t title_id, uint64_t session_id,
                                 const std::string& title_name, uint16_t port) {
   SessionObjectJSON session;
@@ -40,9 +44,9 @@ bool XLiveAPI::XefuLinkRegister(uint32_t title_id, uint64_t session_id,
   if (!session.Serialize(body)) {
     return false;
   }
-  auto response =
-      Post(BuildEndpoint(fmt::format("title/{:08X}/sessions", title_id)),
-           reinterpret_cast<const uint8_t*>(body.c_str()));
+  auto response = Post(
+      BuildEndpoint(fmt::format("title/{:08X}/sessions", title_id)),
+      reinterpret_cast<const uint8_t*>(body.c_str()), 0, kXefuLinkHttpTimeout);
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_CREATED) {
     XELOGW("XeFu link: the netplay server did not list this game ({})",
            response->Message());
@@ -55,7 +59,8 @@ std::vector<std::pair<std::string, uint16_t>> XLiveAPI::XefuLinkPeers(
     uint32_t title_id, uint64_t own_session_id) {
   std::vector<std::pair<std::string, uint16_t>> peers;
   auto response =
-      Get(BuildEndpoint(fmt::format("title/{:08X}/sessions/search", title_id)));
+      Get(BuildEndpoint(fmt::format("title/{:08X}/sessions/search", title_id)),
+          kXefuLinkHttpTimeout);
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_OK) {
     return peers;
   }
@@ -81,8 +86,9 @@ std::vector<std::pair<std::string, uint16_t>> XLiveAPI::XefuLinkPeers(
 }
 
 void XLiveAPI::XefuLinkUnregister(uint32_t title_id, uint64_t session_id) {
-  Delete(BuildEndpoint(
-      fmt::format("title/{:08X}/sessions/{:016x}", title_id, session_id)));
+  Delete(BuildEndpoint(fmt::format("title/{:08X}/sessions/{:016x}", title_id,
+                                   session_id)),
+         kXefuLinkHttpTimeout);
 }
 
 }  // namespace kernel

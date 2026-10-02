@@ -24,7 +24,6 @@
 #include "xenia/base/platform.h"
 // clang-format on
 
-#include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/function.h"
@@ -373,10 +372,10 @@ void Link::RendezvousLoop() {
 
   UPnP* upnp = emulator->GetUPnP();
   if (upnp && upnp->IsActive()) {
-    // AddPort takes the internal port byte-swapped.
+    // In host byte order, as netplay's own bind path passes it.
     upnp->AddPortAsync(
         emulator->GetNetworkAdapterManager()->GetSelectedAdapterLocalIPString(),
-        xe::byte_swap(port_), "UDP");
+        port_, "UDP");
   }
 
   bool registered = false;
@@ -414,6 +413,9 @@ void Link::RendezvousLoop() {
   lock.unlock();
   if (registered) {
     api->XefuLinkUnregister(title_id, session_id);
+  }
+  if (upnp && upnp->IsActive()) {
+    upnp->RemovePortAsync(upnp->GetMappedBindPort(port_), "UDP");
   }
 }
 

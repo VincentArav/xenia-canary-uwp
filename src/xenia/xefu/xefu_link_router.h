@@ -72,6 +72,8 @@ enum class LinkIncoming {
 class LinkRouter {
  public:
   static constexpr uint64_t kPeerLifetimeMs = 5 * 60 * 1000;
+  // Any sender can add itself; the table stays small and bounded.
+  static constexpr size_t kMaxLearnedPeers = 256;
 
   LinkRouter(std::vector<LinkEndpoint> static_peers,
              std::vector<LinkEndpoint> broadcast_targets);

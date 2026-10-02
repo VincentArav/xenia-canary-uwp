@@ -121,18 +121,25 @@ LinkRouter::LinkRouter(std::vector<LinkEndpoint> static_peers,
       broadcast_targets_(std::move(broadcast_targets)) {}
 
 void LinkRouter::Flood(std::vector<LinkEndpoint>& out, uint64_t now_ms) const {
+  std::unordered_set<LinkEndpoint, LinkEndpointHash> seen(out.begin(),
+                                                          out.end());
+  auto add = [&](const LinkEndpoint& endpoint) {
+    if (seen.insert(endpoint).second) {
+      out.push_back(endpoint);
+    }
+  };
   for (const LinkEndpoint& endpoint : static_peers_) {
-    AddUnique(out, endpoint);
+    add(endpoint);
   }
   for (const LinkEndpoint& endpoint : broadcast_targets_) {
-    AddUnique(out, endpoint);
+    add(endpoint);
   }
   for (const LinkEndpoint& endpoint : discovered_peers_) {
-    AddUnique(out, endpoint);
+    add(endpoint);
   }
   for (const auto& [mac, learned] : learned_) {
     if (now_ms - learned.last_seen_ms < kPeerLifetimeMs) {
-      AddUnique(out, learned.endpoint);
+      add(learned.endpoint);
     }
   }
 }
@@ -166,6 +173,18 @@ LinkIncoming LinkRouter::AcceptIncoming(std::span<const uint8_t> frame,
     return LinkIncoming::kOwnFrame;
   }
   if (!IsGroupMac(source)) {
+    if (!learned_.count(source) && learned_.size() >= kMaxLearnedPeers) {
+      // Forget expired peers, then the least recently heard one.
+      std::erase_if(learned_, [&](const auto& item) {
+        return now_ms - item.second.last_seen_ms >= kPeerLifetimeMs;
+      });
+      if (learned_.size() >= kMaxLearnedPeers) {
+        learned_.erase(std::min_element(
+            learned_.begin(), learned_.end(), [](const auto& a, const auto& b) {
+              return a.second.last_seen_ms < b.second.last_seen_ms;
+            }));
+      }
+    }
     learned_[source] = {from, now_ms};
   }
   return LinkIncoming::kDeliver;
