@@ -17,12 +17,14 @@
 #include <utility>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/guest_memory_access.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/user_mode_address_space.h"
 #include "xenia/kernel/user_mode_context.h"
 #include "xenia/kernel/user_mode_context_snapshot.h"
 #include "xenia/kernel/user_mode_create.h"
@@ -33,8 +35,51 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 
+DEFINE_bool(user_mode_selective_tb_flush, true,
+            "Re-check only the translated code inside the pages a user-mode TB "
+            "flush names. Off re-checks every translated code page on each "
+            "flush (slower; the safe fallback).",
+            "Kernel");
+
 namespace xe::kernel {
 namespace {
+
+// The pages a KeFlushUserModeTb names in the mapping's control page, each at
+// the page size of its segment. nullopt when the flush covers everything (no
+// list, or more entries than the control page holds).
+std::optional<std::vector<cpu::FlushedGuestPageRange>> ReadFlushedPageRanges(
+    const Memory& memory, const UserModeMappingSnapshot& mapping) {
+  if (!cvars::user_mode_selective_tb_flush ||
+      !mapping.control_page_physical_address || !mapping.create_time_layout) {
+    return std::nullopt;
+  }
+  const UserModeFlushParseResult parsed = ParseUserModeLiveFlushRequest(
+      std::span<const uint8_t>(memory.TranslatePhysical<const uint8_t*>(
+                                   mapping.control_page_physical_address),
+                               kUserModeControlPageSize));
+  if (!parsed.count_was_accepted) {
+    return std::nullopt;
+  }
+  std::vector<cpu::FlushedGuestPageRange> ranges;
+  ranges.reserve(parsed.effective_addresses.size());
+  for (const uint32_t effective_address : parsed.effective_addresses) {
+    uint32_t page_size = 0x1000;
+    switch (mapping.create_time_layout
+                ->segment_for_effective_address(effective_address)
+                .translation.page_table_kind) {
+      case UserModePageTableKind::k64KiB:
+        page_size = 0x10000;
+        break;
+      case UserModePageTableKind::k16MiB:
+        page_size = 0x1000000;
+        break;
+      default:
+        break;
+    }
+    ranges.push_back({effective_address & ~(page_size - 1), page_size});
+  }
+  return ranges;
+}
 
 constexpr X_STATUS kStatusDatatypeMisalignment = 0x80000002u;
 constexpr uint64_t kUserModeMsrProblemState = 0x4000;
@@ -785,8 +830,15 @@ void UserModeKernelRuntime::Flush(uint32_t selector,
         manager_->FindMappingBySelector(selector);
     if (mapping) {
       // Live: another thread may be running this mapping's code.
+      const std::optional<std::vector<cpu::FlushedGuestPageRange>> ranges =
+          ReadFlushedPageRanges(*kernel_state_->memory(), *mapping);
       const cpu::GuestCodeInvalidationResult flushed =
-          coordinator_->InvalidateMappingDomainsLive(mapping->handle);
+          coordinator_->InvalidateMappingDomainsLive(
+              mapping->handle,
+              ranges
+                  ? std::optional<std::span<const cpu::FlushedGuestPageRange>>(
+                        *ranges)
+                  : std::nullopt);
       if (!flushed) {
         XELOGE("KeFlushUserModeTb failed for selector {} (status {})", selector,
                static_cast<uint32_t>(flushed.status));
@@ -1108,8 +1160,19 @@ void UserModeKernelRuntime::ContinuationThunk(cpu::ppc::PPCContext* ppc_context,
     ReturnFromInterrupt(*thread, ppc_context);
   }
   if (flush_mapping) {
+    // The flushing thread is still in the continuation, so its control page
+    // still names the pages it flushed.
+    std::optional<std::vector<cpu::FlushedGuestPageRange>> ranges;
+    if (const std::optional<UserModeMappingSnapshot> mapping =
+            manager_->FindMapping(*flush_mapping)) {
+      ranges = ReadFlushedPageRanges(*kernel_state_->memory(), *mapping);
+    }
     const cpu::GuestCodeInvalidationResult flushed =
-        coordinator_->InvalidateMappingDomainsLive(*flush_mapping);
+        coordinator_->InvalidateMappingDomainsLive(
+            *flush_mapping,
+            ranges ? std::optional<std::span<const cpu::FlushedGuestPageRange>>(
+                         *ranges)
+                   : std::nullopt);
     if (!flushed) {
       XELOGE("KeFlushUserModeTb from user mode failed (status {})",
              static_cast<uint32_t>(flushed.status));

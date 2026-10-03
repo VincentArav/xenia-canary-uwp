@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <string>
 
@@ -250,6 +251,12 @@ class XObject {
   // Called on successful wait.
   virtual void WaitCallback() {}
   virtual xe::threading::WaitHandle* GetWaitHandle() { return nullptr; }
+  // How long a blocking wait this object would satisfy at once holds off
+  // first, as if the waiter had been preempted. XTimer paces waits on
+  // periodic notification timers in XeFu sessions with it.
+  virtual std::chrono::milliseconds WaitPacingDelay() {
+    return std::chrono::milliseconds(0);
+  }
 
   // Creates the kernel object for guest code to use. Typically not needed.
   uint8_t* CreateNative(uint32_t size);
@@ -286,6 +293,10 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
+  // The guest dispatcher struct whose stashed handle names this object, set
+  // before the handle is stashed: GetNativeObject trusts a handle it read
+  // without the global lock only when the object names the same struct.
+  std::atomic<uint32_t> native_struct_ptr_{0};
 };
 
 template <typename T>

@@ -15,6 +15,7 @@
 #include <array>
 #include <climits>
 #include <cstring>
+#include <string_view>
 #include <unordered_map>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -34,6 +35,7 @@
 #include "xenia/cpu/backend/x64/x64_sequences.h"
 #include "xenia/cpu/backend/x64/x64_stack_layout.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/function_debug_info.h"
 #include "xenia/cpu/hir/instr.h"
@@ -47,6 +49,11 @@
 DEFINE_bool(x64_inline_checked_resolution, true,
             "Checked-domain branches probe the thread's resolved targets "
             "inline and call the resolver only on a miss.",
+            "x64");
+DEFINE_bool(x64_inline_kernel_spinlocks, true,
+            "Direct-memory guest code acquires and releases kernel spinlocks "
+            "and raises and lowers the IRQL inline instead of calling the "
+            "exports (a contended acquire still calls the export).",
             "x64");
 DEFINE_bool(debugprint_trap_log, false,
             "Log debugprint traps to the active debugger", "CPU");
@@ -858,7 +865,172 @@ void X64Emitter::EmitCheckedResolutionProbe(Xbyak::Label& miss) {
                  (entries + offsetof(CheckedResolutionEntry, machine_code))]);
 }
 
+namespace {
+
+// The kernel exports a guest call may run inline.
+enum class InlineKernelExport {
+  kNone,
+  kAcquireSpinLockAtRaisedIrql,
+  kReleaseSpinLockFromRaisedIrql,
+  kRaiseIrqlToDpcLevel,
+  kLowerIrql,
+  kEnterCriticalSection,
+  kLeaveCriticalSection,
+};
+
+InlineKernelExport GetInlineKernelExport(const GuestFunction* function) {
+  if (!cvars::x64_inline_kernel_spinlocks ||
+      function->behavior() != Function::Behavior::kExtern ||
+      !function->export_data() || !function->export_data()->name) {
+    return InlineKernelExport::kNone;
+  }
+  const std::string_view name = function->export_data()->name;
+  if (name == "KeAcquireSpinLockAtRaisedIrql") {
+    return InlineKernelExport::kAcquireSpinLockAtRaisedIrql;
+  }
+  if (name == "KeReleaseSpinLockFromRaisedIrql") {
+    return InlineKernelExport::kReleaseSpinLockFromRaisedIrql;
+  }
+  if (name == "KeRaiseIrqlToDpcLevel") {
+    return InlineKernelExport::kRaiseIrqlToDpcLevel;
+  }
+  if (name == "KfLowerIrql") {
+    return InlineKernelExport::kLowerIrql;
+  }
+  if (name == "RtlEnterCriticalSection") {
+    return InlineKernelExport::kEnterCriticalSection;
+  }
+  if (name == "RtlLeaveCriticalSection") {
+    return InlineKernelExport::kLeaveCriticalSection;
+  }
+  return InlineKernelExport::kNone;
+}
+
+}  // namespace
+
+// Direct-memory code runs the common case of the kernel's spinlock, IRQL and
+// critical-section exports inline:
+// - a spinlock word holds its owner's PCR address, 0 when free;
+// - the PCR keeps the IRQL at +0x18 and the current KTHREAD at +0x100;
+// - a critical section (xboxkrnl_rtl.cc) keeps a host-endian lock count at
+//   +0x10 (-1 when free) and big-endian recursion count and owner at +0x14
+//   and +0x18.
+// A contended lock, a recursive or contended critical section, or a waiter to
+// wake calls the export.
 void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
+  assert_not_null(function);
+  const InlineKernelExport inline_export =
+      checked_memory_descriptor_ || (instr->flags & hir::CALL_TAIL)
+          ? InlineKernelExport::kNone
+          : GetInlineKernelExport(function);
+  if (inline_export == InlineKernelExport::kNone) {
+    CallGuestFunction(instr, function);
+    return;
+  }
+  constexpr size_t kR3 = offsetof(ppc::PPCContext, r) + 3 * sizeof(uint64_t);
+  constexpr size_t kR13 = offsetof(ppc::PPCContext, r) + 13 * sizeof(uint64_t);
+  constexpr uint32_t kPcrCurrentIrql = 0x18;
+  // out = host address of the guest address in eax.
+  auto host_address_of_eax = [this](const Xbyak::Reg64& out) {
+    if (xe::memory::allocation_granularity() > 0x1000) {
+      // 0xE0000000+ is mapped 4 KB higher on hosts with 64 KB granularity.
+      Xbyak::Label below;
+      cmp(eax, 0xE0000000);
+      jb(below);
+      add(eax, 0x1000);
+      L(below);
+    }
+    lea(out, ptr[GetMembaseReg() + rax]);
+  };
+  switch (inline_export) {
+    case InlineKernelExport::kAcquireSpinLockAtRaisedIrql: {
+      Xbyak::Label acquired;
+      mov(eax, dword[GetContextReg() + kR3]);
+      host_address_of_eax(rdx);
+      mov(ecx, dword[GetContextReg() + kR13]);
+      bswap(ecx);
+      xor_(eax, eax);
+      lock();
+      cmpxchg(dword[rdx], ecx);
+      je(acquired, T_NEAR);
+      CallGuestFunction(instr, function);
+      L(acquired);
+      break;
+    }
+    case InlineKernelExport::kReleaseSpinLockFromRaisedIrql:
+      // x64 stores are release stores.
+      mov(eax, dword[GetContextReg() + kR3]);
+      host_address_of_eax(rdx);
+      mov(dword[rdx], 0);
+      break;
+    case InlineKernelExport::kRaiseIrqlToDpcLevel:
+      mov(eax, dword[GetContextReg() + kR13]);
+      host_address_of_eax(rdx);
+      movzx(eax, byte[rdx + kPcrCurrentIrql]);
+      mov(byte[rdx + kPcrCurrentIrql], 2);
+      mov(qword[GetContextReg() + kR3], rax);
+      break;
+    case InlineKernelExport::kLowerIrql:
+      mov(eax, dword[GetContextReg() + kR13]);
+      host_address_of_eax(rdx);
+      mov(ecx, dword[GetContextReg() + kR3]);
+      mov(byte[rdx + kPcrCurrentIrql], cl);
+      break;
+    case InlineKernelExport::kEnterCriticalSection: {
+      constexpr uint32_t kPcrCurrentThread = 0x100;
+      Xbyak::Label slow, done;
+      mov(eax, dword[GetContextReg() + kR13]);
+      host_address_of_eax(r9);
+      mov(ecx, dword[r9 + kPcrCurrentThread]);  // big-endian, as stored
+      mov(eax, dword[GetContextReg() + kR3]);
+      test(eax, eax);
+      jz(slow, T_NEAR);  // the export logs a null section
+      host_address_of_eax(rdx);
+      mov(eax, -1);
+      xor_(r8d, r8d);
+      lock();
+      cmpxchg(dword[rdx + 0x10], r8d);
+      jne(slow, T_NEAR);  // owned already, maybe by this thread
+      mov(dword[rdx + 0x18], ecx);
+      mov(dword[rdx + 0x14], 0x01000000);  // recursion count 1, big-endian
+      jmp(done, T_NEAR);
+      L(slow);
+      CallGuestFunction(instr, function);
+      L(done);
+      break;
+    }
+    case InlineKernelExport::kLeaveCriticalSection: {
+      Xbyak::Label slow, restore, done;
+      mov(eax, dword[GetContextReg() + kR3]);
+      test(eax, eax);
+      jz(slow, T_NEAR);
+      host_address_of_eax(rdx);
+      cmp(dword[rdx + 0x14], 0x01000000);  // recursion count 1, big-endian
+      jne(slow, T_NEAR);
+      mov(r8d, dword[rdx + 0x18]);
+      mov(dword[rdx + 0x14], 0);
+      mov(dword[rdx + 0x18], 0);
+      xor_(eax, eax);
+      mov(ecx, -1);
+      lock();
+      cmpxchg(dword[rdx + 0x10], ecx);  // free unless a waiter came
+      je(done, T_NEAR);
+      L(restore);
+      // A waiter: give the section back as it was and let the export wake it.
+      mov(dword[rdx + 0x18], r8d);
+      mov(dword[rdx + 0x14], 0x01000000);
+      L(slow);
+      CallGuestFunction(instr, function);
+      L(done);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void X64Emitter::CallGuestFunction(const hir::Instr* instr,
+                                   GuestFunction* function) {
   assert_not_null(function);
   ForgetMxcsrMode();
   auto fn = static_cast<X64Function*>(function);

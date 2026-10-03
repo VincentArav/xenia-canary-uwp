@@ -10,9 +10,12 @@
 #include "xenia/kernel/user_mode_guest_code_domains.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <utility>
@@ -27,6 +30,54 @@
 
 namespace xe::kernel {
 namespace {
+
+// Recycles the blocks of the transition permits each kernel and user-mode
+// switch makes, on the thread that frees them. Plain thread-local data, so a
+// release late in a thread's exit is safe; up to kCapacity blocks of an exited
+// thread are never freed.
+template <typename T>
+class RecyclingAllocator {
+ public:
+  using value_type = T;
+
+  RecyclingAllocator() noexcept = default;
+  template <typename U>
+  RecyclingAllocator(const RecyclingAllocator<U>&) noexcept {}
+
+  T* allocate(size_t n) {
+    if (n == 1 && free_count_) {
+      return static_cast<T*>(free_blocks_[--free_count_]);
+    }
+    return static_cast<T*>(::operator new(n * sizeof(T)));
+  }
+  void deallocate(T* block, size_t n) noexcept {
+    if (n == 1 && free_count_ < kCapacity) {
+      free_blocks_[free_count_++] = block;
+      return;
+    }
+    ::operator delete(block);
+  }
+
+  template <typename U>
+  bool operator==(const RecyclingAllocator<U>&) const noexcept {
+    return true;
+  }
+  template <typename U>
+  bool operator!=(const RecyclingAllocator<U>&) const noexcept {
+    return false;
+  }
+
+ private:
+  static constexpr size_t kCapacity = 2;
+  static_assert(alignof(T) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+  static thread_local void* free_blocks_[kCapacity];
+  static thread_local size_t free_count_;
+};
+
+template <typename T>
+thread_local void* RecyclingAllocator<T>::free_blocks_[kCapacity];
+template <typename T>
+thread_local size_t RecyclingAllocator<T>::free_count_ = 0;
 
 bool LayoutsEqual(const UserModeCreateTimeAddressSpaceLayout& left,
                   const UserModeCreateTimeAddressSpaceLayout& right) {
@@ -269,7 +320,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
           kInvalidMappingSnapshot;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     Slot& slot = slots_[mapping.selector];
     if (slot.registering || slot.lease) {
       return slot.mapping == mapping
@@ -286,7 +337,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
   bool Publish(
       UserModeMappingHandle mapping,
       const std::shared_ptr<UserModeGuestCodeDomainLease>& lease) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     Slot& slot = slots_[mapping.selector];
     if (!slot.registering || slot.mapping != mapping || slot.lease) {
       return false;
@@ -297,7 +348,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
   }
 
   void CancelReservation(UserModeMappingHandle mapping) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     Slot& slot = slots_[mapping.selector];
     if (slot.registering && slot.mapping == mapping && !slot.lease) {
       slot = Slot{};
@@ -306,7 +357,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
 
   void RemoveRetiredLease(UserModeMappingHandle mapping,
                           const UserModeGuestCodeDomainLease* lease) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     Slot& slot = slots_[mapping.selector];
     if (slot.mapping != mapping) {
       return;
@@ -327,7 +378,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
 
     std::shared_ptr<UserModeGuestCodeDomainLease> lease;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::shared_lock<std::shared_mutex> lock(mutex_);
       const Slot& slot = slots_[mapping.selector];
       if (slot.mapping != mapping) {
         return nullptr;
@@ -341,7 +392,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
       cpu::TranslationDomainKey domain) const {
     std::shared_ptr<UserModeGuestCodeDomainLease> lease;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::shared_lock<std::shared_mutex> lock(mutex_);
       for (const Slot& slot : slots_) {
         if (slot.lease && slot.lease->ContainsDomain(domain)) {
           lease = slot.lease;
@@ -356,7 +407,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
       const {
     std::vector<std::shared_ptr<UserModeGuestCodeDomainLease>> leases;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::shared_lock<std::shared_mutex> lock(mutex_);
       for (const Slot& slot : slots_) {
         if (slot.lease) {
           leases.push_back(slot.lease);
@@ -369,7 +420,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
   }
 
   size_t active_lease_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     size_t count = 0;
     for (const Slot& slot : slots_) {
       count += slot.lease && slot.lease->CanBeginExecution() ? 1 : 0;
@@ -380,7 +431,7 @@ class UserModeGuestCodeDomainCoordinatorState final {
   void RetireAll() noexcept {
     std::array<std::shared_ptr<UserModeGuestCodeDomainLease>, 2> leases;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::lock_guard<std::shared_mutex> lock(mutex_);
       for (size_t i = 0; i < slots_.size(); ++i) {
         leases[i] = std::move(slots_[i].lease);
         slots_[i] = Slot{};
@@ -400,7 +451,8 @@ class UserModeGuestCodeDomainCoordinatorState final {
     std::shared_ptr<UserModeGuestCodeDomainLease> lease;
   };
 
-  mutable std::mutex mutex_;
+  // Lookups run on every checked-code entry; they share it.
+  mutable std::shared_mutex mutex_;
   std::array<Slot, 2> slots_{};
 };
 
@@ -870,8 +922,9 @@ UserModeGuestCodeDomainCoordinator::AcquireTransition(
 
   try {
     result.permit =
-        std::make_shared<const UserModeGuestCodeDomainTransitionPermit>(
-            this, lease, expected_source_domain_key, target_domain_key);
+        std::allocate_shared<UserModeGuestCodeDomainTransitionPermit>(
+            RecyclingAllocator<UserModeGuestCodeDomainTransitionPermit>(), this,
+            lease, expected_source_domain_key, target_domain_key);
   } catch (...) {
     lease->ReleaseTransition();
     result.diagnostic =
@@ -1021,7 +1074,9 @@ namespace {
 
 cpu::GuestCodeInvalidationResult InvalidateLeaseDomainsLive(
     cpu::Processor* processor,
-    std::span<const std::shared_ptr<UserModeGuestCodeDomainLease>> leases) {
+    std::span<const std::shared_ptr<UserModeGuestCodeDomainLease>> leases,
+    std::optional<std::span<const cpu::FlushedGuestPageRange>> flushed_ranges =
+        std::nullopt) {
   // Data accesses stop using the flushed translations too.
   UserModeGuestDataAccessor::InvalidateTranslationCaches();
   std::vector<cpu::TranslationDomainKey> domains;
@@ -1038,14 +1093,16 @@ cpu::GuestCodeInvalidationResult InvalidateLeaseDomainsLive(
   }
   // A TB flush changes address translations only: retire just the
   // translations whose code no longer fetches from the same physical bytes.
-  return processor->InvalidateRemappedCheckedGuestCodeDomains(domains);
+  return processor->InvalidateRemappedCheckedGuestCodeDomains(domains,
+                                                              flushed_ranges);
 }
 
 }  // namespace
 
 cpu::GuestCodeInvalidationResult
 UserModeGuestCodeDomainCoordinator::InvalidateMappingDomainsLive(
-    UserModeMappingHandle mapping) {
+    UserModeMappingHandle mapping,
+    std::optional<std::span<const cpu::FlushedGuestPageRange>> flushed_ranges) {
   // A TB flush drops cached data translations whether or not code can be
   // invalidated.
   UserModeGuestDataAccessor::InvalidateTranslationCaches();
@@ -1064,7 +1121,8 @@ UserModeGuestCodeDomainCoordinator::InvalidateMappingDomainsLive(
         cpu::GuestCodeInvalidationStatus::kUnsupportedTranslationDomain;
     return result;
   }
-  return InvalidateLeaseDomainsLive(processor_, std::span(&lease, 1));
+  return InvalidateLeaseDomainsLive(processor_, std::span(&lease, 1),
+                                    flushed_ranges);
 }
 
 cpu::GuestCodeInvalidationResult

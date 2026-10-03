@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/util/object_table.h"
 
+#include <mutex>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/xobject.h"
@@ -25,18 +27,37 @@ ObjectTable::~ObjectTable() { Reset(); }
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
+  // Detach the tables first: lookups don't take the global lock.
+  ObjectTableEntry* table;
+  ObjectTableEntry* host_table;
+  uint32_t table_capacity;
+  uint32_t host_table_capacity;
+  {
+    std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
+    table = table_;
+    host_table = host_table_;
+    table_capacity = table_capacity_;
+    host_table_capacity = host_table_capacity_;
+    table_capacity_ = 0;
+    host_table_capacity_ = 0;
+    last_free_entry_ = 0;
+    last_free_host_entry_ = 0;
+    table_ = nullptr;
+    host_table_ = nullptr;
+  }
+
   // Release all objects, clearing their handles first so destructors
   // don't assert on non-empty handles_.
-  for (uint32_t n = 0; n < table_capacity_; n++) {
-    ObjectTableEntry& entry = table_[n];
+  for (uint32_t n = 0; n < table_capacity; n++) {
+    ObjectTableEntry& entry = table[n];
     if (entry.object) {
       entry.object->handles().clear();
       entry.handle_ref_count = 0;
       entry.object->Release();
     }
   }
-  for (uint32_t n = 0; n < host_table_capacity_; n++) {
-    ObjectTableEntry& entry = host_table_[n];
+  for (uint32_t n = 0; n < host_table_capacity; n++) {
+    ObjectTableEntry& entry = host_table[n];
     if (entry.object) {
       entry.object->handles().clear();
       entry.handle_ref_count = 0;
@@ -44,14 +65,8 @@ void ObjectTable::Reset() {
     }
   }
 
-  table_capacity_ = 0;
-  host_table_capacity_ = 0;
-  last_free_entry_ = 0;
-  last_free_host_entry_ = 0;
-  free(table_);
-  table_ = nullptr;
-  free(host_table_);
-  host_table_ = nullptr;
+  free(table);
+  free(host_table);
 }
 
 X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot, bool host) {
@@ -122,31 +137,36 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   uint32_t handle = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
+    // Retain so long as the object is in the table.
+    object->Retain();
+    {
+      std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
+      // Find a free slot.
+      uint32_t slot = 0;
+      bool host_object = object->is_host_object();
+      result = FindFreeSlot(&slot, host_object);
 
-    // Find a free slot.
-    uint32_t slot = 0;
-    bool host_object = object->is_host_object();
-    result = FindFreeSlot(&slot, host_object);
-
-    // Stash.
-    if (XSUCCEEDED(result)) {
-      ObjectTableEntry& entry = host_object ? host_table_[slot] : table_[slot];
-      entry.object = object;
-      entry.handle_ref_count = 1;
-      handle = slot << 2;
-      if (!host_object) {
-        if (object->type() != XObject::Type::Socket) {
-          handle += XObject::kHandleBase;
+      // Stash.
+      if (XSUCCEEDED(result)) {
+        ObjectTableEntry& entry =
+            host_object ? host_table_[slot] : table_[slot];
+        entry.object = object;
+        entry.handle_ref_count = 1;
+        handle = slot << 2;
+        if (!host_object) {
+          if (object->type() != XObject::Type::Socket) {
+            handle += XObject::kHandleBase;
+          }
+        } else {
+          handle += XObject::kHandleHostBase;
         }
-      } else {
-        handle += XObject::kHandleHostBase;
       }
+    }
+    if (XSUCCEEDED(result)) {
       object->handles().push_back(handle);
-
-      // Retain so long as the object is in the table.
-      object->Retain();
-
       XELOGD("Added handle:{:08X} for {}", handle, typeid(*object).name());
+    } else {
+      object->Release();
     }
   }
 
@@ -221,8 +241,12 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
   }
 
   if (entry->object) {
-    auto object = entry->object;
-    entry->object = nullptr;
+    XObject* object;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
+      object = entry->object;
+      entry->object = nullptr;
+    }
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
 
@@ -278,6 +302,7 @@ void ObjectTable::PurgeAllObjects() {
       entry.handle_ref_count = 0;
       entry.object->ReleaseHandle();
 
+      std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
       entry.object = nullptr;
     }
   }
@@ -323,8 +348,10 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   }
 
   XObject* object = nullptr;
+  // A caller holding the global lock already excludes every writer.
+  std::shared_lock<std::shared_mutex> table_lock(table_mutex_, std::defer_lock);
   if (!already_locked) {
-    global_critical_region_.mutex().lock();
+    table_lock.lock();
   }
 
   const bool is_host_object = XObject::is_handle_host_object(handle);
@@ -348,10 +375,6 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   // Retain the object pointer.
   if (object) {
     object->Retain();
-  }
-
-  if (!already_locked) {
-    global_critical_region_.mutex().unlock();
   }
 
   return object;
@@ -449,6 +472,8 @@ bool ObjectTable::Save(ByteStream* stream) {
 }
 
 bool ObjectTable::Restore(ByteStream* stream) {
+  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
   Resize(stream->Read<uint32_t>(), true);
   for (uint32_t i = 0; i < host_table_capacity_; i++) {
     auto& entry = host_table_[i];
@@ -467,6 +492,8 @@ bool ObjectTable::Restore(ByteStream* stream) {
 }
 
 X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
+  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(table_mutex_);
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
   uint32_t capacity = is_host_object ? host_table_capacity_ : table_capacity_;

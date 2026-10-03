@@ -9,6 +9,8 @@
 
 #include "xenia/hid/sdl/sdl_input_driver.h"
 
+#include <chrono>
+
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
 #endif  // XE_PLATFORM_WIN32
@@ -204,8 +206,16 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   }
 
   // Unfortunately drivers can't present all information immediately (e.g.
-  // battery information) so this needs to be refreshed every time.
-  UpdateXCapabilities(*controller);
+  // battery information) so this needs to be refreshed, at most every 250 ms:
+  // a refresh takes SDL's joystick lock, which event pumps hold.
+  constexpr auto kCapsRefreshInterval = std::chrono::milliseconds(250);
+  if (std::chrono::steady_clock::now().time_since_epoch().count() -
+          controller->caps_updated >=
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          kCapsRefreshInterval)
+          .count()) {
+    UpdateXCapabilities(*controller);
+  }
 
   std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
 
@@ -722,6 +732,8 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
   c.vibration.left_motor_speed = 0xFFFFu;
   c.vibration.right_motor_speed = 0xFFFFu;
+  state.caps_updated =
+      std::chrono::steady_clock::now().time_since_epoch().count();
 }
 
 void SDLInputDriver::QueueControllerUpdate() {

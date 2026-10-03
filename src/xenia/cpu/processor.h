@@ -150,6 +150,13 @@ struct GuestCodeInvalidationResult {
   }
 };
 
+// A page a TB flush names: the page holding a flushed effective address, at
+// the size of the page that maps it.
+struct FlushedGuestPageRange {
+  uint32_t begin = 0;
+  uint32_t size = 0;
+};
+
 class Processor {
  public:
   Processor(Memory* memory, ExportResolver* export_resolver);
@@ -319,9 +326,13 @@ class Processor {
   // A TB flush of checked domains: changes the address translation, not the
   // code bytes (icache sweeps retire those). Retires only the translations
   // whose instructions no longer fetch from the physical bytes they were
-  // translated from, and the domains' failed entries.
+  // translated from, and the domains' failed entries. When the flush names
+  // the pages it changed, only recorded code pages inside flushed_ranges are
+  // probed; without them every recorded page is.
   GuestCodeInvalidationResult InvalidateRemappedCheckedGuestCodeDomains(
-      std::span<const TranslationDomainKey> translation_domain_keys);
+      std::span<const TranslationDomainKey> translation_domain_keys,
+      std::optional<std::span<const FlushedGuestPageRange>> flushed_ranges =
+          std::nullopt);
   bool HasLiveThreadInTranslationDomains(
       std::span<const TranslationDomainKey> translation_domain_keys);
 
@@ -425,17 +436,38 @@ class Processor {
  private:
   bool IsCheckedResolverOnlyDomainLocked(
       TranslationDomainKey translation_domain_key);
-  // Shared by the two live checked invalidations. select chooses the defined
+  // Called under a live invalidation's locks for each checked domain. Entry
+  // addresses (sorted, unique) restrict select to those functions and keep
+  // the domain's failed entries; nullopt offers select every function.
+  using CheckedInvalidationCandidates =
+      std::function<std::optional<std::vector<uint32_t>>(TranslationDomainKey)>;
+  // Shared by the live checked invalidations. select chooses the defined
   // or failed functions to retire. A whole-domain invalidation tombstones
   // every entry; otherwise only the retired functions' entries and the
   // domain's failed entries, whose function may never have been declared.
   GuestCodeInvalidationResult InvalidateCheckedGuestCode(
       const std::function<bool(TranslationDomainKey)>& include_domain,
       const Module::GuestFunctionInvalidationFilter& select,
-      bool invalidate_whole_domains);
-  // Records the pages a new checked translation fetched from.
+      bool invalidate_whole_domains,
+      const CheckedInvalidationCandidates& candidates = {});
+  // Records the pages and physical sources a new checked translation fetched
+  // from, ending its compile.
   void RecordCheckedCodePages(const GuestFunction& function);
   void ForgetCheckedCodePages(TranslationDomainKey translation_domain_key);
+  // The source index below; callers hold checked_code_pages_mutex_.
+  void IndexCheckedCodeSourcesLocked(const GuestFunction& function);
+  void UnindexCheckedCodeSourcesLocked(const GuestFunction& function);
+  // Drops the domain's entries, or with addresses (sorted) only theirs.
+  void UnindexCheckedCodeSourcesLocked(
+      TranslationDomainKey translation_domain_key,
+      const std::vector<uint32_t>* addresses);
+  // The entry addresses (sorted, unique) of the domain's translations whose
+  // sources overlap guest physical [begin, end); without a domain, those of
+  // every domain.
+  std::vector<uint32_t> CheckedCodeSourceOverlapsLocked(
+      const TranslationDomainKey* translation_domain_key, uint32_t begin,
+      uint32_t end) const;
+  bool HasCheckedFailedEntriesLocked() const;
 
   // Resolves address in the thread's domain and calls it, re-resolving when a
   // concurrent checked-domain invalidation retired the function first.
@@ -523,6 +555,21 @@ class Processor {
                      std::unordered_map<uint32_t, uint32_t>>
       checked_code_pages_;
   std::unordered_map<TranslationDomainKey, size_t> checked_failed_entry_counts_;
+  // Per guest physical 4 KiB page, the source bytes each live checked
+  // translation read from it, so an icache sweep finds the translations it
+  // affects without scanning them all. Translations whose sources are
+  // incomplete overlap every sweep. Also counts the checked compiles that
+  // have taken their entry but not yet recorded the outcome; a sweep that
+  // sees one waits it out.
+  struct CheckedCodeSource {
+    TranslationAddress function;
+    uint32_t begin;
+    uint32_t end;
+  };
+  std::unordered_map<uint32_t, std::vector<CheckedCodeSource>>
+      checked_code_sources_;
+  std::vector<TranslationAddress> checked_unsourced_functions_;
+  size_t checked_compiles_in_flight_ = 0;
   TranslationDomainRegistry translation_domain_registry_;
   std::atomic<GuestInterruptPoller*> guest_interrupt_poller_{nullptr};
   std::atomic<CheckedGuestMemoryDispatcher*> checked_guest_memory_dispatcher_{
@@ -540,6 +587,12 @@ class Processor {
   // Maps thread ID to state. Updated on thread create, and threads are never
   // removed. Must be guarded with the global lock.
   std::map<uint32_t, std::unique_ptr<ThreadDebugInfo>> thread_debug_infos_;
+  // Guards each thread's domain key (in its ThreadState and ThreadDebugInfo)
+  // and the thread map against domain commits, which take only this lock.
+  // Adding or removing threads takes it with the global lock; reading another
+  // thread's key takes it shared. The debugger's step paths read suspended
+  // threads' keys without it.
+  mutable std::shared_mutex thread_domain_mutex_;
 
   // TODO(benvanik): cleanup/change structures.
   std::vector<Breakpoint*> breakpoints_;

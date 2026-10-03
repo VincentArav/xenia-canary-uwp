@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
 #define XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
 
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -103,6 +104,11 @@ class ObjectTable {
   bool Resize(uint32_t new_capacity, bool host);
 
   xe::global_critical_region global_critical_region_;
+  // Handle lookups take only this lock. Code that changes the tables or an
+  // entry's object holds it and the global lock, so either one keeps them
+  // stable. No object is released while it is held: a destructor may look
+  // handles up.
+  std::shared_mutex table_mutex_;
   uint32_t table_capacity_ = 0;
   uint32_t host_table_capacity_ = 0;
   ObjectTableEntry* table_ = nullptr;

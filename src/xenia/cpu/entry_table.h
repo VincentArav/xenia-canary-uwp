@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
 #include <span>
 #include <vector>
 
@@ -80,7 +81,8 @@ class EntryTable {
   std::vector<Function*> FindWithAddress(uint32_t address);
 
  private:
-  xe::global_critical_region global_critical_region_;
+  // Resolvers share it; nothing else is taken while it is held.
+  std::shared_mutex mutex_;
   // TODO(benvanik): replace with a better data structure.
   xe::split_map<TranslationAddress, Entry*> map_;
   // Entry pointers escape the table lock while compilation is in progress.

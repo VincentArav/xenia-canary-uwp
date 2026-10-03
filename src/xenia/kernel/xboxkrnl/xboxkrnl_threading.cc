@@ -1075,18 +1075,16 @@ dword_result_t KeWaitForMultipleObjects_entry(
 
   assert_true(count <= 64);
   object_ref<XObject> objects[64];
-  {
-    auto crit = global_critical_region::AcquireDirect();
-    for (uint32_t n = 0; n < count; n++) {
-      auto object_ptr = kernel_memory()->TranslateVirtual(objects_ptr[n]);
-      auto object_ref = XObject::GetNativeObject<XObject>(kernel_state(),
-                                                          object_ptr, -1, true);
-      if (!object_ref) {
-        return X_STATUS_INVALID_PARAMETER;
-      }
-
-      objects[n] = std::move(object_ref);
+  // Each lookup takes only the locks it needs.
+  for (uint32_t n = 0; n < count; n++) {
+    auto object_ptr = kernel_memory()->TranslateVirtual(objects_ptr[n]);
+    auto object_ref =
+        XObject::GetNativeObject<XObject>(kernel_state(), object_ptr, -1);
+    if (!object_ref) {
+      return X_STATUS_INVALID_PARAMETER;
     }
+
+    objects[n] = std::move(object_ref);
   }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   X_STATUS result = XObject::WaitMultiple(
@@ -1120,17 +1118,15 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, xe::be<uint32_t>* handles,
          edit: actually switched to fixed size array, as there can never be more
      than 64 events specified
   */
-  {
-    auto crit = global_critical_region::AcquireDirect();
-    for (uint32_t n = 0; n < count; n++) {
-      uint32_t object_handle = handles[n];
-      auto object = kernel_state()->object_table()->LookupObject<XObject>(
-          object_handle, true);
-      if (!object) {
-        return X_STATUS_INVALID_PARAMETER;
-      }
-      objects[n] = std::move(object);
+  // Handle lookups take only the handle table's lock.
+  for (uint32_t n = 0; n < count; n++) {
+    uint32_t object_handle = handles[n];
+    auto object =
+        kernel_state()->object_table()->LookupObject<XObject>(object_handle);
+    if (!object) {
+      return X_STATUS_INVALID_PARAMETER;
     }
+    objects[n] = std::move(object);
   }
 
   auto result =
@@ -1165,14 +1161,10 @@ dword_result_t NtSignalAndWaitForSingleObjectEx_entry(dword_t signal_handle,
                                                       dword_t alertable,
                                                       lpqword_t timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
-  // pre-lock for these two handle lookups
-  global_critical_region::mutex().lock();
-
-  auto signal_object = kernel_state()->object_table()->LookupObject<XObject>(
-      signal_handle, true);
+  auto signal_object =
+      kernel_state()->object_table()->LookupObject<XObject>(signal_handle);
   auto wait_object =
-      kernel_state()->object_table()->LookupObject<XObject>(wait_handle, true);
-  global_critical_region::mutex().unlock();
+      kernel_state()->object_table()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3,

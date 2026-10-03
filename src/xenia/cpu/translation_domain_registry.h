@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -98,7 +99,8 @@ class TranslationDomainRegistry final {
 
  private:
   Processor* const processor_;
-  mutable std::mutex mutex_;
+  // Lookups run on every checked call and transition, so they share it.
+  mutable std::shared_mutex mutex_;
   std::vector<std::unique_ptr<const TranslationDomainDescriptor>>
       retained_domains_;
   std::unordered_map<TranslationDomainKey, const TranslationDomainDescriptor*>

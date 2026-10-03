@@ -202,7 +202,7 @@ bool Processor::CommitThreadTranslationDomain(
     }
   }
 
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   if (thread_state->translation_domain_key() != current_domain_key) {
     return false;
   }
@@ -390,6 +390,11 @@ void Processor::RemoveModule(TranslationDomainKey translation_domain_key,
   }
 
   module->RetireGuestFunctionsForUnload();
+  if (translation_domain_key != TranslationDomainKey::DefaultDirect()) {
+    std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+    UnindexCheckedCodeSourcesLocked(translation_domain_key,
+                                    &addressed_functions);
+  }
   std::unique_ptr<Module> retired_module = std::move(*itr);
   modules_.erase(itr);
   retired_modules_.push_back(std::move(retired_module));
@@ -567,6 +572,12 @@ Function* Processor::ResolveFunction(
       entry_table_.GetOrCreate(translation_domain_key, address, &entry);
   if (status == Entry::STATUS_NEW) {
     // Needs to be generated. We have the 'lock' on it and must do so now.
+    if (translation_domain_key != TranslationDomainKey::DefaultDirect()) {
+      // Counted before any code is read, so an icache sweep either sees the
+      // compile in flight or ran before it read anything.
+      std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+      ++checked_compiles_in_flight_;
+    }
 
     // Grab symbol declaration.
     auto function = LookupFunction(translation_domain_key, address);
@@ -576,6 +587,7 @@ Function* Processor::ResolveFunction(
       if (translation_domain_key != TranslationDomainKey::DefaultDirect()) {
         std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
         ++checked_failed_entry_counts_[translation_domain_key];
+        --checked_compiles_in_flight_;
       }
       return nullptr;
     }
@@ -612,6 +624,7 @@ Function* Processor::ResolveFunction(
 bool Processor::HasLiveThreadInTranslationDomains(
     std::span<const TranslationDomainKey> translation_domain_keys) {
   auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   for (const auto& [thread_id, thread_info] : thread_debug_infos_) {
     if (thread_info->state == ThreadDebugInfo::State::kExited ||
         thread_info->state == ThreadDebugInfo::State::kZombie) {
@@ -654,6 +667,9 @@ GuestCodeInvalidationResult Processor::InvalidateGuestCodeDomain(
   // lock.
   std::unique_lock resolution_lock(guest_code_resolution_mutex_);
   auto global_lock = global_critical_region_.Acquire();
+  // Held through the invalidation: no thread commits into the domain after
+  // the live-thread test below.
+  std::shared_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   if (!is_default_domain && translation_domain_registry_.Lookup(
                                 translation_domain_key) != checked_descriptor) {
     result.status = GuestCodeInvalidationStatus::kUnsupportedTranslationDomain;
@@ -776,18 +792,66 @@ GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCodeSources(
       !translation_domain_registry_.active_domain_count()) {
     return result;
   }
-  return InvalidateCheckedGuestCode(
+  // Nothing is stale unless a translation read the swept bytes, a compile in
+  // flight read the old bytes, or a failed translation awaits a retry. The
+  // pages mutex orders this check after the recording of any compile that read
+  // the old bytes and before any compile reads the new ones.
+  {
+    std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+    if (!checked_compiles_in_flight_ && !HasCheckedFailedEntriesLocked() &&
+        CheckedCodeSourceOverlapsLocked(nullptr, source_begin, source_end)
+            .empty()) {
+      return result;
+    }
+  }
+  // Under the invalidation's locks every compile has been recorded, so only
+  // the translations that read the swept bytes are offered. A domain with
+  // failed entries is scanned whole: its failed translations are retried.
+  std::vector<std::pair<TranslationDomainKey, size_t>> failed_counts;
+  result = InvalidateCheckedGuestCode(
       [](TranslationDomainKey) { return true; },
       [source_begin, source_end](const GuestFunction& function) {
         return function.status() == Symbol::Status::kFailed ||
                function.CodeSourcesMayOverlap(source_begin, source_end);
       },
-      false);
+      false,
+      [this, source_begin, source_end,
+       &failed_counts](TranslationDomainKey translation_domain_key)
+          -> std::optional<std::vector<uint32_t>> {
+        std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+        auto failed_it =
+            checked_failed_entry_counts_.find(translation_domain_key);
+        if (failed_it == checked_failed_entry_counts_.end() ||
+            !failed_it->second) {
+          return CheckedCodeSourceOverlapsLocked(&translation_domain_key,
+                                                 source_begin, source_end);
+        }
+        if (std::none_of(failed_counts.begin(), failed_counts.end(),
+                         [translation_domain_key](const auto& failed) {
+                           return failed.first == translation_domain_key;
+                         })) {
+          failed_counts.emplace_back(translation_domain_key, failed_it->second);
+        }
+        return std::nullopt;
+      });
+  // The failures counted under the locks were retried; later ones remain.
+  if (result && !failed_counts.empty()) {
+    std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+    for (const auto& [translation_domain_key, count] : failed_counts) {
+      auto failed_it =
+          checked_failed_entry_counts_.find(translation_domain_key);
+      if (failed_it != checked_failed_entry_counts_.end()) {
+        failed_it->second -= std::min(failed_it->second, count);
+      }
+    }
+  }
+  return result;
 }
 
 GuestCodeInvalidationResult
 Processor::InvalidateRemappedCheckedGuestCodeDomains(
-    std::span<const TranslationDomainKey> translation_domain_keys) {
+    std::span<const TranslationDomainKey> translation_domain_keys,
+    std::optional<std::span<const FlushedGuestPageRange>> flushed_ranges) {
   for (TranslationDomainKey translation_domain_key : translation_domain_keys) {
     if (translation_domain_key == TranslationDomainKey::DefaultDirect()) {
       GuestCodeInvalidationResult result;
@@ -820,10 +884,45 @@ Processor::InvalidateRemappedCheckedGuestCodeDomains(
       if (pages_it == checked_code_pages_.end()) {
         continue;
       }
-      for (const auto& [page, physical_page] : pages_it->second) {
-        recorded.push_back({translation_domain_key, page, physical_page});
+      if (!flushed_ranges) {
+        for (const auto& [page, physical_page] : pages_it->second) {
+          recorded.push_back({translation_domain_key, page, physical_page});
+        }
+        continue;
+      }
+      // Only recorded pages inside the flushed ranges are probed; the rest
+      // keep their translations, as their TLB entries would.
+      for (const FlushedGuestPageRange& range : *flushed_ranges) {
+        const uint64_t end = uint64_t(range.begin) + range.size;
+        for (uint64_t page = range.begin & ~uint32_t(0xFFF); page < end;
+             page += 0x1000) {
+          auto page_it = pages_it->second.find(static_cast<uint32_t>(page));
+          if (page_it != pages_it->second.end()) {
+            recorded.push_back(
+                {translation_domain_key, page_it->first, page_it->second});
+          }
+        }
       }
     }
+  }
+  if (flushed_ranges) {
+    // Flushed ranges may overlap; probe each page once.
+    std::sort(recorded.begin(), recorded.end(),
+              [](const RecordedPage& a, const RecordedPage& b) {
+                return a.translation_domain_key.id() !=
+                               b.translation_domain_key.id()
+                           ? a.translation_domain_key.id() <
+                                 b.translation_domain_key.id()
+                           : a.page < b.page;
+              });
+    recorded.erase(
+        std::unique(recorded.begin(), recorded.end(),
+                    [](const RecordedPage& a, const RecordedPage& b) {
+                      return a.translation_domain_key ==
+                                 b.translation_domain_key &&
+                             a.page == b.page;
+                    }),
+        recorded.end());
   }
   std::vector<RecordedPage> moved;
   for (const RecordedPage& entry : recorded) {
@@ -937,6 +1036,8 @@ void Processor::RecordCheckedCodePages(const GuestFunction& function) {
       page_it->second = ppc::kUnknownInstructionSource;
     }
   }
+  IndexCheckedCodeSourcesLocked(function);
+  --checked_compiles_in_flight_;
 }
 
 void Processor::ForgetCheckedCodePages(
@@ -944,12 +1045,128 @@ void Processor::ForgetCheckedCodePages(
   std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
   checked_code_pages_.erase(translation_domain_key);
   checked_failed_entry_counts_.erase(translation_domain_key);
+  UnindexCheckedCodeSourcesLocked(translation_domain_key, nullptr);
+}
+
+void Processor::IndexCheckedCodeSourcesLocked(const GuestFunction& function) {
+  const TranslationAddress key = function.translation_address();
+  if (!function.code_sources_complete()) {
+    checked_unsourced_functions_.push_back(key);
+    return;
+  }
+  for (const GuestCodeSourceRange& range : function.code_sources()) {
+    for (uint64_t page = range.begin & ~uint32_t(0xFFF); page < range.end;
+         page += 0x1000) {
+      checked_code_sources_[static_cast<uint32_t>(page)].push_back(
+          {key, std::max(range.begin, static_cast<uint32_t>(page)),
+           static_cast<uint32_t>(
+               std::min<uint64_t>(range.end, page + 0x1000))});
+    }
+  }
+}
+
+void Processor::UnindexCheckedCodeSourcesLocked(const GuestFunction& function) {
+  const TranslationAddress key = function.translation_address();
+  if (!function.code_sources_complete()) {
+    std::erase(checked_unsourced_functions_, key);
+    return;
+  }
+  for (const GuestCodeSourceRange& range : function.code_sources()) {
+    for (uint64_t page = range.begin & ~uint32_t(0xFFF); page < range.end;
+         page += 0x1000) {
+      auto page_it = checked_code_sources_.find(static_cast<uint32_t>(page));
+      if (page_it == checked_code_sources_.end()) {
+        continue;
+      }
+      std::erase_if(page_it->second, [&key](const CheckedCodeSource& source) {
+        return source.function == key;
+      });
+      if (page_it->second.empty()) {
+        checked_code_sources_.erase(page_it);
+      }
+    }
+  }
+}
+
+void Processor::UnindexCheckedCodeSourcesLocked(
+    TranslationDomainKey translation_domain_key,
+    const std::vector<uint32_t>* addresses) {
+  auto matches = [translation_domain_key,
+                  addresses](const TranslationAddress& function) {
+    return function.domain_key() == translation_domain_key &&
+           (!addresses ||
+            std::binary_search(addresses->begin(), addresses->end(),
+                               function.guest_address()));
+  };
+  std::erase_if(checked_unsourced_functions_, matches);
+  for (auto page_it = checked_code_sources_.begin();
+       page_it != checked_code_sources_.end();) {
+    std::erase_if(page_it->second, [&matches](const CheckedCodeSource& source) {
+      return matches(source.function);
+    });
+    page_it = page_it->second.empty() ? checked_code_sources_.erase(page_it)
+                                      : std::next(page_it);
+  }
+}
+
+std::vector<uint32_t> Processor::CheckedCodeSourceOverlapsLocked(
+    const TranslationDomainKey* translation_domain_key, uint32_t begin,
+    uint32_t end) const {
+  std::vector<uint32_t> addresses;
+  auto add = [&](const TranslationAddress& function) {
+    if (!translation_domain_key ||
+        function.domain_key() == *translation_domain_key) {
+      addresses.push_back(function.guest_address());
+    }
+  };
+  for (const TranslationAddress& function : checked_unsourced_functions_) {
+    add(function);
+  }
+  auto add_page = [&](const std::vector<CheckedCodeSource>& sources) {
+    for (const CheckedCodeSource& source : sources) {
+      if (source.begin < end && begin < source.end) {
+        add(source.function);
+      }
+    }
+  };
+  const uint64_t first_page = begin & ~uint32_t(0xFFF);
+  if (((uint64_t(end) - first_page + 0xFFF) >> 12) >
+      checked_code_sources_.size()) {
+    // A sweep wider than the index: visit the recorded pages instead.
+    for (const auto& [page, sources] : checked_code_sources_) {
+      if (page < end && uint64_t(page) + 0x1000 > begin) {
+        add_page(sources);
+      }
+    }
+  } else {
+    for (uint64_t page = first_page; page < end; page += 0x1000) {
+      auto page_it = checked_code_sources_.find(static_cast<uint32_t>(page));
+      if (page_it != checked_code_sources_.end()) {
+        add_page(page_it->second);
+      }
+    }
+  }
+  std::sort(addresses.begin(), addresses.end());
+  addresses.erase(std::unique(addresses.begin(), addresses.end()),
+                  addresses.end());
+  return addresses;
+}
+
+bool Processor::HasCheckedFailedEntriesLocked() const {
+  for (const auto& [translation_domain_key, count] :
+       checked_failed_entry_counts_) {
+    if (count) {
+      return true;
+    }
+  }
+  return false;
 }
 
 GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
     const std::function<bool(TranslationDomainKey)>& include_domain,
     const Module::GuestFunctionInvalidationFilter& select,
-    bool invalidate_whole_domains) {
+    bool invalidate_whole_domains,
+    const CheckedInvalidationCandidates& candidates) {
   GuestCodeInvalidationResult result;
   // The exclusive resolution lock waits out in-flight compiles, so a
   // translation that read the old bytes is published before this runs and is
@@ -983,6 +1200,8 @@ GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
   struct DomainPlan {
     Module* module;
     TranslationDomainKey translation_domain_key;
+    // Only candidates were offered; the failed entries stay.
+    bool candidates_only;
     Module::GuestFunctionInvalidationPlan plan;
   };
   std::vector<DomainPlan> plans;
@@ -993,15 +1212,26 @@ GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
         !IsCheckedResolverOnlyDomainLocked(translation_domain_key)) {
       continue;
     }
-    if (entry_table_.HasInProgressCompilation(translation_domain_key)) {
+    std::optional<std::vector<uint32_t>> domain_candidates;
+    if (candidates && !invalidate_whole_domains) {
+      domain_candidates = candidates(translation_domain_key);
+    }
+    // Compiles hold the resolution lock, so none can be in progress; the
+    // whole-table check is left to the paths that scan anyway.
+    if (!domain_candidates &&
+        entry_table_.HasInProgressCompilation(translation_domain_key)) {
       result.status = GuestCodeInvalidationStatus::kCompilationInProgress;
       return result;
     }
     DomainPlan& domain_plan = plans.emplace_back();
     domain_plan.module = module.get();
     domain_plan.translation_domain_key = translation_domain_key;
-    if (!module->PrepareGuestFunctionsForInvalidation(&domain_plan.plan,
-                                                      select)) {
+    domain_plan.candidates_only = domain_candidates.has_value();
+    if (!module->PrepareGuestFunctionsForInvalidation(
+            &domain_plan.plan, select,
+            domain_candidates
+                ? std::optional<std::span<const uint32_t>>(*domain_candidates)
+                : std::nullopt)) {
       result.status = GuestCodeInvalidationStatus::kFunctionReplacementFailed;
       return result;
     }
@@ -1010,6 +1240,8 @@ GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
   // Every plan exists, so nothing below can fail.
   for (DomainPlan& domain_plan : plans) {
     size_t invalidated_entry_count = 0;
+    const std::vector<const GuestFunction*> retired_functions =
+        domain_plan.plan.old_functions();
     if (invalidate_whole_domains) {
       invalidated_entry_count =
           entry_table_.InvalidateDomain(domain_plan.translation_domain_key);
@@ -1023,12 +1255,20 @@ GuestCodeInvalidationResult Processor::InvalidateCheckedGuestCode(
                                            addresses, &invalidated_entry_count);
       assert_true(invalidated);
       (void)invalidated;
-      invalidated_entry_count += entry_table_.InvalidateFailedEntries(
-          domain_plan.translation_domain_key);
+      if (!domain_plan.candidates_only) {
+        invalidated_entry_count += entry_table_.InvalidateFailedEntries(
+            domain_plan.translation_domain_key);
+      }
     }
     const size_t retired_function_count =
         domain_plan.module->CommitGuestFunctionsForInvalidation(
             std::move(domain_plan.plan));
+    if (!retired_functions.empty()) {
+      std::lock_guard<std::mutex> pages_lock(checked_code_pages_mutex_);
+      for (const GuestFunction* function : retired_functions) {
+        UnindexCheckedCodeSourcesLocked(*function);
+      }
+    }
     result.retired_function_count += retired_function_count;
     result.invalidated_entry_count += invalidated_entry_count;
     if (retired_function_count || invalidated_entry_count) {
@@ -1271,6 +1511,7 @@ bool Processor::CanSaveActiveTranslationDomains() {
   }
 
   auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   for (const auto& [thread_id, thread_info] : thread_debug_infos_) {
     if (thread_info->state == ThreadDebugInfo::State::kExited ||
         thread_info->state == ThreadDebugInfo::State::kZombie) {
@@ -1297,6 +1538,7 @@ bool Processor::Restore(ByteStream* stream) {
       to_delete.push_back(it.first);
     }
   }
+  std::unique_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   for (uint32_t thread_id : to_delete) {
     thread_debug_infos_.erase(thread_id);
   }
@@ -1334,6 +1576,7 @@ void Processor::OnThreadCreated(uint32_t thread_handle,
   thread_info->state = ThreadDebugInfo::State::kAlive;
   thread_info->suspended = false;
   thread_info->thread_handle = thread_handle;
+  std::unique_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   thread_debug_infos_.emplace(thread_info->thread_id, std::move(thread_info));
 }
 
@@ -1347,6 +1590,7 @@ void Processor::OnThreadExit(uint32_t thread_id) {
 
 void Processor::OnThreadDestroyed(uint32_t thread_id) {
   auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> domain_lock(thread_domain_mutex_);
   auto it = thread_debug_infos_.find(thread_id);
   assert_true(it != thread_debug_infos_.end());
   it->second->thread_handle = 0;

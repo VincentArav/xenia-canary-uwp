@@ -49,7 +49,8 @@ struct ThreadDebugInfo {
   // This will be invalidated when the thread dies.
   uint32_t thread_handle = 0;
   // Current translation identity, changed together with the owning
-  // ThreadState under the Processor global lock after old JIT frames unwind.
+  // ThreadState under the Processor's thread domain lock after old JIT frames
+  // unwind.
   // Debugging and save-state code must not interpret a guest PC through
   // another domain.
   TranslationDomainKey translation_domain_key =

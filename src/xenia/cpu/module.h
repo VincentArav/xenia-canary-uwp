@@ -12,6 +12,8 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +47,8 @@ class Module {
     bool empty() const { return replacements.empty(); }
     // Guest addresses of the functions the plan replaces.
     std::vector<uint32_t> addresses() const;
+    // The functions the plan replaces; they outlive the commit.
+    std::vector<const GuestFunction*> old_functions() const;
   };
 
   // Selects the defined or failed guest functions an invalidation replaces.
@@ -78,9 +82,13 @@ class Module {
   const std::vector<uint32_t> GetAddressedFunctions();
   std::vector<uint32_t> GetInstalledGuestFunctionAddresses(
       bool include_externs = true);
+  // With candidate_addresses (sorted, unique), only the functions at those
+  // addresses are offered to filter instead of every function.
   bool PrepareGuestFunctionsForInvalidation(
       GuestFunctionInvalidationPlan* plan_out,
-      const GuestFunctionInvalidationFilter& filter = {});
+      const GuestFunctionInvalidationFilter& filter = {},
+      std::optional<std::span<const uint32_t>> candidate_addresses =
+          std::nullopt);
   size_t CommitGuestFunctionsForInvalidation(
       GuestFunctionInvalidationPlan&& plan);
   void RetireGuestFunctionsForUnload();
@@ -111,9 +119,9 @@ class Module {
   Symbol::Status DefineSymbol(Symbol* symbol);
 
   xe::global_critical_region global_critical_region_;
-  // A Module has one immutable translation domain, so guest address alone is
-  // sufficient for its private symbol namespace.
-  std::unordered_map<uint32_t, Symbol*> map_;
+  // Guest address to the symbol's index in list_, which is append-only; a
+  // replacement takes over its slot.
+  std::unordered_map<uint32_t, size_t> map_;
   std::vector<std::unique_ptr<Symbol>> list_;
   // Replaced functions, kept until teardown: their native code and unwind
   // data stay registered.

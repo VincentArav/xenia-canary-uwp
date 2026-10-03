@@ -10,6 +10,8 @@
 #include "xenia/cpu/translation_domain_registry.h"
 
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 #include "xenia/cpu/guest_memory_access.h"
@@ -59,7 +61,7 @@ const TranslationDomainDescriptor* TranslationDomainRegistry::Register(
     return nullptr;
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::shared_mutex> lock(mutex_);
   if (id_space_exhausted_ || next_domain_id_ == 0) {
     id_space_exhausted_ = true;
     return nullptr;
@@ -94,7 +96,7 @@ const TranslationDomainDescriptor* TranslationDomainRegistry::Lookup(
     return nullptr;
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::shared_lock<std::shared_mutex> lock(mutex_);
   const auto it = active_domains_.find(translation_domain_key);
   return it == active_domains_.end() ? nullptr : it->second;
 }
@@ -108,7 +110,7 @@ bool TranslationDomainRegistry::Retire(
 
   bool retired;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     retired = active_domains_.erase(translation_domain_key) != 0;
   }
   if (processor_) {
@@ -118,7 +120,7 @@ bool TranslationDomainRegistry::Retire(
 }
 
 size_t TranslationDomainRegistry::active_domain_count() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::shared_lock<std::shared_mutex> lock(mutex_);
   return active_domains_.size();
 }
 

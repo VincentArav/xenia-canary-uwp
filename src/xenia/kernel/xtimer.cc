@@ -12,6 +12,7 @@
 #include <algorithm>
 
 #include "xenia/base/logging.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_mode_kernel_runtime.h"
 #include "xenia/kernel/xthread.h"
@@ -30,6 +31,7 @@ XTimer::~XTimer() {
 
 void XTimer::Initialize(uint32_t timer_type) {
   assert_false(timer_);
+  notification_ = timer_type == 0;
   switch (timer_type) {
     case 0:  // NotificationTimer
       timer_ = xe::threading::Timer::CreateManualResetTimer();
@@ -102,12 +104,26 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms,
     };
   }
 
+  host_timer_waited_ = true;
+  lazy_pending_ = false;
   bool result;
   if (!period_ms) {
     result = timer_->SetOnceAt(due_tp, std::move(callback));
   } else {
     result = timer_->SetRepeatingAt(
         due_tp, std::chrono::milliseconds(period_ms), std::move(callback));
+  }
+
+  pacing_ = result && period_ms && notification_ &&
+            kernel_state()->emulator()->mounted_xefu_session();
+  paced_waiters_.clear();
+  if (pacing_) {
+    paced_first_expiry_ =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::max(due_tp - WinSystemClock::now(),
+                     WinSystemClock::duration::zero()));
+    paced_period_ = std::chrono::milliseconds(period_ms);
   }
 
   if (resume) {
@@ -120,7 +136,80 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms,
 
 X_STATUS XTimer::Cancel() {
   std::lock_guard<std::mutex> lock(timer_lock_);
+  pacing_ = false;
+  paced_waiters_.clear();
   return timer_->Cancel() ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+}
+
+xe::threading::WaitHandle* XTimer::GetWaitHandle() {
+  std::lock_guard<std::mutex> lock(timer_lock_);
+  if (!host_timer_waited_) {
+    host_timer_waited_ = true;
+    if (lazy_pending_ || lazy_signaled_) {
+      // A signaled timer fires at once; a periodic one keeps its period.
+      const auto due =
+          lazy_signaled_ ? xe::chrono::WinSystemClock::now() : lazy_due_;
+      const bool armed =
+          lazy_pending_ && lazy_period_ms_
+              ? timer_->SetRepeatingAt(
+                    due, std::chrono::milliseconds(lazy_period_ms_), nullptr)
+              : timer_->SetOnceAt(due, nullptr);
+      if (!armed) {
+        XELOGE("XTimer: failed to arm the host timer for a wait");
+      }
+    }
+  }
+  return timer_.get();
+}
+
+uint64_t XTimer::PacedExpiryCountLocked(
+    std::chrono::steady_clock::time_point now) const {
+  if (now < paced_first_expiry_) {
+    return 0;
+  }
+  return 1 + static_cast<uint64_t>((now - paced_first_expiry_) / paced_period_);
+}
+
+std::chrono::milliseconds XTimer::WaitPacingDelay() {
+  XThread* thread = XThread::GetCurrentThread();
+  std::lock_guard<std::mutex> lock(timer_lock_);
+  if (!pacing_ || !thread) {
+    return std::chrono::milliseconds(0);
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const uint64_t expiries = PacedExpiryCountLocked(now);
+  for (const auto& [thread_id, seen] : paced_waiters_) {
+    if (thread_id == thread->thread_id()) {
+      if (!expiries || seen < expiries) {
+        break;
+      }
+      const auto next =
+          paced_first_expiry_ + paced_period_ * static_cast<int64_t>(seen);
+      return std::chrono::ceil<std::chrono::milliseconds>(next - now);
+    }
+  }
+  return std::chrono::milliseconds(0);
+}
+
+void XTimer::WaitCallback() {
+  XThread* thread = XThread::GetCurrentThread();
+  std::lock_guard<std::mutex> lock(timer_lock_);
+  if (!pacing_ || !thread) {
+    return;
+  }
+  // The timer satisfied the wait, so it has expired at least once.
+  const uint64_t expiries = std::max<uint64_t>(
+      PacedExpiryCountLocked(std::chrono::steady_clock::now()), 1);
+  for (auto& [thread_id, seen] : paced_waiters_) {
+    if (thread_id == thread->thread_id()) {
+      seen = expiries;
+      return;
+    }
+  }
+  if (paced_waiters_.size() >= 64) {
+    paced_waiters_.clear();
+  }
+  paced_waiters_.emplace_back(thread->thread_id(), expiries);
 }
 
 bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
@@ -133,6 +222,8 @@ bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
   std::shared_ptr<xe::threading::TimerQueueWaitItem> previous_item;
   {
     std::lock_guard<std::mutex> lock(timer_lock_);
+    pacing_ = false;
+    paced_waiters_.clear();
     was_armed = guest_timer_armed_;
     generation = ++guest_timer_generation_;
     guest_timer_armed_ = true;
@@ -144,6 +235,8 @@ bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
     }
     previous_item = guest_timer_wait_item_.lock();
     guest_timer_wait_item_.reset();
+    lazy_pending_ = false;
+    lazy_signaled_ = false;
     if (guest_timer_ptr_) {
       // Mirror the fields guest code may read inline.
       auto guest_timer =
@@ -177,12 +270,24 @@ bool XTimer::SetGuestTimer(int64_t due_time, uint32_t period_ms,
   const auto due_tp = now + delay;
 
   // The host waitable timer only provides the signal state for guest waits.
-  const bool armed =
-      periodic ? timer_->SetRepeatingAt(
-                     due_tp, std::chrono::milliseconds(period_ms), nullptr)
-               : timer_->SetOnceAt(due_tp, nullptr);
-  if (!armed) {
-    XELOGE("KeSetTimerEx: failed to arm the host timer");
+  {
+    std::lock_guard<std::mutex> lock(timer_lock_);
+    if (generation == guest_timer_generation_) {
+      if (host_timer_waited_) {
+        const bool armed =
+            periodic
+                ? timer_->SetRepeatingAt(
+                      due_tp, std::chrono::milliseconds(period_ms), nullptr)
+                : timer_->SetOnceAt(due_tp, nullptr);
+        if (!armed) {
+          XELOGE("KeSetTimerEx: failed to arm the host timer");
+        }
+      } else {
+        lazy_pending_ = true;
+        lazy_due_ = due_tp;
+        lazy_period_ms_ = period_ms;
+      }
+    }
   }
 
   // Deliver the DPC from the timer queue. Look the timer up by handle on
@@ -238,11 +343,15 @@ bool XTimer::CancelGuestTimer() {
       memory()->TranslateVirtual<X_KTIMER*>(guest_timer_ptr_)->header.inserted =
           0;
     }
+    // Cancelling keeps the signal state.
+    lazy_pending_ = false;
+    if (host_timer_waited_) {
+      timer_->Cancel();
+    }
   }
   if (wait_item) {
     wait_item->Disarm();
   }
-  timer_->Cancel();
   return was_armed;
 }
 
@@ -257,7 +366,9 @@ void XTimer::OnGuestTimerExpired(uint64_t generation, uint32_t dpc_ptr,
     }
     if (!periodic) {
       guest_timer_armed_ = false;
+      lazy_pending_ = false;
     }
+    lazy_signaled_ = true;
     if (guest_timer_ptr_) {
       auto guest_timer =
           memory()->TranslateVirtual<X_KTIMER*>(guest_timer_ptr_);

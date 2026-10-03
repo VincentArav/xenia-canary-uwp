@@ -202,6 +202,18 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  if (timeout_ms.count()) {
+    const auto delay = std::min(WaitPacingDelay(), timeout_ms);
+    if (delay.count() > 0) {
+      if (!alertable) {
+        xe::threading::Sleep(delay);
+      } else if (xe::threading::AlertableSleep(delay) ==
+                 xe::threading::SleepResult::kAlerted) {
+        return X_STATUS_USER_APC;
+      }
+    }
+  }
+
   auto result =
       xe::threading::Wait(wait_handle, alertable ? true : false, timeout_ms);
 
@@ -282,8 +294,33 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
   X_STATUS status;
   uint32_t boost_increment = 0;
   if (wait_type) {
-    auto result = xe::threading::WaitAny(wait_handles, count,
-                                         alertable ? true : false, timeout_ms);
+    std::pair<xe::threading::WaitResult, size_t> result(
+        xe::threading::WaitResult::kTimeout, 0);
+    bool waited = false;
+    // The first object that asks to hold off does so; only the objects before
+    // it could satisfy the wait meanwhile.
+    for (uint32_t i = 0; timeout_ms.count() && i < count; ++i) {
+      const auto delay = std::min(objects[i]->WaitPacingDelay(), timeout_ms);
+      if (delay.count() <= 0) {
+        continue;
+      }
+      if (i) {
+        result = xe::threading::WaitAny(wait_handles, i,
+                                        alertable ? true : false, delay);
+        waited = result.first != xe::threading::WaitResult::kTimeout;
+      } else if (!alertable) {
+        xe::threading::Sleep(delay);
+      } else if (xe::threading::AlertableSleep(delay) ==
+                 xe::threading::SleepResult::kAlerted) {
+        result.first = xe::threading::WaitResult::kUserCallback;
+        waited = true;
+      }
+      break;
+    }
+    if (!waited) {
+      result = xe::threading::WaitAny(wait_handles, count,
+                                      alertable ? true : false, timeout_ms);
+    }
     switch (result.first) {
       case xe::threading::WaitResult::kSuccess:
         objects[result.second]->WaitCallback();
@@ -390,6 +427,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
 
   // Stash pointer in struct.
   // FIXME: This assumes the object has a dispatch header (some don't!)
+  native_struct_ptr_.store(native_ptr, std::memory_order_release);
   StashHandle(header, handle());
 
   guest_object_ptr_ = native_ptr;
@@ -408,13 +446,25 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
   // each time.
   // We identify this by setting wait_list.flink_ptr to a magic value. When set,
   // wait_list.blink_ptr will hold a handle to our object.
+  auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
+  if (!already_locked && header->wait_list.flink_ptr == kXObjSignature) {
+    // An object created earlier: look its handle up under the handle table's
+    // lock alone, and use it if it is this struct's. First use takes the
+    // global lock below.
+    auto object = kernel_state->object_table()->LookupObject<XObject>(
+        header->wait_list.blink_ptr);
+    if (object && object->native_struct_ptr_.load(std::memory_order_acquire) ==
+                      kernel_state->memory()->HostToGuestVirtual(native_ptr)) {
+      return object;
+    }
+  }
+
   if (!already_locked) {
     global_critical_region::mutex().lock();
   }
 
   XObject* result;
 
-  auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
   if (as_type == -1) {
     as_type = header->type;
   }
@@ -477,6 +527,9 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
     // Stash pointer in struct.
     // FIXME: This assumes the object contains a dispatch header (some don't!)
     if (object) {
+      object->native_struct_ptr_.store(
+          kernel_state->memory()->HostToGuestVirtual(native_ptr),
+          std::memory_order_release);
       StashHandle(header, object->handle());
     }
     result = object;

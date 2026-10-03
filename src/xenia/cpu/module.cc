@@ -34,7 +34,7 @@ bool Module::ContainsAddress(uint32_t address) { return true; }
 Symbol* Module::LookupSymbol(uint32_t address, bool wait) {
   auto global_lock = global_critical_region_.Acquire();
   const auto it = map_.find(address);
-  Symbol* symbol = it != map_.end() ? it->second : nullptr;
+  Symbol* symbol = it != map_.end() ? list_[it->second].get() : nullptr;
   if (symbol) {
     if (symbol->status() == Symbol::Status::kDeclaring) {
       // Some other thread is declaring the symbol - wait.
@@ -60,7 +60,7 @@ Symbol::Status Module::DeclareSymbol(Symbol::Type type, uint32_t address,
   *out_symbol = nullptr;
   auto global_lock = global_critical_region_.Acquire();
   auto it = map_.find(address);
-  Symbol* symbol = it != map_.end() ? it->second : nullptr;
+  Symbol* symbol = it != map_.end() ? list_[it->second].get() : nullptr;
   Symbol::Status status;
   if (symbol) {
     // If we exist but are the wrong type, die.
@@ -89,7 +89,7 @@ Symbol::Status Module::DeclareSymbol(Symbol::Type type, uint32_t address,
         symbol = new Symbol(Symbol::Type::kVariable, this, address);
         break;
     }
-    map_[address] = symbol;
+    map_[address] = list_.size();
     list_.emplace_back(symbol);
     status = Symbol::Status::kNew;
   }
@@ -164,7 +164,8 @@ std::vector<uint32_t> Module::GetInstalledGuestFunctionAddresses(
     bool include_externs) {
   auto global_lock = global_critical_region_.Acquire();
   std::vector<uint32_t> addresses;
-  for (const auto& [address, symbol] : map_) {
+  for (const auto& [address, index] : map_) {
+    Symbol* symbol = list_[index].get();
     if (symbol->type() != Symbol::Type::kFunction) {
       continue;
     }
@@ -188,9 +189,20 @@ std::vector<uint32_t> Module::GuestFunctionInvalidationPlan::addresses() const {
   return result;
 }
 
+std::vector<const GuestFunction*>
+Module::GuestFunctionInvalidationPlan::old_functions() const {
+  std::vector<const GuestFunction*> result;
+  result.reserve(replacements.size());
+  for (const Replacement& replacement : replacements) {
+    result.push_back(replacement.old_function);
+  }
+  return result;
+}
+
 bool Module::PrepareGuestFunctionsForInvalidation(
     GuestFunctionInvalidationPlan* plan_out,
-    const GuestFunctionInvalidationFilter& filter) {
+    const GuestFunctionInvalidationFilter& filter,
+    std::optional<std::span<const uint32_t>> candidate_addresses) {
   if (!plan_out || plan_out->module || !plan_out->replacements.empty()) {
     return false;
   }
@@ -200,7 +212,17 @@ bool Module::PrepareGuestFunctionsForInvalidation(
 
   // Create every replacement before publishing any, so a failure leaves the
   // module unchanged.
-  for (size_t i = 0; i < list_.size(); ++i) {
+  const size_t count =
+      candidate_addresses ? candidate_addresses->size() : list_.size();
+  for (size_t candidate = 0; candidate < count; ++candidate) {
+    size_t i = candidate;
+    if (candidate_addresses) {
+      const auto map_it = map_.find((*candidate_addresses)[candidate]);
+      if (map_it == map_.end()) {
+        continue;
+      }
+      i = map_it->second;
+    }
     Symbol* symbol = list_[i].get();
     if (symbol->type() != Symbol::Type::kFunction) {
       continue;
@@ -253,10 +275,11 @@ size_t Module::CommitGuestFunctionsForInvalidation(
                 replacement.old_function);
     const auto map_it = map_.find(replacement.old_function->address());
     assert_true(map_it != map_.end());
-    assert_true(map_it->second == replacement.old_function);
+    assert_true(map_it->second == replacement.symbol_index);
+    (void)map_it;
     replacement.old_function->Retire();
     retired_list_.push_back(std::move(list_[replacement.symbol_index]));
-    map_it->second = replacement.new_function.get();
+    // The map keeps the index, so it finds the replacement.
     list_[replacement.symbol_index] = std::move(replacement.new_function);
   }
   const size_t replacement_count = plan.replacements.size();

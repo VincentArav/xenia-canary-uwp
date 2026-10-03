@@ -10,8 +10,11 @@
 #ifndef XENIA_KERNEL_XTIMER_H_
 #define XENIA_KERNEL_XTIMER_H_
 
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #include "xenia/base/threading.h"
 #include "xenia/base/threading_timer_queue.h"
@@ -45,14 +48,30 @@ class XTimer : public XObject {
   bool CancelGuestTimer();
 
  protected:
-  xe::threading::WaitHandle* GetWaitHandle() override { return timer_.get(); }
+  xe::threading::WaitHandle* GetWaitHandle() override;
+  void WaitCallback() override;
+  std::chrono::milliseconds WaitPacingDelay() override;
 
  private:
   void OnGuestTimerExpired(uint64_t generation, uint32_t dpc_ptr,
                            bool periodic);
+  // Expiries of the paced timer by now; 0 before the first.
+  uint64_t PacedExpiryCountLocked(
+      std::chrono::steady_clock::time_point now) const;
 
   std::unique_ptr<xe::threading::Timer> timer_;
   std::mutex timer_lock_;
+  bool notification_ = false;
+
+  // A periodic notification timer stays signaled after its first expiry, so a
+  // loop waiting on it spins. In XeFu sessions, a thread the timer already
+  // satisfied since its latest expiry is held off until the next one, as if
+  // preempted; a wait the timer wouldn't satisfy is unaffected.
+  bool pacing_ = false;
+  std::chrono::steady_clock::time_point paced_first_expiry_;
+  std::chrono::steady_clock::duration paced_period_{};
+  // Per waiting thread, the expiry count when the timer last satisfied it.
+  std::vector<std::pair<uint32_t, uint64_t>> paced_waiters_;
 
   XThread* callback_thread_ = nullptr;
   uint32_t callback_routine_ = 0;
@@ -66,6 +85,14 @@ class XTimer : public XObject {
   uint32_t guest_timer_ptr_ = 0;
   bool guest_timer_armed_ = false;
   uint64_t guest_timer_generation_ = 0;
+  // Guest armings arm the host timer only once a thread has waited on the
+  // timer; until then the arming is recorded here, and the first wait brings
+  // the host timer up to date.
+  bool host_timer_waited_ = false;
+  bool lazy_pending_ = false;
+  bool lazy_signaled_ = false;
+  xe::chrono::WinSystemClock::time_point lazy_due_;
+  uint32_t lazy_period_ms_ = 0;
   // Thread that armed the timer. Its DPC targets that thread's processor.
   uint32_t guest_timer_dpc_thread_id_ = 0;
   std::weak_ptr<xe::threading::TimerQueueWaitItem> guest_timer_wait_item_;

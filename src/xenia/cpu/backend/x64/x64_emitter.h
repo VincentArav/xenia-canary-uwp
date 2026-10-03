@@ -264,6 +264,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
   void UnimplementedInstr(const hir::Instr* i);
 
   void Call(const hir::Instr* instr, GuestFunction* function);
+  // The regular guest call; Call() tries the inline kernel exports first.
+  void CallGuestFunction(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
   GuestCallDispatchMode current_guest_call_dispatch_mode() const {
     return current_guest_call_dispatch_mode_;

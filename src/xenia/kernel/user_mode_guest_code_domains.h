@@ -237,13 +237,14 @@ class UserModeGuestCodeDomainCoordinator final
   // flushes them. The caller must have left any checked frame.
   UserModeGuestCodeDomainFlushResult InvalidateMappingDomains(
       UserModeMappingHandle mapping);
-  // Live TB flush: retires every translation in the mapping's four domains
-  // (or in every mapping's) while threads may keep running in them. Unlike
-  // InvalidateMappingDomains it never closes execution, so a concurrent
-  // system call or continuation still finds the lease. The caller must hold
-  // neither the global lock nor a resolution lock.
+  // Live TB flush of the mapping's domains while threads run in them: retires
+  // the translations whose code moved, probing only flushed_ranges when given.
+  // Never closes execution. The caller must hold neither the global nor the
+  // resolution lock.
   cpu::GuestCodeInvalidationResult InvalidateMappingDomainsLive(
-      UserModeMappingHandle mapping);
+      UserModeMappingHandle mapping,
+      std::optional<std::span<const cpu::FlushedGuestPageRange>>
+          flushed_ranges = std::nullopt);
   cpu::GuestCodeInvalidationResult InvalidateAllMappingDomainsLive();
   size_t active_lease_count() const;
 

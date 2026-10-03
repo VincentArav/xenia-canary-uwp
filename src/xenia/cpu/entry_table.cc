@@ -9,6 +9,9 @@
 
 #include "xenia/cpu/entry_table.h"
 
+#include <mutex>
+#include <shared_mutex>
+
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 
@@ -20,7 +23,7 @@ EntryTable::EntryTable() = default;
 EntryTable::~EntryTable() = default;
 
 Entry* EntryTable::Get(const TranslationAddress& address) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> table_lock(mutex_);
   uint32_t idx = map_.IndexForKey(address);
   if (idx == map_.size() || *map_.KeyAt(idx) != address) {
     return nullptr;
@@ -40,7 +43,7 @@ Entry::Status EntryTable::GetOrCreate(const TranslationAddress& address,
   // TODO(benvanik): replace with a map with wait-free for find.
   // https://github.com/facebook/folly/blob/master/folly/AtomicHashMap.h
 
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(mutex_);
 
   uint32_t idx = map_.IndexForKey(address);
 
@@ -55,10 +58,10 @@ Entry::Status EntryTable::GetOrCreate(const TranslationAddress& address,
       // the global lock, arent we? so we wouldnt be executing here
       // Still compiling, so spin.
       do {
-        global_lock.unlock();
+        table_lock.unlock();
         // TODO(benvanik): sleep for less time?
         xe::threading::Sleep(std::chrono::microseconds(10));
-        global_lock.lock();
+        table_lock.lock();
       } while (entry->status == Entry::STATUS_COMPILING);
     }
     status = entry->status;
@@ -75,13 +78,13 @@ Entry::Status EntryTable::GetOrCreate(const TranslationAddress& address,
     // map_[address] = entry;
     status = Entry::STATUS_NEW;
   }
-  global_lock.unlock();
+  table_lock.unlock();
   *out_entry = entry;
   return status;
 }
 
 void EntryTable::Delete(const TranslationAddress& address) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(mutex_);
   uint32_t idx = map_.IndexForKey(address);
   if (idx != map_.size() && *map_.KeyAt(idx) == address) {
     map_.EraseAt(idx);
@@ -90,7 +93,7 @@ void EntryTable::Delete(const TranslationAddress& address) {
 
 std::vector<Function*> EntryTable::FindWithAddress(
     const TranslationAddress& address) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> table_lock(mutex_);
   std::vector<Function*> fns;
   for (auto& it : map_.Values()) {
     Entry* entry = it;
@@ -107,7 +110,7 @@ std::vector<Function*> EntryTable::FindWithAddress(
 }
 
 bool EntryTable::HasInProgressCompilation(TranslationDomainKey domain_key) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> table_lock(mutex_);
   for (Entry* entry : map_.Values()) {
     if (entry->translation_address.domain_key() == domain_key &&
         entry->status.load(std::memory_order_acquire) ==
@@ -126,7 +129,7 @@ bool EntryTable::InvalidateAddresses(TranslationDomainKey domain_key,
   }
   *invalidated_count_out = 0;
 
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(mutex_);
 
   // Refuse the whole request if any entry is compiling: its compiler must not
   // publish into a tombstone.
@@ -155,7 +158,7 @@ bool EntryTable::InvalidateAddresses(TranslationDomainKey domain_key,
 }
 
 size_t EntryTable::InvalidateDomain(TranslationDomainKey domain_key) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(mutex_);
   for (Entry* entry : map_.Values()) {
     if (entry->translation_address.domain_key() == domain_key &&
         entry->status.load(std::memory_order_acquire) ==
@@ -179,7 +182,7 @@ size_t EntryTable::InvalidateDomain(TranslationDomainKey domain_key) {
 }
 
 size_t EntryTable::InvalidateFailedEntries(TranslationDomainKey domain_key) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> table_lock(mutex_);
   size_t invalidated_count = 0;
   for (uint32_t i = map_.size(); i != 0; --i) {
     const uint32_t index = i - 1;
