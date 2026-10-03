@@ -130,21 +130,27 @@ class XexModule : public xe::cpu::Module {
     return &security_info_;
   }
 
-  uint32_t image_size() const {
-    assert_not_zero(base_address_);
-
-    // Calculate the new total size of the XEX image from its headers.
-    auto heap = memory()->LookupHeap(base_address_);
-    uint32_t total_size = 0;
+  // Total page count of the XEX image from its headers, in pages of the heap
+  // the image lives in (which depends on the base address).
+  uint32_t image_page_count() const {
+    uint32_t page_count = 0;
     for (uint32_t i = 0; i < xex_security_info()->page_descriptor_count; i++) {
       // Byteswap the bitfield manually.
       xex2_page_descriptor desc;
       desc.value =
           xe::byte_swap(xex_security_info()->page_descriptors[i].value);
 
-      total_size += desc.page_count * heap->page_size();
+      page_count += desc.page_count;
     }
-    return total_size;
+    return page_count;
+  }
+
+  uint32_t image_size() const {
+    assert_not_zero(base_address_);
+
+    // Calculate the new total size of the XEX image from its headers.
+    auto heap = memory()->LookupHeap(base_address_);
+    return image_page_count() * heap->page_size();
   }
 
   const std::vector<ImportLibrary>* import_libraries() const {
@@ -229,6 +235,11 @@ class XexModule : public xe::cpu::Module {
             (XEX_MODULE_MODULE_PATCH | XEX_MODULE_PATCH_DELTA |
              XEX_MODULE_PATCH_FULL));
   }
+
+  // The section type of the image page holding guest_addr, from the security
+  // info page descriptors. False when the address is outside the image.
+  bool GetPageSectionType(uint32_t guest_addr,
+                          xex2_section_type* section_type) const;
 
   InfoCacheFlags* GetInstructionAddressFlags(uint32_t guest_addr);
 

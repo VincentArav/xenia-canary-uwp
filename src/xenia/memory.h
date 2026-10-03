@@ -232,6 +232,10 @@ class BaseHeap {
   // Inserts a free block and coalesces with adjacent free blocks.
   void InsertFreeBlock(uint32_t start_page, uint32_t page_count);
 
+  // Whether a change to this heap's pages must advance the translation epoch:
+  // physical memory always, XEX images while the image window is open.
+  bool ChangesAdvanceTranslationEpoch() const;
+
   Memory* memory_;
   uint8_t* membase_;
   HeapType heap_type_;
@@ -339,6 +343,27 @@ class PhysicalHeap : public BaseHeap {
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
   std::vector<SystemPageFlagsBlock> system_page_flags_;
 };
+
+// XEX images (the kGuestXex heaps, 0x80000000-0x9FFFFFFF) have no guest
+// physical memory. While the image window is on, their physical addresses are
+// window addresses (0x40000000 and up, above any other), which user-mode
+// translation resolves back to the image. TranslatePhysical must never see
+// one.
+inline constexpr uint32_t kImagePhysicalWindowBase = 0x40000000;
+inline constexpr uint32_t kImagePhysicalWindowSize = 0x20000000;
+inline constexpr uint32_t kImageVirtualBase = 0x80000000;
+
+constexpr bool IsImagePhysicalWindowAddress(uint32_t address) {
+  return address - kImagePhysicalWindowBase < kImagePhysicalWindowSize;
+}
+// The address must be in the window.
+constexpr uint32_t ImageVirtualAddressFromWindow(uint32_t address) {
+  return address - kImagePhysicalWindowBase + kImageVirtualBase;
+}
+// The address must be in a kGuestXex heap.
+constexpr uint32_t ImageWindowAddressFromVirtual(uint32_t address) {
+  return address - kImageVirtualBase + kImagePhysicalWindowBase;
+}
 
 // Models the entire guest memory system on the console.
 // This exposes interfaces to both virtual and physical memory and a TLB and
@@ -591,6 +616,15 @@ class Memory {
     std::erase(translation_stale_flags_, flag);
   }
 
+  // Whether user-mode translation may name XEX image pages through the image
+  // window. Off unless the running title maps image pages into user mode;
+  // while on, XEX heap changes advance the translation epoch too.
+  bool image_physical_window_enabled() const {
+    return image_physical_window_enabled_.load(std::memory_order_acquire);
+  }
+  // Advances the translation epoch when the setting changes.
+  void SetImagePhysicalWindowEnabled(bool enabled);
+
   // Gets the heap for the address space containing the given address.
   XE_NOALIAS
   const BaseHeap* LookupHeap(uint32_t address) const;
@@ -689,6 +723,7 @@ class Memory {
   static_assert(std::atomic<uint64_t>::is_always_lock_free);
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  std::atomic<bool> image_physical_window_enabled_{false};
 };
 
 }  // namespace xe

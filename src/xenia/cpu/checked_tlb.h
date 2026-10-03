@@ -32,7 +32,8 @@ static_assert(kCheckedTlbEntryCount == 1u << kCheckedTlbIndexBits);
 // Entry tag bits above the 20-bit effective page number.
 constexpr uint32_t kCheckedTlbValidBit = 0x40000000u;
 // Generated code may access host_delta + ea directly. Set on every read entry
-// and on write entries that go through a watched guest view.
+// and on write entries that go through a watched guest view, or through the
+// XEX image page of an image window page, which no observer watches.
 constexpr uint32_t kCheckedTlbInlineBit = 0x80000000u;
 // Accessor ids up to kCheckedTlbMaxPackedAccessorId sit in tag bits 20-29, so
 // generated code matches page and accessor with one compare. Entries of larger

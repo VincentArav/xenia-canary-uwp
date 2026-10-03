@@ -25,7 +25,8 @@ struct IcacheSweepPhysicalRange {
 };
 
 struct IcacheSweepClassification {
-  // Word-aligned physical ranges covered through the physical views.
+  // Word-aligned physical ranges covered through the physical views, and
+  // while the image window is open, the image window ranges of XEX images.
   std::vector<IcacheSweepPhysicalRange> physical_ranges;
   // Part of the sweep lies outside the physical views: DefaultDirect code,
   // which isn't invalidated live.
@@ -33,9 +34,9 @@ struct IcacheSweepClassification {
 };
 
 // Splits a KeSweepIcacheRange argument into the guest physical ranges it
-// names. Only the physical-view heaps (0xA0000000 and up) map a virtual
-// address to physical memory; Memory::GetPhysicalAddress would return a
-// meaningless offset for any other heap. The end is clamped at 4 GiB.
+// names: its parts in the physical views (0xA0000000 and up) and, while the
+// image window is open, the window ranges of its XEX image parts. The end is
+// clamped at 4 GiB.
 inline IcacheSweepClassification ClassifyIcacheSweep(const Memory& memory,
                                                      uint32_t address,
                                                      uint32_t size) {
@@ -62,6 +63,15 @@ inline IcacheSweepClassification ClassifyIcacheSweep(const Memory& memory,
       classification.physical_ranges.push_back(
           {physical_begin, (physical_last | 3u) + 1});
     } else {
+      if (heap->heap_type() == HeapType::kGuestXex &&
+          memory.image_physical_window_enabled()) {
+        const uint32_t window_begin =
+            ImageWindowAddressFromVirtual(static_cast<uint32_t>(begin)) & ~3u;
+        const uint32_t window_last = ImageWindowAddressFromVirtual(
+            static_cast<uint32_t>(segment_end - 1));
+        classification.physical_ranges.push_back(
+            {window_begin, (window_last | 3u) + 1});
+      }
       classification.non_physical = true;
     }
     begin = segment_end;

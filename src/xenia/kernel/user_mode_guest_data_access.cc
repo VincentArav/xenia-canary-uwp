@@ -440,6 +440,9 @@ thread_local std::unique_ptr<cpu::CheckedTlb> fallback_tlb;
 
 std::atomic<uint32_t> next_tlb_accessor_id{1};
 
+// Page-table words are always physical memory: the control page is below
+// 0x20000000 and a leaf table ends at most at 0x1FFFFFFF, never in the image
+// window.
 bool TranslationSourceCurrent(const Memory& memory,
                               const cpu::CheckedTlbSource& source) {
   if (source.root_entry_physical_address &&
@@ -525,7 +528,7 @@ uint8_t* CachedHostAddress(const cpu::CheckedTlbEntry& entry,
 
 // host_page holds the physical page's bytes: physical memory, or for a write
 // the guest view page that maps it writable, which only inline_usable entries
-// use.
+// use. For an image window page it is always the XEX image page it names.
 void InsertCachedTranslation(cpu::CheckedTlbEntry* entries,
                              cpu::CheckedTlbSource* sources,
                              uint32_t accessor_id, uint32_t effective_address,
@@ -548,6 +551,23 @@ void InsertCachedTranslation(cpu::CheckedTlbEntry* entries,
 // The page of a guest physical view that maps the physical page committed
 // and writable, if any. The 0xE0000000 view is 4 KiB above physical memory.
 uint8_t* FindWritableAliasPage(Memory& memory, uint32_t physical_page) {
+  // An image window page's only view is its XEX image page, which no physical
+  // observer watches. The physical views at its address map unrelated memory.
+  if (IsImagePhysicalWindowAddress(physical_page)) {
+    const uint32_t image_address = ImageVirtualAddressFromWindow(physical_page);
+    const BaseHeap* heap = memory.LookupHeap(image_address);
+    if (!memory.image_physical_window_enabled() || !heap ||
+        heap->heap_type() != HeapType::kGuestXex) {
+      return nullptr;
+    }
+    const std::optional<HeapPageInfo> page_info =
+        heap->QueryPageInfo(image_address);
+    if (page_info && (page_info->state & kMemoryAllocationCommit) &&
+        (page_info->protect & kMemoryProtectWrite)) {
+      return memory.TranslateVirtual<uint8_t*>(image_address);
+    }
+    return nullptr;
+  }
   constexpr std::array<std::pair<uint32_t, uint32_t>, 3> kViews = {
       {{0xA0000000u, 0u}, {0xC0000000u, 0u}, {0xE0000000u, 0x1000u}}};
   for (const auto& [view_base, physical_offset] : kViews) {
@@ -683,18 +703,18 @@ UserModeGuestDataReadResult UserModeGuestDataAccessor::ReadAlignedCached(
 
   UserModeGuestDataReadResult result = ReadAligned(operand, effective_address);
   // Cache only what was walked under the epoch looked up first: a TB flush
-  // during the walk may have changed it.
+  // during the walk may have changed it. An advance completing after the check
+  // syncs the table past that epoch, and the table then takes none.
   if (result && Memory::translation_epoch() == epoch) {
     cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
-    for (size_t i = 0; i < result.plan.fragment_count; ++i) {
+    for (size_t i = 0; tlb.epoch == epoch && i < result.plan.fragment_count;
+         ++i) {
       const uint32_t physical_address =
           result.translations[i]->physical_address;
       InsertCachedTranslation(
           tlb.read, tlb.read_source, tlb_accessor_id_,
           result.plan.fragments[i].storage_effective_address, physical_address,
-          memory_->TranslatePhysical<const uint8_t*>(physical_address &
-                                                     ~0xFFFu),
-          true,
+          TranslateUserModePhysical(*memory_, physical_address & ~0xFFFu), true,
           SourceOf(*result.translations[i], result.translations[i]->raw_pte));
     }
   }
@@ -752,7 +772,8 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
     if (hits == plan.fragment_count && alias_hits == 0) {
       // Straight to physical memory. As in CommitSyntheticPlannedStore:
       // observers first, under the global lock, then the lease that mapping
-      // retirement waits for.
+      // retirement waits for. Entries without the inline bit are physical
+      // memory: image window entries are always inline.
       const uint8_t* const physical_base =
           memory_->TranslatePhysical<const uint8_t*>(0);
       auto global_lock = global_critical_region::AcquireDirect();
@@ -789,7 +810,9 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
   // page-table write.
   if (result.write_performed && Memory::translation_epoch() == epoch) {
     cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
-    for (size_t i = 0; i < result.plan.fragment_count; ++i) {
+    // As in ReadAlignedCached.
+    for (size_t i = 0; tlb.epoch == epoch && i < result.plan.fragment_count;
+         ++i) {
       const UserModeAddressTranslationResult& walk =
           *result.commit_translations[i];
       const uint32_t physical_address = walk.physical_address;
@@ -799,6 +822,11 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::StoreAlignedCached(
       // watches it.
       uint8_t* const alias_page =
           FindWritableAliasPage(*memory_, physical_page);
+      // An image window page no longer writable is not cached: physical
+      // memory at its address is unrelated.
+      if (!alias_page && IsImagePhysicalWindowAddress(physical_page)) {
+        continue;
+      }
       // The commit set the C bit if the walk found it clear.
       InsertCachedTranslation(
           tlb.write, tlb.write_source, tlb_accessor_id_,
@@ -848,10 +876,18 @@ UserModeGuestDataStoreResult UserModeGuestDataAccessor::MemsetAlignedCached(
   if (result.write_performed && result.commit_translations[0] &&
       Memory::translation_epoch() == epoch) {
     cpu::CheckedTlb& tlb = AcquireTlb(checked_tlb, *memory_, epoch);
+    // As in ReadAlignedCached.
+    if (tlb.epoch != epoch) {
+      return result;
+    }
     const UserModeAddressTranslationResult& walk =
         *result.commit_translations[0];
     const uint32_t physical_page = walk.physical_address & ~0xFFFu;
     uint8_t* const alias_page = FindWritableAliasPage(*memory_, physical_page);
+    // As in StoreAlignedCached.
+    if (!alias_page && IsImagePhysicalWindowAddress(physical_page)) {
+      return result;
+    }
     InsertCachedTranslation(
         tlb.write, tlb.write_source, tlb_accessor_id_, effective_address,
         walk.physical_address,

@@ -153,6 +153,20 @@ dword_result_t XamContentGetDeviceData_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceData, kContent, kImplemented);
 
+// Takes one argument: where to write the device ID.
+dword_result_t XamContentGetDefaultDevice_entry(lpdword_t device_id_ptr) {
+  if (!device_id_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  const uint32_t device_id = PickDefaultStorageDevice(ListStorageDevices());
+  if (!device_id) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  *device_id_ptr = device_id;
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentGetDefaultDevice, kContent, kImplemented);
+
 dword_result_t XamContentCreateDeviceEnumerator_entry(dword_t content_type,
                                                       dword_t content_flags,
                                                       dword_t max_count,

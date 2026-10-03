@@ -16,6 +16,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_mode_guest_code_domains.h"
 #include "xenia/kernel/user_mode_kernel_runtime.h"
 #include "xenia/kernel/user_mode_manager.h"
@@ -503,6 +504,10 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   if (!executable_module_) {
     return;
   }
+
+  // Before any of the title's code runs; a later title closes it again.
+  memory_->SetImagePhysicalWindowEnabled(
+      MapsImagePagesIntoUserMode(title_id()));
 
   auto title_process =
       memory_->TranslateVirtual<X_KPROCESS*>(GetTitleProcess());

@@ -8,6 +8,9 @@
  */
 
 #include "xenia/kernel/xam/apps/xmp_app.h"
+
+#include <algorithm>
+
 #include "xenia/kernel/xthread.h"
 
 #include "xenia/base/logging.h"
@@ -516,11 +519,10 @@ X_HRESULT XmpApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
         return X_E_SUCCESS;
       }
 
-      if (args->max_source.get() < kMaxSourcesForMediaPlayer) {
-        return 0x80070008;
-      }
-
-      for (uint8_t i = 0; i < kMaxSourcesForMediaPlayer; ++i) {
+      // The caller sizes the array; no source is reported, so any size will do.
+      const uint32_t entry_count =
+          std::min<uint32_t>(args->max_source.get(), kMaxSourcesForMediaPlayer);
+      for (uint32_t i = 0; i < entry_count; ++i) {
         if (!args->get_connected_sources_only) {
           // There should be some call to handle it, but we ignore it for now.
         }

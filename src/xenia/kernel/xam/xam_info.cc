@@ -996,6 +996,13 @@ void XampWebInstrumentationSetProfileCounts_entry(dword_t live_profiles,
 DECLARE_XAM_EXPORT1(XampWebInstrumentationSetProfileCounts, kUserProfiles,
                     kStub);
 
+// Telemetry: nothing is logged. Only the first argument is read, for the call
+// log.
+dword_result_t XamInstrumentationLogEventEx_entry(dword_t event_id) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamInstrumentationLogEventEx, kMisc, kStub);
+
 dword_result_t XamDoesOmniNeedConfiguration_entry() { return 0; }
 DECLARE_XAM_EXPORT1(XamDoesOmniNeedConfiguration, kNone, kStub);
 

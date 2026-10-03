@@ -63,6 +63,12 @@ inline constexpr bool IsXNTitle(const uint32_t title_id) {
   return title_id == kXN_2001 || title_id == kXN_2002;
 }
 
+// The XNA runtime maps XEX image pages into user mode by physical address
+// (KeGetImagePageTableEntry, MmGetPhysicalAddress).
+inline constexpr bool MapsImagePagesIntoUserMode(const uint32_t title_id) {
+  return title_id == kXN_2002;
+}
+
 inline constexpr bool IsSystemExperienceTitle(const uint32_t title_id) {
   if (IsAppTitle(title_id)) {
     return true;

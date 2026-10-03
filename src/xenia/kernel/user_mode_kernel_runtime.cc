@@ -426,6 +426,9 @@ X_STATUS UserModeKernelRuntime::Enter(uint32_t context_virtual_address,
                                 cpu::TranslationDomainKey::DefaultDirect(),
                                 target_domain)) {
               ApplyUserModeIntegerContext(prepared_entry.context, *ppc_context);
+              XELOGD("KeEnterUserMode: entry {:08X}, context r1 {:016X}",
+                     prepared_entry.context.entry_address,
+                     snapshot.context.gpr[1]);
               ApplyRetailUserModeMachineState(
                   prepared_entry.context.user_mode_control, *ppc_context);
               entry_address = prepared_entry.context.entry_address;

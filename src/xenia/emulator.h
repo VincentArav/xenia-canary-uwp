@@ -271,6 +271,11 @@ class Emulator {
   // Launches a game from an STFS container file.
   X_STATUS LaunchStfsContainer(const std::filesystem::path& path);
 
+  // Launches an Xbox Live Indie Game package: registers the file, mounted in
+  // place and read-only, as content of the XNA Indie Player (xna_player_path)
+  // and starts the player with launch data naming it.
+  X_STATUS LaunchXnaIndieGame(const std::filesystem::path& path);
+
   X_STATUS LaunchDefaultModule(const std::filesystem::path& path);
 
   enum class InstallState : uint8_t {
@@ -401,6 +406,9 @@ class Emulator {
   // FinalizeDeferredGuestTitleTermination finishes after that thread exits.
   std::atomic<bool> deferred_guest_title_termination_{false};
   std::mutex title_termination_mutex_;
+  // Set, under title_termination_mutex_, while XAM's launch data is the one
+  // LaunchXnaIndieGame published; the title's termination clears both.
+  bool xna_indie_launch_data_ = false;
 
   // Accessible only from the thread that invokes those callbacks (the UI thread
   // if the UI is available).

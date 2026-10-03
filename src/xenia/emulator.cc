@@ -25,6 +25,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
@@ -46,6 +47,7 @@
 #include "xenia/kernel/user_mode_manager.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
+#include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xbdm/xbdm_module.h"
@@ -69,6 +71,7 @@
 #include "xenia/xefu/xefu_launch_coordinator.h"
 #include "xenia/xefu/xefu_media.h"
 #include "xenia/xefu/xefu_selection.h"
+#include "xenia/xefu/xna_indie.h"
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -131,6 +134,13 @@ DEFINE_path(xefu_config, "",
 DEFINE_bool(xefu_live_enabled, false,
             "Set the XeFu launch-data Live flag for an explicit XBE launch.",
             "XeFu");
+
+DEFINE_path(
+    xna_player_path, "",
+    "Path to the XNA Indie Player base executable (Xna_TitleLauncher.xex from "
+    "your own Xbox 360 system update). Opening an Xbox Live Indie Game "
+    "package launches it.",
+    "XNA");
 
 DECLARE_bool(allow_plugins);
 
@@ -473,6 +483,16 @@ void Emulator::FinalizeTitleTerminationOwnership(bool release_main_thread) {
       // Title threads have stopped, so the mounts can go.
       mounted_xefu_session_.reset();
     }
+    if (xna_indie_launch_data_) {
+      // It names the XNA Indie Player's package; the next title must not
+      // read it.
+      auto xam =
+          kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+      if (xam) {
+        xam->loader_data().launch_data.clear();
+      }
+      xna_indie_launch_data_ = false;
+    }
     title_id_ = std::nullopt;
     title_name_.clear();
     title_version_.clear();
@@ -672,6 +692,11 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::LIVE:
     case FileSignatureType::CON:
     case FileSignatureType::PIRS: {
+      // An Xbox Live Indie Game is content of the XNA Indie Player, not a
+      // title: the player runs it.
+      if (xefu::IsIndieGamePackage(path)) {
+        return LaunchXnaIndieGame(path);
+      }
       mount_result = MountPath(path, "\\Device\\Package_0");
       return mount_result ? mount_result : LaunchStfsContainer(path);
     } break;
@@ -1028,6 +1053,126 @@ X_STATUS Emulator::LaunchStfsContainer(const std::filesystem::path& path) {
     return LaunchDefaultModule(path);
   }
   kernel_state_->deployment_type_ = XDeploymentType::kDownload;
+  return result;
+}
+
+X_STATUS Emulator::LaunchXnaIndieGame(const std::filesystem::path& path) {
+  const std::unique_ptr<vfs::XContentContainerHeader> header =
+      xefu::ReadIndieGamePackageHeader(path);
+  if (!header) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const std::string display_name =
+      xe::to_utf8(header->content_metadata.display_name(XLanguage::kEnglish));
+  XELOGI("XNA: {} is an Xbox Live Indie Game ('{}').", path, display_name);
+
+  std::error_code path_error;
+  std::filesystem::path player_path;
+  if (!cvars::xna_player_path.empty()) {
+    player_path = std::filesystem::absolute(cvars::xna_player_path, path_error);
+  }
+  if (player_path.empty() || path_error ||
+      !std::filesystem::is_regular_file(player_path, path_error)) {
+    XELOGE(
+        "XNA: Xbox Live Indie Games run in the XNA Indie Player, which is not "
+        "included (xna_player_path is '{}'). Set xna_player_path to "
+        "Xna_TitleLauncher.xex from the $SystemUpdate folder of your own Xbox "
+        "360 system update, and install the player's title update "
+        "tu32000100_00000000 (title 584E07D2, from your console) with File > "
+        "Install Content.",
+        cvars::xna_player_path);
+    return X_STATUS_NOT_FOUND;
+  }
+  const FileSignatureType player_type = GetFileSignature(player_path);
+  if (player_type != FileSignatureType::XEX1 &&
+      player_type != FileSignatureType::XEX2) {
+    XELOGE(
+        "XNA: xna_player_path '{}' is not an XEX; it must name "
+        "Xna_TitleLauncher.xex.",
+        player_path);
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  kernel::xam::ContentManager* const content_manager =
+      kernel_state_->content_manager();
+  const uint32_t hdd_device_id =
+      static_cast<uint32_t>(kernel::xam::DummyDeviceId::HDD);
+  if (content_manager
+          ->ListContent(hdd_device_id, 0, xefu::kXnaIndiePlayerTitleId,
+                        XContentType::kInstaller)
+          .empty()) {
+    XELOGW(
+        "XNA: No title update is installed for the XNA Indie Player "
+        "(584E07D2). Its base executable is a stub: install "
+        "tu32000100_00000000 from your console with File > Install Content.");
+  }
+
+  // The launch data hands this name to the player, whose XamContentCreate
+  // opens the package as its content of that name.
+  const std::string content_name = xefu::IndieGamePackageInstallName(
+      *header, xe::path_to_utf8(path.filename()));
+  if (content_name.empty()) {
+    XELOGE(
+        "XNA: {} has no content ID, and its file name cannot name content (at "
+        "most 42 ASCII characters).",
+        path);
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  const std::filesystem::path package_path =
+      std::filesystem::absolute(path, path_error);
+  if (path_error) {
+    XELOGE("XNA: Unable to resolve the package path {}: {}", path,
+           path_error.message());
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // Mount the package (in place, read-only) once here to report a damaged one
+  // before the player starts.
+  kernel::xam::HostContentPackage package;
+  {
+    const std::unique_ptr<vfs::XContentContainerDevice> device =
+        vfs::XContentContainerDevice::CreateContentDevice("", package_path);
+    if (!device || !device->Initialize()) {
+      XELOGE("XNA: {} cannot be mounted: its file system is unreadable.", path);
+      return X_STATUS_INVALID_PARAMETER;
+    }
+    // The content data installing the package records in its header (display
+    // name falling back to the first language that has one).
+    package.content_data = device->content_header();
+  }
+
+  // Marketplace content resolves under XUID 0. The registration lasts until
+  // the next indie game's replaces it, and wins over the same content
+  // installed under the content root.
+  package.content_data.device_id = hdd_device_id;
+  package.content_data.content_type = XContentType::kMarketplaceContent;
+  package.content_data.set_file_name(content_name);
+  package.content_data.xuid = 0;
+  package.content_data.title_id = xefu::kXnaIndiePlayerTitleId;
+  package.host_path = package_path;
+  content_manager->RegisterHostContentPackage(std::move(package));
+
+  auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  if (!xam) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // Restores the previous launch data unless committed.
+  const xefu::IndieLaunchData launch_data =
+      xefu::BuildIndieLaunchData(content_name, hdd_device_id);
+  xefu::ScopedXefuLaunchData launch_data_transaction(
+      xam->loader_data().launch_data, launch_data);
+
+  XELOGI("XNA: Launching the XNA Indie Player {}.", player_path);
+  const X_STATUS mount_result =
+      MountPath(player_path, "\\Device\\Harddisk0\\Partition1");
+  const X_STATUS result =
+      mount_result ? mount_result : LaunchXexFile(player_path);
+  if (is_title_open()) {
+    // The player is running and may already have read the launch data.
+    launch_data_transaction.Commit();
+    std::lock_guard<std::mutex> lock(title_termination_mutex_);
+    xna_indie_launch_data_ = true;
+  }
   return result;
 }
 

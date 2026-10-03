@@ -46,6 +46,18 @@ const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id);
 std::vector<const DummyDeviceInfo*> ListStorageDevices(
     bool include_readonly = false);
 
+// The device XamContentGetDefaultDevice names: the first of devices that can
+// be written to (any but the disc drive), or 0 when there is none.
+inline uint32_t PickDefaultStorageDevice(
+    const std::vector<const DummyDeviceInfo*>& devices) {
+  for (const DummyDeviceInfo* device : devices) {
+    if (device && device->device_type != DeviceType::ODD) {
+      return static_cast<uint32_t>(device->device_id);
+    }
+  }
+  return 0;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe

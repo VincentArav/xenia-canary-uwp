@@ -288,8 +288,9 @@ UserModeBeginEnterResult UserModeManager::BeginEnterLocked(
     prepared_entry.thread_id = request.thread_id;
     prepared_entry.mapping = request.mapping;
     prepared_entry.context_virtual_address = request.context_virtual_address;
+    // User code starts on the context's r1; the kernel zeroes r1 only as the
+    // hypervisor's Enter selector.
     prepared_entry.context = request.entry_context;
-    prepared_entry.context.gpr[1] = 0;
     prepared_entry.handler_address = request.handler_address;
     prepared_entry.save_area_end = request.save_area_end;
     prepared_entry.companion_state = request.companion_state;

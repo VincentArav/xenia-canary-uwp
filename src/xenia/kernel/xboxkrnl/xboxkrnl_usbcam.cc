@@ -37,6 +37,48 @@ dword_result_t XUsbcamGetState_entry() {
 }
 DECLARE_XBOXKRNL_EXPORT1(XUsbcamGetState, kNone, kStub);
 
+// The camera calls below return Win32 error codes, not NTSTATUS. With no camera
+// attached they fail at once with ERROR_DEVICE_NOT_CONNECTED and touch no
+// caller memory.
+
+// XUsbcamCreate succeeds without a camera, so destroying what it created does
+// too.
+dword_result_t XUsbcamDestroy_entry(dword_t handle) { return X_ERROR_SUCCESS; }
+DECLARE_XBOXKRNL_EXPORT1(XUsbcamDestroy, kNone, kStub);
+
+dword_result_t XUsbcamSetConfig_entry(dword_t handle, dword_t unknown1,
+                                      dword_t unknown2, dword_t value_ptr,
+                                      dword_t value_size,
+                                      dword_t completion_routine,
+                                      dword_t overlapped_ptr) {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XBOXKRNL_EXPORT1(XUsbcamSetConfig, kNone, kStub);
+
+dword_result_t XUsbcamSetView_entry(dword_t handle, dword_t unknown1,
+                                    dword_t unknown2, dword_t unknown3,
+                                    dword_t completion_routine,
+                                    dword_t overlapped_ptr) {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XBOXKRNL_EXPORT1(XUsbcamSetView, kNone, kStub);
+
+// Takes further arguments, the OVERLAPPED among them on the stack.
+dword_result_t XUsbcamSetCaptureMode_entry(dword_t handle, dword_t unknown1,
+                                           dword_t unknown2_ptr,
+                                           dword_t unknown3, dword_t unknown4) {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XBOXKRNL_EXPORT1(XUsbcamSetCaptureMode, kNone, kStub);
+
+dword_result_t XUsbcamReadFrame_entry(dword_t handle, dword_t buffer_ptr,
+                                      dword_t buffer_size,
+                                      dword_t completion_routine,
+                                      dword_t overlapped_ptr) {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XBOXKRNL_EXPORT1(XUsbcamReadFrame, kNone, kStub);
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

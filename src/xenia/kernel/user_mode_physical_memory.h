@@ -87,24 +87,25 @@ class UserModePhysicalReadTransaction final {
   UserModePhysicalReadTransaction& operator=(
       const UserModePhysicalReadTransaction&) = delete;
 
-  // Copies the complete range only after every touched 4 KiB physical page is
-  // confirmed reserved, committed and readable. Empty, overflowing and
-  // non-29-bit ranges fail without modifying destination. A page this thread
-  // confirmed since the last change to physical heap state is not queried
-  // again, and a read of such pages alone takes no lock.
+  // Copies the range once every page in it is confirmed committed and
+  // readable; nothing is copied otherwise. The range must lie in physical
+  // memory or wholly in the open image window, whose pages are the XEX image
+  // pages they name. Pages this thread confirmed since the last heap change
+  // aren't queried again, and reading only those takes no lock.
   UserModePhysicalReadResult TryRead(uint32_t physical_address,
                                      std::span<uint8_t> destination) const;
 
-  // Validates the full physical target range without reading or writing it.
-  // Backing must be readable and have either Write or WriteCombine protection.
+  // Checks that the range is readable and writable (Write or WriteCombine), in
+  // physical memory or wholly in the open image window.
   UserModePhysicalWriteProbeResult ProbeWrite(uint32_t physical_address,
                                               size_t size) const;
 
  private:
   friend class UserModeGuestDataAccessor;
 
-  // The caller must have prevalidated the complete range using ProbeWrite and
-  // must retain this transaction through the immediately following mutation.
+  // Notifies the write observers of a range ProbeWrite validated; the caller
+  // writes it before ending the transaction. Image window ranges have no
+  // observers.
   bool NotifyWriteInvalidationCallbacks(uint32_t physical_address,
                                         size_t size) const;
   bool CompareExchangeBe32Prevalidated(uint32_t physical_address,
@@ -131,6 +132,12 @@ class UserModePhysicalReadTransaction final {
   mutable xe::global_unique_lock_type global_lock_;
   bool physical_heap_is_valid_ = false;
 };
+
+// Host address of a user-mode physical address whose page a transaction
+// validated: physical memory, or the XEX image page an image window address
+// names. Never TranslatePhysical for the latter.
+uint8_t* TranslateUserModePhysical(const Memory& memory,
+                                   uint32_t physical_address);
 
 }  // namespace xe::kernel
 

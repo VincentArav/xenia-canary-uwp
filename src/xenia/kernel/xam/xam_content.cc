@@ -18,6 +18,8 @@
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_state.h"
+#include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xenumerator.h"
@@ -565,10 +567,17 @@ DECLARE_XAM_EXPORT1(XamContentGetCreator, kContent, kImplemented);
 dword_result_t XamContentGetThumbnail_entry(
     dword_t user_index, lpvoid_t content_data_ptr, lpvoid_t buffer_ptr,
     lpdword_t buffer_size_ptr, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
+  // No user (0xFE) or any user (0xFF) names content no profile owns, as in
+  // XamContentCreate.
+  uint64_t xuid = 0;
+  if (user_index != XUserIndexNone && user_index != XUserIndexAny) {
+    const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  if (!user) {
-    return X_ERROR_NO_SUCH_USER;
+    if (!user) {
+      return X_ERROR_NO_SUCH_USER;
+    }
+
+    xuid = user->xuid();
   }
 
   assert_not_null(buffer_size_ptr);
@@ -578,7 +587,19 @@ dword_result_t XamContentGetThumbnail_entry(
   // Get thumbnail (if it exists).
   std::vector<uint8_t> buffer;
   auto result = kernel_state()->content_manager()->GetContentThumbnail(
-      user->xuid(), content_data, &buffer);
+      xuid, content_data, &buffer);
+
+  // Content without a thumbnail of its own has the title's image, as XAM
+  // gives it.
+  if (result == X_ERROR_FILE_NOT_FOUND &&
+      kernel_state()->content_manager()->ContentExists(xuid, content_data)) {
+    buffer.clear();
+    if (const SpaInfo* spa = kernel_state()->xam_state()->spa_info()) {
+      const std::span<const uint8_t> icon = spa->title_icon();
+      buffer.assign(icon.begin(), icon.end());
+    }
+    result = X_ERROR_SUCCESS;
+  }
 
   *buffer_size_ptr = uint32_t(buffer.size());
 
@@ -608,10 +629,16 @@ DECLARE_XAM_EXPORT1(XamContentGetThumbnail, kContent, kImplemented);
 dword_result_t XamContentSetThumbnail_entry(
     dword_t user_index, lpvoid_t content_data_ptr, lpvoid_t buffer_ptr,
     dword_t buffer_size, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
+  // As XamContentGetThumbnail: 0xFE and 0xFF name content no profile owns.
+  uint64_t xuid = 0;
+  if (user_index != XUserIndexNone && user_index != XUserIndexAny) {
+    const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  if (!user) {
-    return X_ERROR_NO_SUCH_USER;
+    if (!user) {
+      return X_ERROR_NO_SUCH_USER;
+    }
+
+    xuid = user->xuid();
   }
 
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
@@ -620,7 +647,7 @@ dword_result_t XamContentSetThumbnail_entry(
   auto buffer = std::vector<uint8_t>((uint8_t*)buffer_ptr,
                                      (uint8_t*)buffer_ptr + buffer_size);
   auto result = kernel_state()->content_manager()->SetContentThumbnail(
-      user->xuid(), content_data, std::move(buffer));
+      xuid, content_data, std::move(buffer));
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);

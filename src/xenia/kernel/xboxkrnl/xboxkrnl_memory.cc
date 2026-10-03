@@ -17,8 +17,10 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/icache_sweep.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/segment_array.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -655,7 +657,16 @@ dword_result_t MmGetPhysicalAddress_entry(dword_t base_address) {
   //   _In_  PVOID BaseAddress
   // );
   // base_address = result of MmAllocatePhysicalMemory.
-  uint32_t physical_address = kernel_memory()->GetPhysicalAddress(base_address);
+  Memory* const memory = kernel_memory();
+  // XEX images have no physical memory: return the page's image window
+  // address, which user-mode translation resolves back to the image.
+  if (memory->image_physical_window_enabled()) {
+    const BaseHeap* const heap = memory->LookupHeap(base_address);
+    if (heap && heap->heap_type() == HeapType::kGuestXex) {
+      return ImageWindowAddressFromVirtual(base_address);
+    }
+  }
+  uint32_t physical_address = memory->GetPhysicalAddress(base_address);
   assert_true(physical_address != UINT32_MAX);
   if (physical_address == UINT32_MAX) {
     physical_address = 0;
@@ -770,7 +781,7 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
                                               const ppc_context_t& ctx) {
   auto kernel_state = ctx->kernel_state;
   xe::BaseHeap* image_heap = kernel_state->memory()->LookupHeap(address);
-  if (image_heap->heap_type() != HeapType::kGuestXex) {
+  if (!image_heap || image_heap->heap_type() != HeapType::kGuestXex) {
     return 0;
   }
   uint32_t returned_value = address - image_heap->heap_base();
@@ -785,6 +796,32 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
     // now there is not enough data, but dashboard 14xxx and above requires that
     // return from this call will have bit 0 set.
     returned_value |= 1;
+  }
+
+  // The PowerPC page protection in the low bits: PP in bits 0-1, no-execute
+  // in bit 2. Only the XNA player gets them; bit 0 means something else to
+  // the dashboard.
+  if (MapsImagePagesIntoUserMode(kernel_state->title_id())) {
+    for (auto* module : kernel_state->processor()->GetModules()) {
+      auto* xex_module = dynamic_cast<cpu::XexModule*>(module);
+      xex2_section_type section_type;
+      if (!xex_module || xex_module->is_patch() ||
+          !xex_module->GetPageSectionType(address, &section_type)) {
+        continue;
+      }
+      switch (section_type) {
+        case XEX_SECTION_CODE:
+          returned_value = (returned_value & ~0b111u) | 0b011;
+          break;
+        case XEX_SECTION_DATA:
+          returned_value = (returned_value & ~0b111u) | 0b110;
+          break;
+        case XEX_SECTION_READONLY_DATA:
+          returned_value = (returned_value & ~0b111u) | 0b111;
+          break;
+      }
+      break;
+    }
   }
 
   return returned_value & 0x400FFFFF;  // this is actually the mask it applies

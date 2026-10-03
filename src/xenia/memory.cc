@@ -542,6 +542,14 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
   return static_cast<const PhysicalHeap*>(heap)->GetPhysicalAddress(address);
 }
 
+void Memory::SetImagePhysicalWindowEnabled(bool enabled) {
+  // Under the global lock, so no heap change is in progress.
+  auto global_lock = global_critical_region_.Acquire();
+  if (image_physical_window_enabled_.exchange(enabled) != enabled) {
+    AdvanceTranslationEpoch();
+  }
+}
+
 void Memory::Zero(uint32_t address, uint32_t size) {
   std::memset(TranslateVirtual(address), 0, size);
 }
@@ -813,10 +821,10 @@ uint32_t FromPageAccess(xe::memory::PageAccess protect) {
 
 namespace {
 
-// Advances the translation epoch when a physical heap change is complete,
-// still under the global lock. A fill samples the epoch before it walks and
-// inserts only if it is unchanged, so no translation walked before the change
-// survives it.
+// Advances the translation epoch when a physical heap change (or an XEX heap
+// change while the image window is open) is complete, still under the global
+// lock. A fill samples the epoch before it walks and inserts only if it is
+// unchanged, so no translation walked before the change survives it.
 class TranslationEpochAdvance {
  public:
   explicit TranslationEpochAdvance(bool enabled) : enabled_(enabled) {}
@@ -838,6 +846,12 @@ BaseHeap::BaseHeap()
     : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
 
 BaseHeap::~BaseHeap() = default;
+
+bool BaseHeap::ChangesAdvanceTranslationEpoch() const {
+  return heap_type_ == HeapType::kGuestPhysical ||
+         (heap_type_ == HeapType::kGuestXex && memory_ &&
+          memory_->image_physical_window_enabled());
+}
 
 void BaseHeap::Initialize(Memory* memory, uint8_t* membase, HeapType heap_type,
                           uint32_t heap_base, uint32_t heap_size,
@@ -1127,7 +1141,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
   auto global_lock = global_critical_region_.Acquire();
   // A commit over committed pages may lower their protection.
   const TranslationEpochAdvance translation_epoch_advance(
-      heap_type_ == HeapType::kGuestPhysical &&
+      ChangesAdvanceTranslationEpoch() &&
       (allocation_type & kMemoryAllocationCommit));
 
   // - If we are reserving, the entire range must not be already reserved.
@@ -1413,7 +1427,7 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 
   auto global_lock = global_critical_region_.Acquire();
   const TranslationEpochAdvance translation_epoch_advance(
-      heap_type_ == HeapType::kGuestPhysical);
+      ChangesAdvanceTranslationEpoch());
 
   // Release from host.
   // TODO(benvanik): find a way to actually decommit memory;
@@ -1439,7 +1453,7 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto global_lock = global_critical_region_.Acquire();
   const TranslationEpochAdvance translation_epoch_advance(
-      heap_type_ == HeapType::kGuestPhysical);
+      ChangesAdvanceTranslationEpoch());
 
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) / page_size_;
@@ -1537,7 +1551,7 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
 
   auto global_lock = global_critical_region_.Acquire();
   const TranslationEpochAdvance translation_epoch_advance(
-      heap_type_ == HeapType::kGuestPhysical);
+      ChangesAdvanceTranslationEpoch());
 
   // Ensure all pages are in the same reserved region and all are committed.
   uint32_t first_base_address = UINT_MAX;

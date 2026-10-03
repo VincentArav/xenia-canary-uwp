@@ -25,6 +25,7 @@
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_net.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xnet_key_registry.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
@@ -2682,6 +2683,30 @@ dword_result_t NetDll_XNetUnregisterKey_entry(dword_t caller,
   return 0;
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetUnregisterKey, kNetworking, kStub);
+
+// Moves the exchange key registered under session_key_unregister to
+// session_key_replace.
+dword_result_t NetDll_XNetReplaceKey_entry(
+    dword_t caller, pointer_t<XNKID> session_key_unregister,
+    pointer_t<XNKID> session_key_replace) {
+  if (!session_key_unregister || !session_key_replace) {
+    return static_cast<uint32_t>(X_WSA_ERROR::X_WSAEINVAL);
+  }
+
+  const uint64_t old_xnkid = session_key_unregister->as_uintBE64();
+  const uint64_t new_xnkid = session_key_replace->as_uintBE64();
+  XELOGI("XNetReplaceKey: {:016X} -> {:016X}", old_xnkid, new_xnkid);
+
+  XLiveAPI* xlive_api = kernel_state()->GetXboxLiveAPI();
+  XNetRegisteredKeys keys;
+  keys.systemlink_id = xlive_api->GetSystemlinkID();
+  keys.explicit_xboxlive_key = EXPLICIT_XBOXLIVE_KEY;
+  keys = ReplaceRegisteredKey(keys, old_xnkid, new_xnkid);
+  xlive_api->SetSystemlinkID(keys.systemlink_id);
+  EXPLICIT_XBOXLIVE_KEY = keys.explicit_xboxlive_key;
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetReplaceKey, kNetworking, kSketchy);
 
 dword_result_t XamBackgroundDownloadSetMode_entry(dword_t mode) {
   download_mode_ = static_cast<X_BACKGROUND_DOWNLOAD_MODE>(mode.value());

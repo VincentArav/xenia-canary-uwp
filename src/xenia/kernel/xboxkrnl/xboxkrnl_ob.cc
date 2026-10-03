@@ -433,6 +433,11 @@ dword_result_t ObCreateObject_entry(
 }
 DECLARE_XBOXKRNL_EXPORT1(ObCreateObject, kNone, kImplemented);
 
+// Whether an object belongs to the title rather than the system. Xenia keeps
+// no separate system objects, so every object is a title object.
+dword_result_t ObIsTitleObject_entry(dword_t object) { return 1; }
+DECLARE_XBOXKRNL_EXPORT1(ObIsTitleObject, kNone, kSketchy);
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

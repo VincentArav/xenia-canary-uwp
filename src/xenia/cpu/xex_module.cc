@@ -9,6 +9,9 @@
 
 #include "xenia/cpu/xex_module.h"
 
+#include <algorithm>
+#include <vector>
+
 #include "third_party/fmt/include/fmt/format.h"
 
 #include "xenia/base/byte_order.h"
@@ -23,6 +26,7 @@
 #include "xenia/cpu/lzx.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_import_library_parser.h"
+#include "xenia/cpu/xex_patch_plan.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
@@ -86,6 +90,17 @@ namespace xe {
 namespace cpu {
 
 using xe::kernel::KernelState;
+
+// The image base the XEX header asks for: XEX_HEADER_IMAGE_BASE_ADDRESS, or the
+// security info load address when that optional header is absent.
+static uint32_t GetHeaderImageBaseAddress(const XexModule* module) {
+  uint32_t base_address = module->xex_security_info()->load_address;
+  xe::be<uint32_t>* base_addr_opt = nullptr;
+  if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
+    base_address = *base_addr_opt;
+  }
+  return base_address;
+}
 
 XexModule::XexModule(Processor* processor, KernelState* kernel_state)
     : Module(processor), kernel_state_(kernel_state) {}
@@ -264,7 +279,9 @@ int XexModule::ApplyPatch(XexModule* module) {
   }
 
   // Patch base XEX header
-  uint32_t original_image_size = module->image_size();
+  BaseHeap* original_heap = memory()->LookupHeap(original_base_address);
+  assert_not_null(original_heap);
+  const uint32_t original_page_count = module->image_page_count();
   uint32_t header_target_size = patch_header->size_of_target_headers;
 
   if (!header_target_size) {
@@ -317,52 +334,108 @@ int XexModule::ApplyPatch(XexModule* module) {
   // Update security info context with latest security info data
   module->ReadSecurityInfo();
 
-  uint32_t new_image_size = module->image_size();
+  // The patched header may move the image to another heap; size the patched
+  // image in that heap's pages.
+  const uint32_t new_base_address = GetHeaderImageBaseAddress(module);
+  BaseHeap* new_heap = memory()->LookupHeap(new_base_address);
+  if (!new_heap || (new_base_address != original_base_address &&
+                    new_heap->heap_type() != HeapType::kGuestXex)) {
+    XELOGE("Patch for module: {} moves it to {:08X}, outside the XEX heaps",
+           module->name(), new_base_address);
+    return 6;
+  }
+  module->base_address_ = new_base_address;
 
-  // Check if we need to alloc new memory for the patched xex
-  if (new_image_size > original_image_size) {
-    uint32_t size_delta = new_image_size - original_image_size;
-    uint32_t addr_new_mem = module->base_address_ + original_image_size;
+  const ImagePatchPlan plan = PlanImagePatch(
+      original_base_address, original_page_count, original_heap->page_size(),
+      new_base_address, module->image_page_count(), new_heap->page_size());
+  if (!plan.valid) {
+    XELOGE(
+        "Patch for module: {} has an unusable image layout ({:08X}+{} pages "
+        "-> {:08X}+{} pages)",
+        module->name(), original_base_address, original_page_count,
+        new_base_address, module->image_page_count());
+    module->base_address_ = original_base_address;
+    return 6;
+  }
+  const uint32_t original_image_size = plan.old_size;
+  const uint32_t new_image_size = plan.new_size;
 
-    // Before we allocate new range we must check if patch haven't modified
-    // base_address.
-    uint32_t new_base_address = module->base_address();
-    xe::be<uint32_t>* base_addr_opt = nullptr;
-    if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
-      new_base_address = *base_addr_opt;
-    }
-
-    if (original_base_address != new_base_address) {
+  if (plan.move) {
+    XELOGW(
+        "Patch for module: {} changed base_address from {:08X} to {:08X}, "
+        "need to reallocate xex data! (size {:08X} -> {:08X})",
+        module->name(), original_base_address, new_base_address,
+        original_image_size, new_image_size);
+    const bool flag_4kb = (module->xex_security_info()->image_flags &
+                           XEX_IMAGE_PAGE_SIZE_4KB) != 0;
+    if (flag_4kb != (new_heap->page_size() == 4096)) {
       XELOGW(
-          "Patch for module: {} changed base_address from {:08X} to {:08X}, "
-          "need to reallocate xex "
-          "data!",
-          module->name(), module->base_address_, new_base_address);
-      module->base_address_ = new_base_address;
-      addr_new_mem = new_base_address;
-      size_delta = new_image_size;
+          "Patched image flags ({:08X}) disagree with the {:X}-byte pages "
+          "at {:08X}",
+          module->xex_security_info()->image_flags, new_heap->page_size(),
+          new_base_address);
     }
 
-    bool alloc_result =
-        memory()
-            ->LookupHeap(addr_new_mem)
-            ->AllocFixed(
-                addr_new_mem, size_delta, 4096,
-                xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
-                xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
+    // Keep the original image bytes the delta will be applied to. The
+    // allocation may be smaller than the page descriptors say (uncompressed
+    // images are allocated at their file size).
+    uint32_t original_region_size = 0;
+    original_heap->QuerySize(original_base_address, &original_region_size);
+    std::vector<uint8_t> original_image(
+        std::min(plan.copy_size, original_region_size));
+    if (!original_image.empty()) {
+      std::memcpy(original_image.data(),
+                  memory()->TranslateVirtual(original_base_address),
+                  original_image.size());
+    }
 
+    // Different heaps can't overlap, so the old image is released only once
+    // the new one exists. A move inside one heap may overlap the old
+    // allocation, so release that first.
+    const bool same_heap = new_heap == original_heap;
+    if (same_heap && !original_heap->Release(original_base_address)) {
+      XELOGW("Unable to release original XEX memory at {:08X}.",
+             original_base_address);
+    }
+
+    bool alloc_result = new_heap->AllocFixed(
+        plan.alloc_address, plan.alloc_size, plan.new_page_size,
+        xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
+        xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
     if (!alloc_result) {
-      XELOGE("Unable to allocate XEX memory at {:08X}-{:08X}.", addr_new_mem,
-             size_delta);
+      XELOGE("Unable to allocate XEX memory at {:08X}-{:08X}.",
+             plan.alloc_address, plan.alloc_size);
+      if (!same_heap) {
+        // The original allocation is still ours; keep Unload releasing it.
+        module->base_address_ = original_base_address;
+      }
       assert_always();
       return 6;
     }
 
-    // For base_address change we need to copy data from previous allocation to
-    // new one
-    if (original_base_address != new_base_address) {
-      kernel_state_->memory()->Copy(new_base_address, original_base_address,
-                                    original_image_size);
+    uint8_t* new_image = memory()->TranslateVirtual(plan.alloc_address);
+    std::memset(new_image, 0, plan.alloc_size);
+    if (!original_image.empty()) {
+      std::memcpy(new_image, original_image.data(), original_image.size());
+    }
+
+    if (!same_heap && !original_heap->Release(original_base_address)) {
+      XELOGW("Unable to release original XEX memory at {:08X}.",
+             original_base_address);
+    }
+  } else if (plan.grow) {
+    // Extend the image in place.
+    bool alloc_result = new_heap->AllocFixed(
+        plan.alloc_address, plan.alloc_size, plan.new_page_size,
+        xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
+        xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
+
+    if (!alloc_result) {
+      XELOGE("Unable to allocate XEX memory at {:08X}-{:08X}.",
+             plan.alloc_address, plan.alloc_size);
+      assert_always();
+      return 6;
     }
   }
 
@@ -476,18 +549,14 @@ int XexModule::ApplyPatch(XexModule* module) {
   }
 
   if (!result_code) {
-    // Decommit unused pages if new image size is smaller than original
-    if (original_image_size > new_image_size) {
-      uint32_t size_delta = original_image_size - new_image_size;
-      uint32_t addr_free_mem = module->base_address_ + new_image_size;
-
-      bool free_result = memory()
-                             ->LookupHeap(addr_free_mem)
-                             ->Decommit(addr_free_mem, size_delta);
+    // Decommit unused pages if the patched image is smaller than the memory
+    // it was built in (the original image, or a moved image's working copy).
+    if (plan.trim_size) {
+      bool free_result = new_heap->Decommit(plan.trim_address, plan.trim_size);
 
       if (!free_result) {
-        XELOGE("Unable to decommit XEX memory at {:08X}-{:08X}.", addr_free_mem,
-               size_delta);
+        XELOGE("Unable to decommit XEX memory at {:08X}-{:08X}.",
+               plan.trim_address, plan.trim_size);
         assert_always();
       }
     }
@@ -528,7 +597,12 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
     return 0;
   }
 
-  memory()->LookupHeap(base_address_)->Reset();
+  // While the image window is on, loading a DLL keeps the heap's page state:
+  // user mode reaches the other modules' pages through the window.
+  if (!(xex_header()->module_flags & XEX_MODULE_DLL_MODULE) ||
+      !memory()->image_physical_window_enabled()) {
+    memory()->LookupHeap(base_address_)->Reset();
+  }
 
   aes_decrypt_buffer(
       key, reinterpret_cast<const uint8_t*>(xex_security_info()->aes_key), 16,
@@ -940,11 +1014,7 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
 
   // Try setting our base_address based on XEX_HEADER_IMAGE_BASE_ADDRESS, fall
   // back to xex_security_info otherwise
-  base_address_ = xex_security_info()->load_address;
-  xe::be<uint32_t>* base_addr_opt = nullptr;
-  if (GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
-    base_address_ = *base_addr_opt;
-  }
+  base_address_ = GetHeaderImageBaseAddress(this);
 
   // Setup debug info.
   name_ = name;
@@ -1420,6 +1490,28 @@ InfoCacheFlags* XexModule::GetInstructionAddressFlags(uint32_t guest_addr) {
   guest_addr -= low_address_;
 
   return info_cache_.LookupFlags(guest_addr);
+}
+bool XexModule::GetPageSectionType(uint32_t guest_addr,
+                                   xex2_section_type* section_type) const {
+  if (!base_address_ || guest_addr < base_address_) {
+    return false;
+  }
+  const BaseHeap* heap = memory()->LookupHeap(base_address_);
+  if (!heap) {
+    return false;
+  }
+  const uint64_t page = (guest_addr - base_address_) / heap->page_size();
+  uint64_t first_page = 0;
+  for (uint32_t i = 0; i < xex_security_info()->page_descriptor_count; i++) {
+    xex2_page_descriptor desc;
+    desc.value = xe::byte_swap(xex_security_info()->page_descriptors[i].value);
+    if (page < first_page + desc.page_count) {
+      *section_type = desc.info;
+      return true;
+    }
+    first_page += desc.page_count;
+  }
+  return false;
 }
 void XexModule::PrecompileDiscoveredFunctions() {
   if (!cvars::enable_early_precompilation) {

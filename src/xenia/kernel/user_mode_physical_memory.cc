@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
@@ -24,9 +25,10 @@ namespace {
 constexpr uint32_t kUserModePhysicalAddressLimit = 0x20000000;
 constexpr uint32_t kUserModePhysicalPageSize = 0x1000;
 
-// Physical pages this thread found reserved, committed and readable. They stay
-// so until the translation clear epoch advances: every physical heap change
-// advances it once complete, still under the global lock.
+// Physical pages this thread found committed and readable, valid until the
+// translation clear epoch advances (on every physical heap change, and XEX
+// heap change while the image window is open). Image window pages are numbered
+// from 0x40000, apart from physical ones.
 struct ValidatedReadPages {
   const Memory* memory = nullptr;
   uint64_t clear_epoch = 0;
@@ -57,7 +59,34 @@ void MarkValidatedReadPage(const Memory& memory, uint32_t page) {
   validated.pages[page_number % validated.pages.size()] = page_number + 1;
 }
 
+// Whether [first, last] lies wholly inside the image window while it is open.
+bool IsImageWindowRange(const Memory& memory, uint32_t first, uint32_t last) {
+  return IsImagePhysicalWindowAddress(first) &&
+         IsImagePhysicalWindowAddress(last) &&
+         memory.image_physical_window_enabled();
+}
+
+// The state of the XEX image page an image window page names, checked with the
+// image heap's own page size and protection.
+std::optional<HeapPageInfo> QueryImageWindowPage(const Memory& memory,
+                                                 uint32_t page) {
+  const uint32_t image_address = ImageVirtualAddressFromWindow(page);
+  const BaseHeap* const heap = memory.LookupHeap(image_address);
+  if (!heap || heap->heap_type() != HeapType::kGuestXex) {
+    return std::nullopt;
+  }
+  return heap->QueryPageInfo(image_address);
+}
+
 }  // namespace
+
+uint8_t* TranslateUserModePhysical(const Memory& memory,
+                                   uint32_t physical_address) {
+  return IsImagePhysicalWindowAddress(physical_address)
+             ? memory.TranslateVirtual<uint8_t*>(
+                   ImageVirtualAddressFromWindow(physical_address))
+             : memory.TranslatePhysical<uint8_t*>(physical_address);
+}
 
 UserModePhysicalReadTransaction::UserModePhysicalReadTransaction(Memory& memory)
     : memory_(memory),
@@ -95,12 +124,14 @@ UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
 
   const uint32_t last_address =
       physical_address + uint32_t(destination.size() - 1);
-  if (physical_address >= kUserModePhysicalAddressLimit ||
-      last_address >= kUserModePhysicalAddressLimit) {
+  // Above physical memory, only a range wholly inside the open image window.
+  const bool image_window = last_address >= kUserModePhysicalAddressLimit;
+  if (image_window &&
+      !IsImageWindowRange(memory_, physical_address, last_address)) {
     result.diagnostic = UserModePhysicalReadDiagnostic::kOutsidePhysicalMemory;
     return result;
   }
-  if (!physical_heap_is_valid_) {
+  if (!image_window && !physical_heap_is_valid_) {
     result.diagnostic =
         UserModePhysicalReadDiagnostic::kUnexpectedPhysicalHeapLayout;
     return result;
@@ -120,7 +151,8 @@ UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
     }
     EnsureLocked();
     const std::optional<HeapPageInfo> page_info =
-        physical_heap->QueryPageInfo(page);
+        image_window ? QueryImageWindowPage(memory_, page)
+                     : physical_heap->QueryPageInfo(page);
     if (!page_info.has_value()) {
       result.diagnostic = UserModePhysicalReadDiagnostic::kPageQueryFailed;
       result.failing_page_physical_address = page;
@@ -149,7 +181,7 @@ UserModePhysicalReadResult UserModePhysicalReadTransaction::TryRead(
 
   // Copy only after the whole range validated.
   std::memcpy(destination.data(),
-              memory_.TranslatePhysical<const uint8_t*>(physical_address),
+              TranslateUserModePhysical(memory_, physical_address),
               destination.size());
   return result;
 }
@@ -171,13 +203,15 @@ UserModePhysicalWriteProbeResult UserModePhysicalReadTransaction::ProbeWrite(
   }
 
   const uint32_t last_address = physical_address + uint32_t(size - 1);
-  if (physical_address >= kUserModePhysicalAddressLimit ||
-      last_address >= kUserModePhysicalAddressLimit) {
+  // Above physical memory, only a range wholly inside the open image window.
+  const bool image_window = last_address >= kUserModePhysicalAddressLimit;
+  if (image_window &&
+      !IsImageWindowRange(memory_, physical_address, last_address)) {
     result.diagnostic =
         UserModePhysicalWriteProbeDiagnostic::kOutsidePhysicalMemory;
     return result;
   }
-  if (!physical_heap_is_valid_) {
+  if (!image_window && !physical_heap_is_valid_) {
     result.diagnostic =
         UserModePhysicalWriteProbeDiagnostic::kUnexpectedPhysicalHeapLayout;
     return result;
@@ -190,7 +224,8 @@ UserModePhysicalWriteProbeResult UserModePhysicalReadTransaction::ProbeWrite(
   BaseHeap* const physical_heap = memory_.GetPhysicalHeap();
   for (uint32_t page = first_page;; page += kUserModePhysicalPageSize) {
     const std::optional<HeapPageInfo> page_info =
-        physical_heap->QueryPageInfo(page);
+        image_window ? QueryImageWindowPage(memory_, page)
+                     : physical_heap->QueryPageInfo(page);
     if (!page_info.has_value()) {
       result.diagnostic =
           UserModePhysicalWriteProbeDiagnostic::kPageQueryFailed;
@@ -209,6 +244,8 @@ UserModePhysicalWriteProbeResult UserModePhysicalReadTransaction::ProbeWrite(
       result.failing_page_physical_address = page;
       return result;
     }
+    // XEX image pages are never WriteCombine, and image code and read-only
+    // data pages are Read only.
     if (!(page_info->protect & kMemoryProtectRead) ||
         !(page_info->protect &
           (kMemoryProtectWrite | kMemoryProtectWriteCombine))) {
@@ -230,6 +267,14 @@ bool UserModePhysicalReadTransaction::NotifyWriteInvalidationCallbacks(
     return false;
   }
   EnsureLocked();
+  // Only physical memory has observers (GPU and XMA caches), and nothing
+  // caches image bytes, so an image window range needs no dispatch.
+  if (IsImagePhysicalWindowAddress(physical_address)) {
+    return size != 0 &&
+           size - 1 < kImagePhysicalWindowBase + kImagePhysicalWindowSize -
+                          physical_address &&
+           memory_.image_physical_window_enabled();
+  }
   return memory_.NotifyPhysicalMemoryWriteInvalidationCallbacksLocked(
       global_lock_, physical_address, static_cast<uint32_t>(size));
 }
@@ -242,8 +287,8 @@ bool UserModePhysicalReadTransaction::CompareExchangeBe32Prevalidated(
   assert_not_null(observed_raw_value);
   xe::be<uint32_t> expected(expected_raw_value);
   const xe::be<uint32_t> desired(desired_raw_value);
-  uint32_t* const physical_word =
-      memory_.TranslatePhysical<uint32_t*>(physical_address);
+  uint32_t* const physical_word = reinterpret_cast<uint32_t*>(
+      TranslateUserModePhysical(memory_, physical_address));
   std::atomic_ref<uint32_t> atomic_physical_word(*physical_word);
   const bool exchanged = atomic_physical_word.compare_exchange_strong(
       expected.value, desired.value, std::memory_order_acq_rel,
@@ -260,8 +305,8 @@ bool UserModePhysicalReadTransaction::CompareExchangeRaw32Prevalidated(
   EnsureLocked();
   assert_zero(physical_address & (alignof(uint32_t) - 1));
   assert_not_null(observed_value);
-  uint32_t* const physical_word =
-      memory_.TranslatePhysical<uint32_t*>(physical_address);
+  uint32_t* const physical_word = reinterpret_cast<uint32_t*>(
+      TranslateUserModePhysical(memory_, physical_address));
   std::atomic_ref<uint32_t> atomic_physical_word(*physical_word);
   const bool exchanged = atomic_physical_word.compare_exchange_strong(
       expected_value, desired_value, std::memory_order_acq_rel,
@@ -276,8 +321,8 @@ bool UserModePhysicalReadTransaction::CompareExchangeRaw64Prevalidated(
   EnsureLocked();
   assert_zero(physical_address & (alignof(uint64_t) - 1));
   assert_not_null(observed_value);
-  uint64_t* const physical_word =
-      memory_.TranslatePhysical<uint64_t*>(physical_address);
+  uint64_t* const physical_word = reinterpret_cast<uint64_t*>(
+      TranslateUserModePhysical(memory_, physical_address));
   std::atomic_ref<uint64_t> atomic_physical_word(*physical_word);
   const bool exchanged = atomic_physical_word.compare_exchange_strong(
       expected_value, desired_value, std::memory_order_acq_rel,
@@ -291,7 +336,7 @@ void UserModePhysicalReadTransaction::CopyWritePrevalidated(
   EnsureLocked();
   assert_false(source.empty());
   assert_not_null(source.data());
-  std::memcpy(memory_.TranslatePhysical<uint8_t*>(physical_address),
+  std::memcpy(TranslateUserModePhysical(memory_, physical_address),
               source.data(), source.size());
 }
 

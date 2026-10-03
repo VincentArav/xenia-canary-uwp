@@ -19,6 +19,7 @@
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/vfs/devices/host_path_device.h"
+#include "xenia/vfs/devices/xcontent_container_device.h"
 
 DECLARE_int32(license_mask);
 
@@ -31,6 +32,12 @@ static const char* kGameContentHeaderDirName = "Headers";
 static const char* kSpaFilename = "spa.bin";
 
 static int content_device_id_ = 0;
+
+// A registered package file counts as content only while it is there.
+static bool IsHostPackagePresent(const HostContentPackage& package) {
+  std::error_code error;
+  return std::filesystem::is_regular_file(package.host_path, error);
+}
 
 ContentPackage::ContentPackage(KernelState* kernel_state,
                                const std::string_view root_name,
@@ -48,6 +55,43 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+}
+
+ContentPackage::ContentPackage(KernelState* kernel_state,
+                               const std::string_view root_name,
+                               const XCONTENT_AGGREGATE_DATA& data,
+                               std::string device_path,
+                               std::unique_ptr<vfs::Device> device,
+                               uint32_t license)
+    : kernel_state_(kernel_state),
+      root_name_(root_name),
+      device_path_(std::move(device_path)),
+      content_data_(data),
+      license_(license) {
+  auto fs = kernel_state_->file_system();
+  fs->RegisterDevice(std::move(device));
+  fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+}
+
+std::unique_ptr<ContentPackage> ContentPackage::MountPackageFile(
+    KernelState* kernel_state, const std::string_view root_name,
+    const XCONTENT_AGGREGATE_DATA& data,
+    const std::filesystem::path& package_file) {
+  std::string device_path =
+      fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
+  // Package devices map their file read-only and refuse writes, file creation
+  // and deletion.
+  std::unique_ptr<vfs::XContentContainerDevice> device =
+      vfs::XContentContainerDevice::CreateContentDevice(device_path,
+                                                        package_file);
+  if (!device || !device->Initialize()) {
+    XELOGE("Unable to mount the content package {}", package_file);
+    return nullptr;
+  }
+  const uint32_t license = device->license_mask();
+  return std::unique_ptr<ContentPackage>(
+      new ContentPackage(kernel_state, root_name, data, std::move(device_path),
+                         std::move(device), license));
 }
 
 ContentPackage::~ContentPackage() {
@@ -198,6 +242,32 @@ std::unordered_set<uint32_t> ContentManager::FindPublisherTitleIds(
   return title_ids;
 }
 
+void ContentManager::RegisterHostContentPackage(HostContentPackage package) {
+  XELOGI("Content {} of title {:08X} is mounted from the package {}",
+         package.content_data.file_name(), package.content_data.title_id.get(),
+         package.host_path);
+  host_content_packages_.Register(std::move(package));
+}
+
+std::optional<HostContentPackage> ContentManager::FindHostContentPackage(
+    const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+    const uint32_t disc_number) const {
+  if (disc_number != static_cast<uint32_t>(-1)) {
+    return std::nullopt;
+  }
+  // Only a title ID of kCurrentlyRunningTitleId stands for the running title.
+  const uint32_t running_title_id =
+      data.title_id.get() == kCurrentlyRunningTitleId
+          ? kernel_state_->title_id()
+          : 0;
+  std::optional<HostContentPackage> package =
+      host_content_packages_.Find(xuid, data, running_title_id);
+  if (!package || !IsHostPackagePresent(*package)) {
+    return std::nullopt;
+  }
+  return package;
+}
+
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
     const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
     const XContentType content_type) const {
@@ -210,6 +280,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
   }
 
   for (const uint32_t& title_id : title_ids) {
+    const size_t title_result_begin = result.size();
     // Search path:
     // content_root/xuid/title_id/type_name/*
     auto package_root = ResolvePackageRoot(xuid, title_id, content_type);
@@ -234,6 +305,28 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
         content_data.title_id = title_id;
         content_data.xuid = xuid;
         result.emplace_back(std::move(content_data));
+      }
+    }
+
+    // A package file registered as this content is listed as installed
+    // content would be, once even if the same content is installed too.
+    const uint32_t listed_title_id = title_id == kCurrentlyRunningTitleId
+                                         ? kernel_state_->title_id()
+                                         : title_id;
+    const std::optional<HostContentPackage> host_package =
+        host_content_packages_.FindListed(xuid, listed_title_id, content_type);
+    if (host_package && IsHostPackagePresent(*host_package)) {
+      const std::string host_file_name =
+          xe::string_util::trim(host_package->content_data.file_name());
+      const bool installed = std::any_of(
+          result.cbegin() + static_cast<std::ptrdiff_t>(title_result_begin),
+          result.cend(),
+          [&host_file_name](const XCONTENT_AGGREGATE_DATA& listed) {
+            return xe::utf8::equal_case(
+                xe::string_util::trim(listed.file_name()), host_file_name);
+          });
+      if (!installed) {
+        result.push_back(host_package->content_data);
       }
     }
   }
@@ -293,6 +386,9 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 
 bool ContentManager::ContentExists(const uint64_t xuid,
                                    const XCONTENT_AGGREGATE_DATA& data) {
+  if (FindHostContentPackage(xuid, data)) {
+    return true;
+  }
   auto path = ResolvePackagePath(xuid, data);
   return std::filesystem::exists(path);
 }
@@ -333,6 +429,18 @@ X_RESULT ContentManager::ReadContentHeaderFile(
     const std::string_view file_name, const uint64_t xuid,
     const uint32_t title_id, XContentType content_type,
     XCONTENT_AGGREGATE_DATA& data) const {
+  // A registered package file's header comes from the package, as installing
+  // it would have written it.
+  XCONTENT_AGGREGATE_DATA host_data{};
+  host_data.content_type = content_type;
+  host_data.title_id = title_id;
+  host_data.set_file_name(file_name);
+  if (const std::optional<HostContentPackage> host_package =
+          FindHostContentPackage(xuid, host_data)) {
+    data = host_package->content_data;
+    return X_STATUS_SUCCESS;
+  }
+
   auto header_file_path =
       ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
@@ -371,6 +479,11 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
+  if (FindHostContentPackage(xuid, data)) {
+    // Content mounted from a package file is read-only.
+    return X_ERROR_ACCESS_DENIED;
+  }
+
   auto package_path = ResolvePackagePath(xuid, data);
   if (std::filesystem::exists(package_path)) {
     // Exists, must not!
@@ -402,21 +515,32 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data, disc_number);
-  if (!std::filesystem::exists(package_path)) {
-    // Does not exist, must be created.
-    return X_ERROR_FILE_NOT_FOUND;
+  // A package file registered as this content is mounted from where it is,
+  // in preference to the same content installed.
+  std::unique_ptr<ContentPackage> package;
+  if (const std::optional<HostContentPackage> host_package =
+          FindHostContentPackage(xuid, data, disc_number)) {
+    package = ContentPackage::MountPackageFile(kernel_state_, root_name, data,
+                                               host_package->host_path);
   }
 
-  // Open package.
-  auto package = ResolvePackage(root_name, xuid, data, disc_number);
-  assert_not_null(package);
+  if (!package) {
+    auto package_path = ResolvePackagePath(xuid, data, disc_number);
+    if (!std::filesystem::exists(package_path)) {
+      // Does not exist, must be created.
+      return X_ERROR_FILE_NOT_FOUND;
+    }
 
-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+    // Open package.
+    package = ResolvePackage(root_name, xuid, data, disc_number);
+    assert_not_null(package);
+
+    package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+        data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  }
 
   content_license = package->GetPackageLicense();
-  if (static_cast<uint32_t>(cvars::license_mask) > 1) {
+  if (static_cast<uint32_t>(cvars::license_mask) > 0) {
     content_license |= cvars::license_mask;
   }
 
@@ -476,6 +600,10 @@ X_RESULT ContentManager::SetContentThumbnail(
     const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
     std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
+  if (FindHostContentPackage(xuid, data)) {
+    // Content mounted from a package file is read-only.
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto package_path = ResolvePackagePath(xuid, data);
   std::filesystem::create_directories(package_path);
   if (std::filesystem::exists(package_path)) {
@@ -495,6 +623,11 @@ X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
 
   if (IsContentOpen(data)) {
     // TODO(Gliniak): Get real error code for this case.
+    return X_ERROR_ACCESS_DENIED;
+  }
+
+  if (FindHostContentPackage(xuid, data)) {
+    // Content mounted from a package file is read-only: the file stays.
     return X_ERROR_ACCESS_DENIED;
   }
 

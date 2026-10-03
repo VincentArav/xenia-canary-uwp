@@ -17,6 +17,7 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/friends_util.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/live_guide_ui.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/ui/file_picker.h"
@@ -612,6 +613,115 @@ dword_result_t XamShowPartyUI_entry(dword_t user_index) {
   return X_ERROR_FUNCTION_FAILED;
 }
 DECLARE_XAM_EXPORT1(XamShowPartyUI, kNone, kStub);
+
+// Xbox Live guide UIs Xenia has no implementation of (see live_guide_ui.h).
+// For a user signed in to Xbox Live a message box says so, and the call
+// succeeds as if the guide had opened.
+static X_RESULT xeXamShowUnsupportedLiveGuideUI(uint32_t user_index,
+                                                std::string_view ui_name,
+                                                const std::string& details) {
+  const UserProfile* user =
+      user_index < XUserMaxUserCount
+          ? kernel_state()->xam_state()->GetUserProfile(user_index)
+          : nullptr;
+  const X_RESULT result = live_guide_ui::CheckUser(
+      user_index, user != nullptr, user && user->IsSignedInToLive());
+  if (result != X_ERROR_SUCCESS) {
+    XELOGW("{}: user {} cannot open it (error {:08X})", ui_name, user_index,
+           result);
+    return result;
+  }
+
+  if (cvars::headless) {
+    return xeXamDispatchHeadlessAsync([]() {});
+  }
+
+  std::string title = "Xbox Live";
+  std::string desc =
+      fmt::format("Game requested to open the Xbox Live {}.", ui_name);
+  if (!details.empty()) {
+    desc += "\n" + details;
+  }
+  desc += "\n\nXenia does not implement this Xbox Live feature.";
+
+  auto close = [](MessageBoxDialog* dialog) -> void {};
+  const Emulator* emulator = kernel_state()->emulator();
+  xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+  return xeXamDispatchDialogAsync<MessageBoxDialog>(
+      new MessageBoxDialog(imgui_drawer, title, desc, {"OK"}, 0), close);
+}
+
+static std::string xeDescribeGuideRecipients(lpqword_t recipients,
+                                             uint32_t recipient_count) {
+  constexpr uint32_t kMaxListedRecipients = 8;
+  std::string desc = fmt::format("Recipients: {}", recipient_count);
+  for (uint32_t i = 0; i < recipient_count; i++) {
+    if (i == kMaxListedRecipients) {
+      desc += "\n...";
+      break;
+    }
+    desc += fmt::format("\n0x{:016X}", recipients[i].get());
+  }
+  return desc;
+}
+
+dword_result_t XamShowPlayersUI_entry(dword_t user_index) {
+  return xeXamShowUnsupportedLiveGuideUI(user_index, "Players UI", "");
+}
+DECLARE_XAM_EXPORT1(XamShowPlayersUI, kUI, kStub);
+
+dword_result_t XamShowMessagesUI_entry(dword_t user_index) {
+  return xeXamShowUnsupportedLiveGuideUI(user_index, "Messages UI", "");
+}
+DECLARE_XAM_EXPORT1(XamShowMessagesUI, kUI, kStub);
+
+dword_result_t XamShowPlayerReviewUI_entry(dword_t user_index,
+                                           qword_t xuid_feedback_target) {
+  return xeXamShowUnsupportedLiveGuideUI(
+      user_index, "Player Review UI",
+      fmt::format("Player: 0x{:016X}",
+                  static_cast<uint64_t>(xuid_feedback_target)));
+}
+DECLARE_XAM_EXPORT1(XamShowPlayerReviewUI, kUI, kStub);
+
+dword_result_t XamShowFriendRequestUI_entry(dword_t user_index,
+                                            qword_t xuid_user) {
+  return xeXamShowUnsupportedLiveGuideUI(
+      user_index, "Friend Request UI",
+      fmt::format("Player: 0x{:016X}", static_cast<uint64_t>(xuid_user)));
+}
+DECLARE_XAM_EXPORT1(XamShowFriendRequestUI, kUI, kStub);
+
+dword_result_t XamShowMessageComposeUI_entry(dword_t user_index,
+                                             lpqword_t recipients,
+                                             dword_t recipient_count,
+                                             lpu16string_t text_ptr) {
+  if (!live_guide_ui::IsValidRecipientList(recipients.guest_address(),
+                                           recipient_count)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  std::string details = xeDescribeGuideRecipients(recipients, recipient_count);
+  if (text_ptr) {
+    details += "\nMessage: " + xe::to_utf8(text_ptr.value());
+  }
+  return xeXamShowUnsupportedLiveGuideUI(user_index, "Message Compose UI",
+                                         details);
+}
+DECLARE_XAM_EXPORT1(XamShowMessageComposeUI, kUI, kStub);
+
+dword_result_t XamShowGameInviteUI_entry(dword_t user_index,
+                                         lpqword_t recipients,
+                                         dword_t recipient_count,
+                                         lpu16string_t unused_text_ptr) {
+  if (!live_guide_ui::IsValidRecipientList(recipients.guest_address(),
+                                           recipient_count)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return xeXamShowUnsupportedLiveGuideUI(
+      user_index, "Game Invite UI",
+      xeDescribeGuideRecipients(recipients, recipient_count));
+}
+DECLARE_XAM_EXPORT1(XamShowGameInviteUI, kUI, kStub);
 
 // this is supposed to do a lot more, calls another function that triggers some
 // cbs

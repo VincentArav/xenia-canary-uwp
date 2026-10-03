@@ -11,6 +11,7 @@
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/share_access.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
@@ -822,6 +823,75 @@ dword_result_t IoDismountVolumeByFileHandle_entry(dword_t handle) {
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
+
+// Share access as NT keeps it, on the 360's byte-counter SHARE_ACCESS and the
+// access bits it records in the FILE_OBJECT (see share_access.h).
+dword_result_t IoCheckShareAccess_entry(
+    dword_t desired_access, dword_t desired_share_access, lpvoid_t file_object,
+    pointer_t<share_access::X_SHARE_ACCESS> share_access_ptr, dword_t update) {
+  if (!file_object || !share_access_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  share_access::X_SHARE_ACCESS* share = share_access_ptr;
+  uint8_t& access_bits =
+      file_object.as<uint8_t*>()[share_access::kFileObjectAccessByteOffset];
+  return share_access::CheckShareAccess(desired_access, desired_share_access,
+                                        access_bits, *share,
+                                        static_cast<uint8_t>(update) != 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(IoCheckShareAccess, kFileSystem, kImplemented);
+
+void IoSetShareAccess_entry(
+    dword_t desired_access, dword_t desired_share_access, lpvoid_t file_object,
+    pointer_t<share_access::X_SHARE_ACCESS> share_access_ptr) {
+  if (!file_object || !share_access_ptr) {
+    return;
+  }
+  share_access::X_SHARE_ACCESS* share = share_access_ptr;
+  uint8_t& access_bits =
+      file_object.as<uint8_t*>()[share_access::kFileObjectAccessByteOffset];
+  share_access::SetShareAccess(desired_access, desired_share_access,
+                               access_bits, *share);
+}
+DECLARE_XBOXKRNL_EXPORT1(IoSetShareAccess, kFileSystem, kImplemented);
+
+void IoRemoveShareAccess_entry(
+    lpvoid_t file_object,
+    pointer_t<share_access::X_SHARE_ACCESS> share_access_ptr) {
+  if (!file_object || !share_access_ptr) {
+    return;
+  }
+  share_access::X_SHARE_ACCESS* share = share_access_ptr;
+  share_access::RemoveShareAccess(
+      file_object.as<uint8_t*>()[share_access::kFileObjectAccessByteOffset],
+      *share);
+}
+DECLARE_XBOXKRNL_EXPORT1(IoRemoveShareAccess, kFileSystem, kImplemented);
+
+// Xenia sends no IRPs to title drivers (file I/O goes to the VFS), so an IRP
+// completed here has no completion routine, IO_STATUS_BLOCK or event to finish.
+// The status the driver stored in it is left as it is.
+void IoCompleteRequest_entry(lpvoid_t irp, dword_t priority_boost) {
+  XELOGD("IoCompleteRequest({:08X}, {}) - no I/O manager IRP to complete",
+         irp.guest_address(), static_cast<uint32_t>(priority_boost));
+}
+DECLARE_XBOXKRNL_EXPORT1(IoCompleteRequest, kFileSystem, kStub);
+
+// Dispatch routine for requests a driver doesn't handle: fails the IRP with
+// STATUS_INVALID_DEVICE_REQUEST. IRP.IoStatus is at 0x10 (status, then
+// Information at 0x14).
+constexpr uint32_t kIrpIoStatusOffset = 0x10;
+
+dword_result_t IoInvalidDeviceRequest_entry(dword_t device_object,
+                                            lpvoid_t irp) {
+  if (irp) {
+    auto io_status = reinterpret_cast<X_IO_STATUS_BLOCK*>(irp.as<uint8_t*>() +
+                                                          kIrpIoStatusOffset);
+    io_status->status = X_STATUS_INVALID_DEVICE_REQUEST;
+  }
+  return X_STATUS_INVALID_DEVICE_REQUEST;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoInvalidDeviceRequest, kFileSystem, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

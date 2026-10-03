@@ -10,16 +10,21 @@
 #ifndef XENIA_KERNEL_XAM_CONTENT_MANAGER_H_
 #define XENIA_KERNEL_XAM_CONTENT_MANAGER_H_
 
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/string_key.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/xbox.h"
 
@@ -194,12 +199,112 @@ struct XCONTENT_DATA_INTERNAL : XCONTENT_DATA {  // 0x0 sz:0x134
 };
 static_assert_size(XCONTENT_DATA_INTERNAL, 0x200);
 
+// Content mounted in place from a package file on the host (STFS or SVOD),
+// read-only, instead of installed (extracted) under the content root.
+struct HostContentPackage {
+  // The content the package holds. Its xuid (0 for marketplace content),
+  // title_id (a real title ID, not kCurrentlyRunningTitleId), content_type and
+  // file name locate it; header reads and enumeration report all of it.
+  XCONTENT_AGGREGATE_DATA content_data{};
+  std::filesystem::path host_path;
+};
+
+// Whether |data| (passed with |xuid|, its user's or 0) names |package|'s
+// content, located as installed content is
+// (ContentManager::ResolvePackagePath): kCurrentlyRunningTitleId stands for
+// |running_title_id|, and file names match trimmed and ignoring ASCII case. The
+// device ID takes no part.
+inline bool HostContentPackageMatches(const HostContentPackage& package,
+                                      const uint64_t xuid,
+                                      const XCONTENT_AGGREGATE_DATA& data,
+                                      const uint32_t running_title_id) {
+  const XCONTENT_AGGREGATE_DATA& content = package.content_data;
+  const XContentType content_type = data.content_type.get();
+  if (content_type != content.content_type.get()) {
+    return false;
+  }
+  const uint32_t title_id = data.title_id.get() == kCurrentlyRunningTitleId
+                                ? running_title_id
+                                : data.title_id.get();
+  if (title_id != content.title_id.get()) {
+    return false;
+  }
+  // The content data's own XUID wins over the user's, and marketplace content
+  // is common to all profiles.
+  uint64_t used_xuid = data.xuid.get();
+  if (used_xuid == static_cast<uint64_t>(-1) || used_xuid == 0) {
+    used_xuid = xuid;
+  }
+  if (content_type == XContentType::kMarketplaceContent) {
+    used_xuid = 0;
+  }
+  if (used_xuid != content.xuid.get()) {
+    return false;
+  }
+  const std::string file_name = string_util::trim(data.file_name());
+  return !file_name.empty() &&
+         utf8::equal_case(file_name, string_util::trim(content.file_name()));
+}
+
+// The package files registered as content for the session. There is one at a
+// time: a registration replaces the one before it. Thread-safe.
+class HostContentPackageRegistry {
+ public:
+  void Register(HostContentPackage package) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    package_ = std::move(package);
+  }
+
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    package_.reset();
+  }
+
+  // The registered package |data| names (see HostContentPackageMatches).
+  std::optional<HostContentPackage> Find(
+      const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+      const uint32_t running_title_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (package_ &&
+        HostContentPackageMatches(*package_, xuid, data, running_title_id)) {
+      return package_;
+    }
+    return std::nullopt;
+  }
+
+  // The registered package listed among the content of |xuid|, |title_id| (a
+  // real title ID) and |content_type|, both taken as given, as installed
+  // content is listed from content_root/xuid/title_id/content_type.
+  std::optional<HostContentPackage> FindListed(
+      const uint64_t xuid, const uint32_t title_id,
+      const XContentType content_type) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (package_ && package_->content_data.xuid.get() == xuid &&
+        package_->content_data.title_id.get() == title_id &&
+        package_->content_data.content_type.get() == content_type) {
+      return package_;
+    }
+    return std::nullopt;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::optional<HostContentPackage> package_;
+};
+
 class ContentPackage {
  public:
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                  const XCONTENT_AGGREGATE_DATA& data,
                  const std::filesystem::path& package_path);
   ~ContentPackage();
+
+  // Mounts |package_file|, an STFS or SVOD package, in place: read-only, with
+  // the license its header grants. Null when the file does not mount.
+  static std::unique_ptr<ContentPackage> MountPackageFile(
+      KernelState* kernel_state, const std::string_view root_name,
+      const XCONTENT_AGGREGATE_DATA& data,
+      const std::filesystem::path& package_file);
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);
 
@@ -210,6 +315,11 @@ class ContentPackage {
   const uint32_t GetPackageLicense() const { return license_; }
 
  private:
+  // Mounts |device|, initialized at |device_path|, as the content.
+  ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                 const XCONTENT_AGGREGATE_DATA& data, std::string device_path,
+                 std::unique_ptr<vfs::Device> device, uint32_t license);
+
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;
@@ -264,7 +374,21 @@ class ContentManager {
   uint64_t GetContentTotalSpace() const;
   uint64_t GetContentFreeSpace() const;
 
+  // Registers a package file on the host as the content it holds, mounted in
+  // place rather than installed, for the rest of the session or until the next
+  // registration replaces it. While its file is there the content exists,
+  // opens from the file (read-only) in preference to the same content
+  // installed under the content root, and cannot be created over, deleted or
+  // given a thumbnail.
+  void RegisterHostContentPackage(HostContentPackage package);
+
  private:
+  // The registered package |data| names, while its file is there. Only
+  // content without a disc number (-1) comes from a package file.
+  std::optional<HostContentPackage> FindHostContentPackage(
+      const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+      const uint32_t disc_number = -1) const;
+
   std::filesystem::path ResolvePackageRoot(
       const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
@@ -287,6 +411,7 @@ class ContentManager {
   // TODO(benvanik): remove use of global lock, it's bad here!
   xe::global_critical_region global_critical_region_;
   std::unordered_map<string_key_insensitive, ContentPackage*> open_packages_;
+  HostContentPackageRegistry host_content_packages_;
 };
 
 }  // namespace xam

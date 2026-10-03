@@ -13,6 +13,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_seh.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
@@ -128,7 +129,8 @@ void HandleCppException(pointer_t<X_EXCEPTION_RECORD> record) {
   XELOGE("Guest attempted to throw a C++ exception!");
 }
 
-void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record) {
+void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record,
+                             const ppc_context_t& context) {
   switch (record->code) {
     case 0x406D1388: {
       HandleSetThreadName(record);
@@ -140,9 +142,11 @@ void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record) {
     }
   }
 
-  // TODO(benvanik): unwinding.
-  // This is going to suck.
-  // xe::debugging::Break();
+  // The title's own handlers. True: the context now resumes where a handler
+  // continued, or in the __except block that took the exception.
+  if (DispatchGuestException(record.guest_address(), context.value())) {
+    return;
+  }
 
   // RtlRaiseException definitely wasn't a noreturn function, we can return
   // safe-ish
