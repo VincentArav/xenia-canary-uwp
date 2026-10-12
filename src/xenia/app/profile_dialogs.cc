@@ -208,7 +208,7 @@ void NoProfileDialog::OnDraw(ImGuiIO& io) {
 
   if (should_close) {
     emulator_window_->SetHotkeysState(true);
-    delete this;
+    Close();
     return;
   }
 }
@@ -386,7 +386,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
   
   // Profile list with proper rendering
   for (auto& [xuid, account] : *profiles) {
-      ImGui::PushID(static_cast<int>(xuid));
+      ImGui::PushID(fmt::format("{:016X}", xuid).c_str());
 
       const uint8_t user_index =
           profile_manager->GetUserIndexAssignedToProfile(xuid);
@@ -509,6 +509,8 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
       const bool is_signedin =
           profile_manager->GetProfile(selected_xuid_) != nullptr;
       if (selected_user_index == XUserIndexAny) {
+        ImGui::BeginDisabled(!profile_manager->IsAnyProfileSlotFree());
+
         if (ImGui::MenuItem("Login")) {
           XELOGD("ProfileConfigDialog: selected Login for {:016X}",
                  selected_xuid_);
@@ -525,12 +527,27 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
               XELOGD(
                   "ProfileConfigDialog: selected Login to slot {} for {:016X}",
                   i, selected_xuid_);
+              uint64_t current_slot_xuid = 0;
+
+              if (const auto current_profile = profile_manager->GetProfile(
+                      static_cast<uint8_t>(i - 1));
+                  current_profile) {
+                current_slot_xuid = current_profile->xuid();
+              }
+
               profile_manager->Login(selected_xuid_, i - 1);
+              LoadProfileIcon(selected_xuid_);
+
+              // Release resources
+              if (current_slot_xuid) {
+                LoadProfileIcon(current_slot_xuid);
+              }
               ImGui::CloseCurrentPopup();
             }
           }
           ImGui::EndMenu();
         }
+        ImGui::EndDisabled();
       } else {
         if (ImGui::MenuItem("Logout")) {
           XELOGD("ProfileConfigDialog: selected Logout for {:016X}",

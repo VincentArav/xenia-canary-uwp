@@ -17,12 +17,15 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/ui/presenter.h"
@@ -41,10 +44,40 @@ enum class ReadbackResolveMode {
   kFull       // Immediate sync with GPU stall (full)
 };
 
+// Occlusion queries - ZPD report mode.
+enum class ZPDMode {
+  kFake,     // Fake counter walk, no real GPU queries (fake)
+  kFast,     // Real queries, speculative writes biased visible (fast)
+  kFastAlt,  // Fast, but replays cached zero deltas too (fast-alt)
+  kStrict,   // Real queries, waits before writeback (strict)
+};
+
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 ReadbackResolveMode GetReadbackResolveMode();
 void SetReadbackResolveMode(const std::string& mode);
+ZPDMode GetZPDMode();
+void SetZPDMode(const std::string& mode);
+
+// Shared pool capacity for D3D12 and Vulkan.
+constexpr uint32_t kQueryPoolCapacity = 8192;
+
+// Contiguous range of query indices for batched resolve/copy operations.
+struct ResolveRange {
+  uint32_t start;
+  uint32_t count;
+};
+
+// Clock backstop for strict retire, triggered on the first failed guest wait.
+constexpr uint64_t kStrictZPDRetireDeadlineMs = 2;
+// The fast modes only need to keep queue growth in check.
+constexpr uint64_t kFastZPDRetireDeadlineMs = 250;
+
+// Cap for the fast-mode cached delta map.  Games reuse a small set of report
+// addresses so this should never be hit, but prevents unbounded growth if a
+// title cycles through unique addresses.  Clearing the cache has no
+// correctness impact - it only removes speculative writeback hints.
+constexpr size_t kFastZPDCacheMaxEntries = 1024;
 
 class GraphicsSystem;
 class Shader;
@@ -121,8 +154,9 @@ class CommandProcessor {
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
   // awaited.
-  virtual void InitializeShaderStorage(const std::filesystem::path& cache_root,
-                                       uint32_t title_id, bool blocking);
+  virtual void InitializeShaderStorage(
+      const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+      std::function<void()> completion_callback = nullptr);
 
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
   virtual void BeginTracing(const std::filesystem::path& root_path);
@@ -255,7 +289,224 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  virtual void PollCompletedSubmission() {}
+
+  // Used by strict ZPD to distinguish normal in flight latency from a
+  // genuinely stuck report.
+  virtual uint64_t GetCompletedSubmission() const { return 0; }
+
   virtual void OnPrimaryBufferEnd() {}
+
+  // TODO(boma): Add tracking for EVENT_WRITE_EXT reports.
+  using ReportHandle = uint64_t;
+  static constexpr ReportHandle kInvalidReportHandle = 0;
+
+  enum class QueryOpenResult {
+    kOpened,
+    kDeferred,
+    kPoolExhausted,
+    kFailed,
+  };
+
+  // One EVENT_WRITE_ZPD. Measures the host query segments since the previous
+  // report and owes the guest one write of the running counter. Reports
+  // retire strictly in stream order.
+  struct ZPDReport {
+    ReportHandle handle = kInvalidReportHandle;
+    // Set by the event that ends the measurement.
+    uint32_t address = 0;
+    // Guest sample counts. Each segment is normalized by its own scale area
+    // when it resolves.
+    XenosZPDReport delta;
+    // Submission containing the most recently closed segment's resolve.
+    uint64_t last_segment_end_submission = 0;
+    uint32_t pending_segments = 0;
+    // Fast modes write a guess at event time and correct it on retire.
+    // The guessed delta is kept so later guesses can be re-based.
+    XenosZPDReport speculative_value;
+    XenosZPDReport speculative_delta;
+    bool speculative = false;
+    // For strict, when a report holds the D3D sentinel.
+    // Only these are worth blocking a wait for.
+    bool awaited = false;
+  };
+
+  static constexpr uint64_t kInvalidVIZGeneration = 0;
+  struct VIZQueryHandle {
+    uint32_t id = 0;
+    uint64_t generation = kInvalidVIZGeneration;
+  };
+
+  // Host query segment open for the ZPD report and/or VIZ ID currently being
+  // measured. Both read the same resolve.
+  struct ActiveQuerySegment {
+    uint32_t scale_area = 0;
+    bool segment_active = false;
+    bool segment_pending_begin = false;
+    bool count_total = false;
+    bool hybrid = false;
+    bool report = false;
+    VIZQueryHandle viz;
+    bool survey = false;
+    bool report_measuring() const {
+      return segment_pending_begin || (segment_active && report);
+    }
+  };
+
+  virtual void EnsureQueryResources() {}
+  virtual void ShutdownQueryResources() {}
+
+  virtual bool IsQueryPoolReady() const { return false; }
+  virtual bool CanOpenQuery() const { return true; }
+
+  // Backend acquires a pool slot for the consumers in active_segment_,
+  // records BeginQuery, tracks it internally.
+  virtual QueryOpenResult OpenQuery(bool can_close_submission) {
+    return QueryOpenResult::kFailed;
+  }
+  // Backend records EndQuery, queues a resolve for the active slot and the
+  // VIZ predicate if there's a VIZ consumer. report_handle is invalid without
+  // a report consumer.
+  virtual bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                          uint64_t& out_submission) {
+    return false;
+  }
+  // Backend drains completed resolves and calls OnZPDQueryResolved and
+  // OnVIZQueryResolved for each.
+  virtual void PumpQueryResolves() {}
+  // Backend waits for all pending segments of report_handle to resolve.
+  virtual bool AwaitQueryResolve(ReportHandle report_handle,
+                                 uint64_t wait_for_submission) {
+    return false;
+  }
+
+  // Queues the current interval at report_address and starts the next one.
+  void QueueZPDReport(uint32_t report_address);
+  // Opens a new host query segment when CanOpenQuery is true.
+  void OpenQuerySegment(bool can_close_submission);
+  // Closes the current segment at a submission or render pass boundary.
+  // The report and VIZ ID stay open and a new segment will open at the next
+  // opportunity.
+  void CloseQuerySegment();
+  void EndZPDFrame() {
+    CloseQuerySegment();
+    active_segment_.segment_pending_begin = false;
+  }
+  // Splits the open segment when the draw scale or hybrid query Total counting
+  // changes so each segment normalizes with one scale and counts one set of
+  // draws, and when the VIZ ID or survey state changes. Also opens a pending
+  // segment, once per draw.
+  void UpdateQuerySegment(uint32_t scale_area, bool count_total, bool survey);
+
+  // Called by backends when a host query resolve completes.
+  // Accumulates the normalized sample counts into the report.
+  void OnZPDQueryResolved(ReportHandle report_handle,
+                          const XenosZPDReport& raw_counts,
+                          uint32_t scale_area);
+  // Queued or current report, nullptr once retired. Handles are issued in
+  // order, so the queue is indexed by the front handle.
+  ZPDReport* FindZPDReport(ReportHandle report_handle);
+  // Handles a strict report the guest is waiting on while the ring is empty.
+  void PrepareZPDForWait();
+  // Called from PrepareForWait and submission boundaries so retired reports
+  // reach the guest before it loops again. Fast modes give up on a stuck front
+  // report after kFastZPDRetireDeadlineMs.
+  void PumpPendingRetire();
+  // Guest writeback.
+  void WriteZPDReport(uint32_t report_address, const XenosZPDReport& value) {
+    value.WriteTo(
+        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
+            report_address));
+  }
+  void ResetZPDState() {
+    zpd_mode_ = GetZPDMode();
+    active_segment_ = {};
+    zpd_next_report_handle_ = 1;
+    zpd_current_report_ = {};
+    zpd_reports_.clear();
+    zpd_awaited_report_count_ = 0;
+    fast_zpd_report_cached_deltas_.clear();
+    zpd_sample_counter_ = {};
+    zpd_speculative_sample_counter_ = {};
+    fake_zpd_sample_count_ = 0;
+    zpd_pending_retire_start_ms_ = 0;
+    zpd_force_fake_fallback_ = false;
+  }
+
+  // VIZ_QUERY has the scan converter track 64 query IDs. An ID is visible when
+  // its geometry is still potentially visible after hi-Z. Without any
+  // hierarchical state, we get answers from the survey's query segment instead.
+  // Draws carrying a VIZ token then get predicated on the GPU. Anything
+  // unmeasured, for whatever reason, stays visible.
+  struct VIZQuery {
+    uint64_t generation = kInvalidVIZGeneration;
+    uint32_t pending_segments = 0;
+    bool resolved = true;
+    bool visible = true;
+    bool active = false;
+    // Survey reached the backend during this generation.
+    bool surveyed = false;
+    // OR of the resolved segments for this generation.
+    bool accumulated_visible = false;
+    // Something went wrong while measuring; this doesn't mean not-visible.
+    bool fallback = false;
+    uint64_t last_segment_end_submission = 0;
+    // The backend has a survey result ready to use for predication.
+    bool predicate_armed = false;
+    // Once the predicate no longer covers the full unresolved query,
+    // later segments can't make it exact again.
+    bool predicate_blocked = false;
+  };
+
+  // Surveys ride the query segments as a consumer, see ActiveQuerySegment.
+  void BeginVIZQuery(uint32_t id);
+  void EndVIZQuery(uint32_t id);
+  // Backend calls this for every draw under an active ID. Measured only if it
+  // ran inside a segment carrying the ID.
+  void OnVIZSurveyDraw(bool measured);
+  // Backend reports a resolved segment here.
+  void OnVIZQueryResolved(uint32_t id, uint64_t generation, bool visible);
+  // Whether a draw with a VIZ token runs. If it does, viz_draw_predicate_
+  // is set when the backend has to predicate it. Memexport and copy draws
+  // pass through untouched, since a cull or a predicate would lose their side
+  // effects.
+  bool PrepareVIZDraw(uint32_t token);
+  // Backend waits for the submission holding a VIZ segment's resolve.
+  virtual void AwaitVIZQueryResolve(uint64_t wait_for_submission) {}
+
+  // The backend stages a survey's result into its predicate buffer while the
+  // generation can still use it, and arms or blocks the ID accordingly.
+  bool CanArmVIZPredicate(uint32_t id, uint64_t generation) const {
+    const VIZQuery& query = viz_queries_[id];
+    return query.generation == generation && !query.predicate_armed &&
+           !query.predicate_blocked;
+  }
+  void ArmVIZPredicate(uint32_t id, uint64_t generation) {
+    VIZQuery& query = viz_queries_[id];
+    assert_true(query.generation == generation);
+    assert_false(query.predicate_armed);
+    assert_false(query.predicate_blocked);
+    query.predicate_armed = true;
+  }
+  void BlockVIZPredicate(uint32_t id, uint64_t generation) {
+    VIZQuery& query = viz_queries_[id];
+    assert_true(query.generation == generation);
+    query.predicate_armed = false;
+    query.predicate_blocked = true;
+  }
+  // Whether the draw being issued runs under an armed predicate.
+  bool IsVIZPredicateArmed() const {
+    return viz_draw_predicate_.generation != kInvalidVIZGeneration &&
+           viz_queries_[viz_draw_predicate_.id].predicate_armed;
+  }
+  void ResetVIZState() {
+    active_segment_.viz = {};
+    viz_draw_predicate_ = {};
+    viz_pending_resolves_ = 0;
+    for (VIZQuery& query : viz_queries_) {
+      query = {};
+    }
+  }
 
 #include "pm4_command_processor_declare.h"
 
@@ -285,6 +536,50 @@ class CommandProcessor {
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+
+  ZPDMode zpd_mode_ = ZPDMode::kFast;
+
+  ReportHandle zpd_next_report_handle_ = 1;
+  // The report the next event will end. No handle means nothing is measuring.
+  ZPDReport zpd_current_report_;
+  ActiveQuerySegment active_segment_{};
+  bool query_segment_opening_ = false;
+  // Reports owed to the guest, in stream order.
+  std::deque<ZPDReport> zpd_reports_;
+  // Strict reports containing the D3D sentinel the guest polls.
+  uint32_t zpd_awaited_report_count_ = 0;
+
+  // The retired counter advances as intervals retire. The speculative counter
+  // tracks the latest queued report so fast modes can monotonically write
+  // increasing values at EVENT_WRITE_ZPD, using each report's last retired
+  // delta as its next speculative prediction.
+  XenosZPDReport zpd_sample_counter_;
+  XenosZPDReport zpd_speculative_sample_counter_;
+  std::unordered_map<uint32_t, XenosZPDReport> fast_zpd_report_cached_deltas_;
+
+  bool zpd_force_fake_fallback_ = false;
+  uint32_t fake_zpd_sample_count_ = 0;
+
+  // Uptime in ms when the current retire backstop was armed.
+  uint64_t zpd_pending_retire_start_ms_ = 0;
+
+  // Set by the backend when resolution scale changes.
+  uint32_t zpd_draw_resolution_scale_x_ = 1;
+  uint32_t zpd_draw_resolution_scale_y_ = 1;
+
+  // Scale area for the segment being closed.
+  uint32_t GetZPDScaleArea() const {
+    return active_segment_.scale_area
+               ? active_segment_.scale_area
+               : zpd_draw_resolution_scale_x_ * zpd_draw_resolution_scale_y_;
+  }
+
+  // Represents the 64 slots of SC_VIZ_QUERY_STATUS_0/1.
+  std::array<VIZQuery, 64> viz_queries_{};
+  // Predicate for the draw being issued, set by PM4.
+  VIZQueryHandle viz_draw_predicate_{};
+  // Segments with an unresolved VIZ consumer.
+  uint32_t viz_pending_resolves_ = 0;
 
   TraceWriter trace_writer_;
   enum class TraceState {

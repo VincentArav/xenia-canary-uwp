@@ -9,6 +9,7 @@
 
 #include "xenia/apu/xma_context.h"
 
+#include <cmath>
 #include <cstring>
 
 #include "xenia/apu/xma_decoder.h"
@@ -49,7 +50,7 @@ void XmaContext::DumpRaw(AVFrame* frame, int id) {
   }
   size_t data_size = sizeof(float);
   for (int i = 0; i < frame->nb_samples; i++) {
-    for (int ch = 0; ch < frame->channels; ch++) {
+    for (int ch = 0; ch < frame->ch_layout.nb_channels; ch++) {
       fwrite(frame->data[ch] + data_size * i, 1, data_size, outfile);
     }
   }
@@ -125,8 +126,8 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
       // Raw samples sometimes aren't within [-1, 1]
       float scaled_sample = xe::clamp_float(in[i], -1.0f, 1.0f) * scale;
 
-      // Convert the sample and output it in big endian.
-      auto sample = static_cast<int16_t>(scaled_sample);
+      // Round before converting the sample and outputing it in big endian.
+      auto sample = static_cast<int16_t>(std::lrintf(scaled_sample));
       out[o++] = xe::byte_swap(sample);
     }
   }

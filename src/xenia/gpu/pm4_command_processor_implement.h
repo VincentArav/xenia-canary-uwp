@@ -29,7 +29,7 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
         // Return up a level if we encounter a bad packet.
         XELOGE("**** INDIRECT RINGBUFFER: Failed to execute packet.");
         assert_always();
-        // break;
+        break;
       }
     } while (reader_.read_count());
 
@@ -552,6 +552,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = true;
         break;
       }
+      case PM4_WAIT_IB_PFD_COMPLETE: {
+        // Waits for earlier INDIRECT_BUFFER_PFD base and size writes.
+        // No wait is needed since we process indirect buffers synchronously.
+        reader_.AdvanceRead(count * sizeof(uint32_t));
+        result = true;
+        break;
+      }
       case PM4_WAIT_FOR_IDLE: {
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
@@ -954,56 +961,57 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   return true;
 }
 
-static uint32_t samples = cvars::query_occlusion_sample_upper_threshold;
-
 XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = xe::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3F);
 
-  if (cvars::query_occlusion_sample_lower_threshold < 0) {
+  uint32_t report_address =
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  // RB_SAMPLE_COUNT_CTL is unused by real hardware.
+
+  if (!report_address) {
     return true;
   }
-  // Occlusion queries:
-  // This command is send on query begin and end.
-  // As a workaround report some fixed amount of passed samples.
-  auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
-  // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-  // and used to detect a finished query.
-  bool is_end_via_z_pass = pSampleCounts->ZPass_A == kQueryFinished &&
-                           pSampleCounts->ZPass_B == kQueryFinished;
-  // Older versions of D3D also checks for ZFail (4D5307D5).
-  bool is_end_via_z_fail = pSampleCounts->ZFail_A == kQueryFinished &&
-                           pSampleCounts->ZFail_B == kQueryFinished;
-  std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-  if (is_end_via_z_pass || is_end_via_z_fail) {
-    pSampleCounts->ZPass_A = samples;
-    pSampleCounts->Total_A = samples;
+
+  if (zpd_mode_ != ZPDMode::kFake && !zpd_force_fake_fallback_) {
+    // Z-Pass Done (ZPD) facilitates all D3D occlusion queries.
+    // D3D fills the counters (usually ZPass_A + ZPass_B, but some 2005-2006 D3D
+    // versions use ZFail_A + ZFail_B, and sometimes even both counters' B
+    // fields are kept zero) with a swapped 0xFFFFFEED sentinel while counting.
+    // Rather than trying to clumsily infer boundaries here, the command
+    // processor treats each event as a free-running sample counter snapshot.
+    // VIZ_QUERY is a coarse hi-Z visibility test, not strictly an OQ.
+    COMMAND_PROCESSOR::QueueZPDReport(report_address);
+    return true;
   }
 
-  samples =
-      samples <= static_cast<uint32_t>(
-                     cvars::query_occlusion_sample_lower_threshold)
-          ? static_cast<uint32_t>(cvars::query_occlusion_sample_upper_threshold)
-          : samples - 1;
+  // Fake / fallback mode.
+  if (cvars::occlusion_query_fake_lower_threshold < 0) {
+    return true;
+  }
+  fake_zpd_sample_count_ =
+      (fake_zpd_sample_count_ <=
+       static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold))
+          ? static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold)
+          : fake_zpd_sample_count_ - 1;
 
+  zpd_speculative_sample_counter_ +=
+      XenosZPDReport::FromNativeQuery(fake_zpd_sample_count_);
+  zpd_sample_counter_ = zpd_speculative_sample_counter_;
+  COMMAND_PROCESSOR::WriteZPDReport(report_address, zpd_sample_counter_);
   return true;
 }
 
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
     uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,
     uint32_t count_remaining) XE_RESTRICT {
-  // if viz_query_condition != 0, this is a conditional draw based on viz query.
-  // This ID matches the one issued in PM4_VIZ_QUERY
-  // uint32_t viz_id = viz_query_condition & 0x3F;
-  // when true, render conditionally based on query result
-  // uint32_t viz_use = viz_query_condition & 0x100;
+  // viz_query_condition is the VIZ token.
+  // Bit 8 makes the draw conditional on the ID's visibility in bits 0:5,
+  // from an earlier PM4_VIZ_QUERY.
 
   assert_not_zero(count_remaining);
   if (!count_remaining) {
@@ -1034,7 +1042,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
         XELOGE("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
         return false;
       }
-      uint32_t vgt_dma_base = reader_.ReadAndSwap<uint32_t>();
+      // Wrap writeback & XPS addresses to their physical backing.
+      uint32_t vgt_dma_base = CpuToGpu(reader_.ReadAndSwap<uint32_t>());
       --count_remaining;
       register_file_->values[XE_GPU_REG_VGT_DMA_BASE] = vgt_dma_base;
       reg::VGT_DMA_SIZE vgt_dma_size;
@@ -1085,17 +1094,16 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   reader_.AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
-    auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
+    // A consumer draw whose survey is still outstanding runs under the
+    // backend's predicate instead of blocking. Surveys themselves are
+    // ordinary draws here.
+    if (COMMAND_PROCESSOR::PrepareVIZDraw(viz_query_condition)) {
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
           vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
           is_indexed ? &index_buffer_info : nullptr,
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
                                      vgt_draw_initiator.prim_type));
+      viz_draw_predicate_ = {};
       if (!draw_succeeded) {
         XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
                vgt_draw_initiator.num_indices,
@@ -1103,6 +1111,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
                uint32_t(vgt_draw_initiator.source_select));
       }
     }
+  }
+
+  if (!draw_succeeded) {
+    COMMAND_PROCESSOR::OnVIZSurveyDraw(false);
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1331,8 +1343,22 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INVALIDATE_STATE(
 
 bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // begin/end initiator for viz query extent processing
   // https://www.google.com/patents/US20050195186
+  // VIZ_QUERY (VIZ) is Xenos' GPU-side conditional rendering / predication
+  // query mechanism. It's not actually an occlusion query like EVENT_WRITE_ZPD.
+  // There's no sample counts to return to the guest and no buffer that the CPU
+  // needs to read. Mercifully, VIZ has distinct BEGIN and END event types which
+  // clear the internal state of the scan converter.
+  //
+  // The scan converter tracks a state of 64 IDs, and geometry submissions
+  // between BEGIN/END events update one of those IDs, and later draw packets
+  // can use the results so the command processor can discard them. It's
+  // actually pretty similar to modern D3D12 predication or Vulkan conditional
+  // rendering, except geometry can be killed by hi-Z before any later tests.
+  //
+  // As a close-enough approximation, native occlusion queries are used for host
+  // RT and ZPass-like counting in-shader for interlock, and any passing sample
+  // is treated like a visible result.
   assert_true(count == 1);
 
   uint32_t dword0 = reader_.ReadAndSwap<uint32_t>();
@@ -1340,23 +1366,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
   uint32_t id = dword0 & 0x3F;
   uint32_t end = dword0 & 0x100;
   if (!end) {
-    // begin a new viz query @ id
-    // On hardware this clears the internal state of the scan converter (which
-    // is different to the register)
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_START);
-    // XELOGGPU("Begin viz query ID {:02X}", id);
+    if (cvars::occlusion_query_viz) {
+      COMMAND_PROCESSOR::BeginVIZQuery(id);
+    }
   } else {
-    // end the viz query
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_END);
-    // XELOGGPU("End viz query ID {:02X}", id);
-    // The scan converter writes the internal result back to the register here.
-    // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1)
-                                                                     << id;
-    } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |=
-          uint32_t(1) << (id - 32);
+    if (cvars::occlusion_query_viz) {
+      COMMAND_PROCESSOR::EndVIZQuery(id);
     }
   }
 

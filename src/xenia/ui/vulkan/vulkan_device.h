@@ -126,6 +126,10 @@ class VulkanDevice {
 
     bool scalarBlockLayout = false;
 
+    // VK_EXT_host_query_reset (promoted to 1.2)
+
+    bool hostQueryReset = false;
+
     // VK_KHR_portability_subset (#164)
 
     bool constantAlphaColorBlendFactors = false;
@@ -151,6 +155,11 @@ class VulkanDevice {
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
 
+    // VK_EXT_sample_locations (#144)
+
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
+    bool variableSampleLocations = false;
+
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
     bool shaderDemoteToHelperInvocation = false;
@@ -158,6 +167,15 @@ class VulkanDevice {
     // VK_EXT_non_seamless_cube_map (#423)
 
     bool nonSeamlessCubeMap = false;
+
+    // VK_EXT_custom_border_color (#288)
+
+    bool customBorderColors = false;
+    bool customBorderColorWithoutFormat = false;
+
+    // VK_EXT_conditional_rendering (#82)
+
+    bool conditionalRendering = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -174,6 +192,7 @@ class VulkanDevice {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_EXT_sample_locations = false;              // #144
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.
@@ -181,8 +200,10 @@ class VulkanDevice {
     bool ext_1_1_KHR_bind_memory2 = false;              // #158
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
+    bool ext_1_2_EXT_host_query_reset = false;          // promoted to 1.2
     // Has optional features not implied by this being true.
-    bool ext_1_3_KHR_maintenance4 = false;  // #414
+    bool ext_1_3_KHR_maintenance4 = false;       // #414
+    bool ext_EXT_conditional_rendering = false;  // #82
 #if XE_PLATFORM_WIN32
     // VK_EXT_full_screen_exclusive (#256, Windows only)
     bool ext_EXT_full_screen_exclusive = false;
@@ -204,8 +225,12 @@ class VulkanDevice {
 #include "xenia/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc"
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)
 #include "xenia/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc"
+    // VK_EXT_host_query_reset (promoted to 1.2)
+#include "xenia/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc"
     // VK_KHR_maintenance4 (#414, promoted to 1.3)
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
+    // VK_EXT_conditional_rendering (#82)
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

@@ -11,6 +11,7 @@
 #define XENIA_GPU_SHADER_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -535,9 +536,36 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  // Whether the fetch can return a single texel with no instruction override to
+  // linear/anisotropic filtering.
+  bool AllowsPointSampling(bool use_computed_lod) const {
+    return attributes.mag_filter != xenos::TextureFilter::kLinear &&
+           attributes.min_filter != xenos::TextureFilter::kLinear &&
+           attributes.mip_filter != xenos::TextureFilter::kLinear &&
+           (!use_computed_lod ||
+            attributes.aniso_filter == xenos::AnisoFilter::kDisabled ||
+            attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst);
+  }
+
+  // Whether a tfetch snaps its coordinates to the texel center instead of
+  // adding kTextureCoordEpsilon. Only point sampled 2D fetches with normalized
+  // coordinates snap. The fetch constant side is bit 26 in GetIntegerScaleBits.
+  // The epsilon is there so host rounding picks the texel guest trunc would,
+  // but near an edge it can push the sample into the next texel. That shows up
+  // as texture seams in 425307EC's virtual texture tables.
+  bool CanSnapToTexelCenter(bool use_computed_lod) const {
+    return opcode == ucode::FetchOpcode::kTextureFetch &&
+           dimension == xenos::FetchOpDimension::k2D &&
+           !attributes.unnormalized_coordinates &&
+           AllowsPointSampling(use_computed_lod);
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(StringBuffer* out) const;
 };
+
+// Fixed point texture coordinate ULP (see ProcessTextureFetchInstruction).
+constexpr float kTextureCoordEpsilon = 1.5f / 1024.0f;
 
 struct ParsedAluInstruction {
   // Opcode for the vector part of the instruction.
@@ -1006,9 +1034,20 @@ class Shader {
   // An externally managed identifier of the shader storage the microcode of the
   // shader was last written to, or was loaded from, to only write the shader
   // microcode to the storage once. UINT32_MAX by default.
-  uint32_t ucode_storage_index() const { return ucode_storage_index_; }
+  uint32_t ucode_storage_index() const {
+    return ucode_storage_index_.load(std::memory_order_relaxed);
+  }
   void set_ucode_storage_index(uint32_t storage_index) {
-    ucode_storage_index_ = storage_index;
+    ucode_storage_index_.store(storage_index, std::memory_order_relaxed);
+  }
+  // Atomically set storage index if changed. Returns true if updated.
+  bool try_set_ucode_storage_index(uint32_t new_index) {
+    uint32_t expected = ucode_storage_index_.load(std::memory_order_relaxed);
+    if (expected == new_index) {
+      return false;
+    }
+    return ucode_storage_index_.compare_exchange_strong(
+        expected, new_index, std::memory_order_relaxed);
   }
 
   // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
@@ -1073,7 +1112,7 @@ class Shader {
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
 
-  uint32_t ucode_storage_index_ = UINT32_MAX;
+  std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
 
  private:
   void GatherExecInformation(

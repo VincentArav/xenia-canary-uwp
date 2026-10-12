@@ -10,6 +10,8 @@
 #ifndef XENIA_KERNEL_XSEMAPHORE_H_
 #define XENIA_KERNEL_XSEMAPHORE_H_
 
+#include <mutex>
+
 #include "xenia/base/threading.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/kernel/xthread.h"
@@ -27,9 +29,10 @@ class XSemaphore : public XObject {
 
   [[nodiscard]] bool Initialize(int32_t initial_count, int32_t maximum_count);
   [[nodiscard]] bool InitializeNative(void* native_ptr,
-                                      X_DISPATCH_HEADER* header);
+                                      const X_DISPATCH_HEADER* header);
 
-  int32_t ReleaseSemaphore(int32_t release_count);
+  [[nodiscard]] bool ReleaseSemaphore(int32_t release_count,
+                                      int32_t* out_previous_count);
 
   bool Save(ByteStream* stream) override;
   static object_ref<XSemaphore> Restore(KernelState* kernel_state,
@@ -39,10 +42,16 @@ class XSemaphore : public XObject {
   xe::threading::WaitHandle* GetWaitHandle() override {
     return semaphore_.get();
   }
+  void WaitCallback() override;
+  void SyncFromGuest() override;
 
  private:
   std::unique_ptr<xe::threading::Semaphore> semaphore_;
   uint32_t maximum_count_ = 0;
+
+  std::mutex count_lock_;
+
+  int32_t host_count_ = 0;
 };
 
 }  // namespace kernel

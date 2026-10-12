@@ -10,13 +10,13 @@
 #include "xenia/gpu/gpu_flags.h"
 
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
-            "Prefix path for GPU trace files.", "GPU");
-DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU");
+            "Prefix path for GPU trace files.", "GPU.Debug");
+DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU.Debug");
 
 DEFINE_path(
     dump_shaders, "",
     "For shader debugging, path to dump GPU shaders to as they are compiled.",
-    "GPU");
+    "GPU.Debug");
 
 DEFINE_bool(vsync, true, "Enable VSYNC.", "GPU");
 
@@ -43,7 +43,7 @@ DEFINE_bool(
     "Disable filtering between cube map faces near edges where possible "
     "(Vulkan with VK_EXT_non_seamless_cube_map) to reproduce the Direct3D 9 "
     "behavior.",
-    "GPU");
+    "GPU.Debug");
 
 // Extremely bright screen borders in 4D5307E6.
 // Reading between texels with half-pixel offset in 58410954.
@@ -57,19 +57,20 @@ DEFINE_bool(
     "textures, for instance, when they are read between texels rather than "
     "at texel centers, or the leftmost/topmost pixels may not be fully covered "
     "when MSAA is used with fullscreen passes.",
-    "GPU");
+    "GPU.Debug");
 
-DEFINE_int32(query_occlusion_sample_lower_threshold, 80,
-             "If set to -1 no sample counts are written, games may hang. Else, "
-             "the sample count of every tile will be incremented on every "
-             "EVENT_WRITE_ZPD by this number. Setting this to 0 means "
-             "everything is reported as occluded.",
+DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
+             "Lower end of the fake sample count value written on "
+             "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"
+             "-1 writes nothing, resulting in some games that sit and hang.\n"
+             "0 means the fake result stays fully occluded.",
              "GPU");
-DEFINE_int32(
-    query_occlusion_sample_upper_threshold, 100,
-    "Set to higher number than query_occlusion_sample_lower_threshold. This "
-    "value is ignored if query_occlusion_sample_lower_threshold is set to -1.",
-    "GPU");
+DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
+             "Upper end of the fake sample count value written on "
+             "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"
+             "Keep this higher than occlusion_query_fake_lower_threshold.\n"
+             "Ignored if occlusion_query_fake_lower_threshold is -1.",
+             "GPU");
 
 DEFINE_int32(anisotropic_override, -1,
              "Forces anisotropic filtering (AF) for eligible textures.\n"
@@ -88,9 +89,41 @@ DEFINE_int32(anisotropic_override, -1,
 DEFINE_bool(no_discard_stencil_in_transfer_pipelines, false,
             "Skip stencil bit discard in render target transfer pipelines. "
             "May improve performance on some GPUs.",
-            "GPU");
+            "GPU.Debug");
 
 DEFINE_bool(gpu_3d_to_2d_texture, true,
             "Handle shaders that sample 3D textures as 2D by creating a 2D "
             "texture from slice 0 of the guest memory.",
+            "GPU");
+
+DEFINE_bool(
+    async_shader_compilation, true,
+    "Compile shaders and create pipelines asynchronously in background "
+    "threads. "
+    "Eliminates shader compilation stutter but may cause brief rendering "
+    "artifacts while pipelines are being created. When disabled, pipelines are "
+    "created synchronously which causes stutter but no visual artifacts.",
+    "GPU");
+
+DEFINE_bool(
+    force_depth_clamp, false,
+    "Use host depth clamping instead of near and far plane clipping when "
+    "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
+    "this requires depthClamp support.",
+    "GPU");
+
+DEFINE_bool(
+    mulsc_round_toward_zero, false,
+    "Round mulsc products toward zero instead of to nearest even. This fixes "
+    "bad geometry in several Volition Engine titles and possibly others. "
+    "This rounding behavior hasn't been confirmed on real hardware, so it's "
+    "disabled by default.",
+    "GPU");
+
+DEFINE_bool(xenos_sample_positions, false,
+            "Rasterize 2x and 4x MSAA render targets at the Xenos sample "
+            "positions, like real hardware, if the GPU and driver support it.\n"
+            "Only applies to RTV/FBO - ROV/FSI render targets always use Xenos "
+            "positions since they safely map coverage and calculate depth "
+            "in-shader.",
             "GPU");

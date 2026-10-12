@@ -33,9 +33,12 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
-  // render_pass_begin->pNext of all barriers must be null.
-  void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
-                            VkSubpassContents contents) {
+  // render_pass_begin->pNext must be null.
+  void CmdVkBeginRenderPass(
+      const VkRenderPassBeginInfo* render_pass_begin,
+      VkSubpassContents contents,
+      const VkSampleLocationsInfoEXT* sample_locations = nullptr,
+      bool has_depth_attachment = false) {
     assert_null(render_pass_begin->pNext);
     size_t arguments_size = sizeof(ArgsVkBeginRenderPass);
     uint32_t clear_value_count = render_pass_begin->clearValueCount;
@@ -45,6 +48,13 @@ class DeferredCommandBuffer {
       clear_values_offset = arguments_size;
       arguments_size += sizeof(VkClearValue) * clear_value_count;
     }
+    size_t sample_locations_offset = 0;
+    if (sample_locations) {
+      arguments_size = xe::align(arguments_size, alignof(VkSampleLocationEXT));
+      sample_locations_offset = arguments_size;
+      arguments_size +=
+          sizeof(VkSampleLocationEXT) * sample_locations->sampleLocationsCount;
+    }
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
         WriteCommand(Command::kVkBeginRenderPass, arguments_size));
     auto& args = *reinterpret_cast<ArgsVkBeginRenderPass*>(args_ptr);
@@ -53,6 +63,17 @@ class DeferredCommandBuffer {
     args.render_area = render_pass_begin->renderArea;
     args.clear_value_count = clear_value_count;
     args.contents = contents;
+    args.sample_locations_count =
+        sample_locations ? sample_locations->sampleLocationsCount : 0;
+    args.has_depth_attachment = has_depth_attachment;
+    if (sample_locations) {
+      args.sample_locations_per_pixel =
+          sample_locations->sampleLocationsPerPixel;
+      args.sample_location_grid_size = sample_locations->sampleLocationGridSize;
+      std::memcpy(args_ptr + sample_locations_offset,
+                  sample_locations->pSampleLocations,
+                  sizeof(VkSampleLocationEXT) * args.sample_locations_count);
+    }
     if (clear_value_count) {
       std::memcpy(args_ptr + clear_values_offset,
                   render_pass_begin->pClearValues,
@@ -129,6 +150,60 @@ class DeferredCommandBuffer {
                 sizeof(VkBuffer) * binding_count);
     std::memcpy(args_ptr + offsets_offset, offsets,
                 sizeof(VkDeviceSize) * binding_count);
+  }
+
+  void CmdVkBeginQuery(VkQueryPool query_pool, uint32_t query,
+                       VkQueryControlFlags flags) {
+    auto& args = *reinterpret_cast<ArgsVkBeginQuery*>(
+        WriteCommand(Command::kVkBeginQuery, sizeof(ArgsVkBeginQuery)));
+    args.query_pool = query_pool;
+    args.query = query;
+    args.flags = flags;
+  }
+
+  void CmdVkEndQuery(VkQueryPool query_pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkEndQuery*>(
+        WriteCommand(Command::kVkEndQuery, sizeof(ArgsVkEndQuery)));
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
+  void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query,
+                                 uint32_t query_count, VkBuffer dst_buffer,
+                                 VkDeviceSize dst_offset, VkDeviceSize stride,
+                                 VkQueryResultFlags flags) {
+    auto& args = *reinterpret_cast<ArgsVkCopyQueryPoolResults*>(WriteCommand(
+        Command::kVkCopyQueryPoolResults, sizeof(ArgsVkCopyQueryPoolResults)));
+    args.query_pool = query_pool;
+    args.first_query = first_query;
+    args.query_count = query_count;
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.stride = stride;
+    args.flags = flags;
+  }
+
+  void CmdVkBeginConditionalRenderingEXT(VkBuffer buffer, VkDeviceSize offset,
+                                         VkConditionalRenderingFlagsEXT flags) {
+    auto& args = *reinterpret_cast<ArgsVkBeginConditionalRenderingEXT*>(
+        WriteCommand(Command::kVkBeginConditionalRenderingEXT,
+                     sizeof(ArgsVkBeginConditionalRenderingEXT)));
+    args.buffer = buffer;
+    args.offset = offset;
+    args.flags = flags;
+  }
+
+  void CmdVkEndConditionalRenderingEXT() {
+    WriteCommand(Command::kVkEndConditionalRenderingEXT, 0);
+  }
+
+  void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query,
+                           uint32_t query_count) {
+    auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
+        WriteCommand(Command::kVkResetQueryPool, sizeof(ArgsVkResetQueryPool)));
+    args.query_pool = query_pool;
+    args.first_query = first_query;
+    args.query_count = query_count;
   }
 
   void CmdClearAttachmentsEmplace(uint32_t attachment_count,
@@ -232,6 +307,16 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  void CmdVkFillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset,
+                       VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.size = size;
+    args.data = data;
+  }
+
   VkImageBlit* CmdBlitImageEmplace(VkImage src_image,
                                    VkImageLayout src_image_layout,
                                    VkImage dst_image,
@@ -293,7 +378,7 @@ class DeferredCommandBuffer {
 
   void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
 
-  // pNext of all barriers must be null.
+  // pNext of all barriers must be null, except for VkSampleLocationsInfoEXT.
   void CmdVkPipelineBarrier(VkPipelineStageFlags src_stage_mask,
                             VkPipelineStageFlags dst_stage_mask,
                             VkDependencyFlags dependency_flags,
@@ -393,10 +478,17 @@ class DeferredCommandBuffer {
     kVkBindIndexBuffer,
     kVkBindPipeline,
     kVkBindVertexBuffers,
+    kVkBeginQuery,
+    kVkEndQuery,
+    kVkCopyQueryPoolResults,
+    kVkResetQueryPool,
+    kVkBeginConditionalRenderingEXT,
+    kVkEndConditionalRenderingEXT,
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkFillBuffer,
     kVkBlitImage,
     kVkDispatch,
     kVkDraw,
@@ -426,8 +518,13 @@ class DeferredCommandBuffer {
     VkRect2D render_area;
     uint32_t clear_value_count;
     VkSubpassContents contents;
-    // Followed by aligned optional VkClearValue[].
+    VkSampleCountFlagBits sample_locations_per_pixel;
+    VkExtent2D sample_location_grid_size;
+    uint32_t sample_locations_count;
+    bool has_depth_attachment;
+    // Followed by aligned optional VkClearValue[], VkSampleLocationEXT[].
     static_assert(alignof(VkClearValue) <= alignof(uintmax_t));
+    static_assert(alignof(VkSampleLocationEXT) <= alignof(uintmax_t));
   };
 
   struct ArgsVkBindDescriptorSets {
@@ -457,6 +554,39 @@ class DeferredCommandBuffer {
     // Followed by aligned VkBuffer[], VkDeviceSize[].
     static_assert(alignof(VkBuffer) <= alignof(uintmax_t));
     static_assert(alignof(VkDeviceSize) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkBeginQuery {
+    VkQueryPool query_pool;
+    uint32_t query;
+    VkQueryControlFlags flags;
+  };
+
+  struct ArgsVkEndQuery {
+    VkQueryPool query_pool;
+    uint32_t query;
+  };
+
+  struct ArgsVkCopyQueryPoolResults {
+    VkQueryPool query_pool;
+    uint32_t first_query;
+    uint32_t query_count;
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    VkDeviceSize stride;
+    VkQueryResultFlags flags;
+  };
+
+  struct ArgsVkBeginConditionalRenderingEXT {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkConditionalRenderingFlagsEXT flags;
+  };
+
+  struct ArgsVkResetQueryPool {
+    VkQueryPool query_pool;
+    uint32_t first_query;
+    uint32_t query_count;
   };
 
   struct ArgsVkClearAttachments {
@@ -491,6 +621,13 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    VkDeviceSize size;
+    uint32_t data;
   };
 
   struct ArgsVkBlitImage {
@@ -532,11 +669,21 @@ class DeferredCommandBuffer {
     uint32_t memory_barrier_count;
     uint32_t buffer_memory_barrier_count;
     uint32_t image_memory_barrier_count;
+    uint32_t sample_locations_info_count;
     // Followed by aligned optional VkMemoryBarrier[],
-    // optional VkBufferMemoryBarrier[], optional VkImageMemoryBarrier[].
+    // optional VkBufferMemoryBarrier[], optional VkImageMemoryBarrier[], then
+    // sample_locations_info_count aligned ArgsSampleLocationsInfo records,
+    // each followed by its VkSampleLocationEXT[].
     static_assert(alignof(VkMemoryBarrier) <= alignof(uintmax_t));
     static_assert(alignof(VkBufferMemoryBarrier) <= alignof(uintmax_t));
     static_assert(alignof(VkImageMemoryBarrier) <= alignof(uintmax_t));
+  };
+
+  struct ArgsSampleLocationsInfo {
+    uint32_t image_memory_barrier_index;
+    VkSampleCountFlagBits samples_per_pixel;
+    VkExtent2D grid_size;
+    uint32_t count;
   };
 
   struct ArgsVkPushConstants {
@@ -582,6 +729,9 @@ class DeferredCommandBuffer {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  // For rebuilding pNext chains of barriers with sample locations.
+  std::vector<VkImageMemoryBarrier> image_barriers_with_sample_locations_;
+  std::vector<VkSampleLocationsInfoEXT> barrier_sample_locations_;
 };
 
 }  // namespace vulkan

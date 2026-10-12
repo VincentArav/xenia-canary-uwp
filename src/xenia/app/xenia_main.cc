@@ -52,20 +52,25 @@
 // Available graphics systems:
 #if !XE_PLATFORM_WINRT
 #include "xenia/gpu/null/null_graphics_system.h"
+#if !XE_PLATFORM_MAC
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #endif
+#endif  // !XE_PLATFORM_WINRT
 #if XE_PLATFORM_WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #endif  // XE_PLATFORM_WIN32
 
 // Available input drivers:
+#if XE_PLATFORM_LINUX
+#include "xenia/hid/keyboard/keyboard_hid.h"
+#endif  // XE_PLATFORM_LINUX
 #include "xenia/hid/nop/nop_hid.h"
 #if !XE_PLATFORM_ANDROID & !XE_PLATFORM_WINRT
 #include "xenia/hid/sdl/sdl_hid.h"
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_WIN32
 #if !XE_PLATFORM_WINRT
-#include "xenia/hid/winkey/winkey_hid.h"
+#include "xenia/hid/keyboard/keyboard_hid.h"
 #endif
 #include "xenia/hid/xinput/xinput_hid.h"
 #endif  // XE_PLATFORM_WIN32
@@ -73,11 +78,11 @@
 #if XE_PLATFORM_WIN32
 #define APU_OPTIONS "[any, nop, sdl, xaudio2]"
 #define GPU_OPTIONS "[any, d3d12, vulkan, null]"
-#define HID_OPTIONS "[any, nop, sdl, winkey, xinput]"
+#define HID_OPTIONS "[any, nop, sdl, keyboard, xinput]"
 #elif XE_PLATFORM_LINUX
 #define APU_OPTIONS "[any, alsa, nop, sdl]"
 #define GPU_OPTIONS "[any, vulkan, null]"
-#define HID_OPTIONS "[any, nop, sdl]"
+#define HID_OPTIONS "[any, nop, sdl, keyboard]"
 #else
 #define APU_OPTIONS "[any, nop, sdl]"
 #define GPU_OPTIONS "[any, vulkan, null]"
@@ -138,7 +143,8 @@ DECLARE_bool(debug);
 DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
 #endif
 
-DECLARE_bool(widescreen);
+DECLARE_int32(window_size_x);
+DECLARE_int32(window_size_y);
 
 namespace xe {
 namespace app {
@@ -199,9 +205,13 @@ class EmulatorApp final : public xe::ui::WindowedApp {
         return nullptr;
       } else {
         for (const auto& creator : creators_) {
-          if (!creator.is_available()) continue;
+          if (!creator.is_available()) {
+            continue;
+          }
           auto instance = creator.instantiate(std::forward<Args>(args)...);
-          if (!instance) continue;
+          if (!instance) {
+            continue;
+          }
           return instance;
         }
         return nullptr;
@@ -235,7 +245,7 @@ class EmulatorApp final : public xe::ui::WindowedApp {
       }
 
       // "Specified" path. Winkey is always added on windows.
-      if (name != "winkey") {
+      if (name != "keyboard") {
         auto it = std::find_if(
             creators_.cbegin(), creators_.cend(),
             [&name](const auto& f) { return name.compare(f.name) == 0; });
@@ -251,7 +261,7 @@ class EmulatorApp final : public xe::ui::WindowedApp {
       // Always add winkey for passthrough.
       auto it = std::find_if(
           creators_.cbegin(), creators_.cend(),
-          [&name](const auto& f) { return f.name.compare("winkey") == 0; });
+          [&name](const auto& f) { return f.name.compare("keyboard") == 0; });
       if (it != creators_.cend() && (*it).is_available()) {
         auto instance = (*it).instantiate(std::forward<Args>(args)...);
         if (instance) {
@@ -414,7 +424,9 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
   if (gpu_implementation_name == "null") {
     return std::make_unique<gpu::null::NullGraphicsSystem>();
   }
+#if !XE_PLATFORM_MAC
   factory.Add<gpu::vulkan::VulkanGraphicsSystem>("vulkan");
+#endif
 #endif  // !XE_PLATFORM_WINRT
   std::unique_ptr<gpu::GraphicsSystem> gpu_implementation =
       factory.Create(gpu_implementation_name);
@@ -461,9 +473,12 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
 #if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
     factory.Add("sdl", xe::hid::sdl::Create);
 #endif  // !XE_PLATFORM_ANDROID
+#if XE_PLATFORM_LINUX
+    factory.Add("keyboard", xe::hid::keyboard::Create);
+#endif
 #if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
     // WinKey input driver should always be the last input driver added!
-    factory.Add("winkey", xe::hid::winkey::Create);
+    factory.Add("keyboard", xe::hid::keyboard::Create);
 #endif  // XE_PLATFORM_WIN32
     for (auto& driver : factory.CreateAll(cvars::hid, window,
                                           EmulatorWindow::kZOrderHidInput)) {
@@ -491,12 +506,9 @@ bool EmulatorApp::OnInitialize() {
     if (!cvars::portable &&
         !std::filesystem::exists(storage_root / "portable.txt")) {
       storage_root = xe::filesystem::GetUserFolder();
-#if defined(XE_PLATFORM_WIN32) || defined(XE_PLATFORM_LINUX)
-      storage_root = storage_root / "Xenia";
+#if XE_PLATFORM_ANDROID
+      // TODO(Triang3l): Point to the app's external storage "files" directory.
 #else
-      // TODO(Triang3l): Point to the app's external storage "files" directory
-      // on Android.
-#warning Unhandled platform for the data root.
       storage_root = storage_root / "Xenia";
 #endif
     }
@@ -508,6 +520,8 @@ bool EmulatorApp::OnInitialize() {
 
 #if XE_ARCH_AMD64 == 1
   amd64::InitFeatureFlags();
+#elif XE_ARCH_ARM64 == 1
+  arm64::InitFeatureFlags();
 #endif
 
   std::filesystem::path content_root = cvars::content_root;
@@ -549,12 +563,10 @@ bool EmulatorApp::OnInitialize() {
   emulator_ =
       std::make_unique<Emulator>("", storage_root, content_root, cache_root);
 
-  // Determine window size based on user setting.
-  auto res = xe::gpu::GraphicsSystem::GetInternalDisplayResolution();
-
   // Main emulator display window.
-  emulator_window_ = EmulatorWindow::Create(emulator_.get(), app_context(),
-                                            res.first, res.second);
+  emulator_window_ =
+      EmulatorWindow::Create(emulator_.get(), app_context(),
+                             cvars::window_size_x, cvars::window_size_y);
   if (!emulator_window_) {
     XELOGE("Failed to create the main emulator window");
     return false;
@@ -587,6 +599,9 @@ void EmulatorApp::OnDestroy() {
 
   // TODO(DrChat): Remove this code and do a proper exit.
   XELOGI("Cheap-skate exit!");
+
+  xe::FlushLog();
+
   std::quick_exit(EXIT_SUCCESS);
 }
 
@@ -777,7 +792,7 @@ void EmulatorApp::EmulatorThread() {
   if (xam) {
     xam->LoadLoaderData();
 
-    if (xam->loader_data().launch_data_present) {
+    if (!xam->loader_data().host_path.empty()) {
       const std::filesystem::path host_path = xam->loader_data().host_path;
       app_context().CallInUIThread([this, host_path]() {
         return emulator_window_->RunTitle(host_path);

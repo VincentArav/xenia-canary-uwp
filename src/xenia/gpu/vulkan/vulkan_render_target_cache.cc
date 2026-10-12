@@ -65,6 +65,7 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_32bpp_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_64bpp_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_64bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_dxt3aas1111_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_4xmsaa_cs.h"
@@ -120,6 +121,8 @@ const VulkanRenderTargetCache::ResolveCopyShaderCode
          sizeof(shaders::resolve_full_128bpp_cs),
          shaders::resolve_full_128bpp_scaled_cs,
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
+        {shaders::resolve_dxt3aas1111_cs,
+         sizeof(shaders::resolve_dxt3aas1111_cs), nullptr, 0},
 };
 
 const VulkanRenderTargetCache::TransferPipelineLayoutInfo
@@ -265,7 +268,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   // 2x MSAA support.
   // TODO(Triang3l): Handle sampledImageIntegerSampleCounts 4 not supported in
   // transfers.
-  if (cvars::native_2x_msaa) {
+  if (!cvars::debug_msaa_2x_as_4x) {
     // Multisampled integer sampled images are optional in Vulkan and in Xenia.
     msaa_2x_attachments_supported_ =
         (device_properties.framebufferColorSampleCounts &
@@ -284,6 +287,48 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   } else {
     msaa_2x_attachments_supported_ = false;
     msaa_2x_no_attachments_supported_ = false;
+  }
+
+  // Set up Xenos MSAA sample locations for sample counts the device supports.
+  if (vulkan_device->extensions().ext_EXT_sample_locations) {
+    for (uint32_t i = 0; i < 2; ++i) {
+      bool subpass_has_attachments = i != 0;
+      // FSI always uses Xenos' MSAA sample positions.
+      if (subpass_has_attachments && !cvars::xenos_sample_positions) {
+        continue;
+      }
+      // Draws without attachments can change sample counts within a render
+      // pass, so they need variable sample locations.
+      if (!subpass_has_attachments &&
+          !device_properties.variableSampleLocations) {
+        continue;
+      }
+      for (uint32_t j = 0; j < 2; ++j) {
+        // Use interlock sample mapping for subpasses without attachments.
+        int8_t positions[4][2];
+        uint32_t host_sample_count = draw_util::GetHostSampleXenosPositions(
+            j ? xenos::MsaaSamples::k4X : xenos::MsaaSamples::k2X,
+            IsMsaa2xSupported(subpass_has_attachments),
+            !subpass_has_attachments, positions);
+        if (!(device_properties.sampleLocationSampleCounts &
+              VkSampleCountFlags(host_sample_count))) {
+          continue;
+        }
+        VkSampleLocationEXT* locations = sample_locations_[i][j];
+        for (uint32_t k = 0; k < host_sample_count; ++k) {
+          locations[k].x = 0.5f + float(positions[k][0]) * (1.0f / 16.0f);
+          locations[k].y = 0.5f + float(positions[k][1]) * (1.0f / 16.0f);
+        }
+        VkSampleLocationsInfoEXT& info = sample_locations_info_[i][j];
+        info.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+        info.pNext = nullptr;
+        info.sampleLocationsPerPixel = VkSampleCountFlagBits(host_sample_count);
+        info.sampleLocationGridSize.width = 1;
+        info.sampleLocationGridSize.height = 1;
+        info.sampleLocationsCount = host_sample_count;
+        info.pSampleLocations = locations;
+      }
+    }
   }
 
   // Descriptor set layouts.
@@ -482,6 +527,20 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     Shutdown();
     return false;
   }
+  if (draw_resolution_scaled) {
+    // Second layout for fully native resolve copies.
+    resolve_copy_push_constant_range.size =
+        sizeof(draw_util::ResolveCopyShaderConstants);
+    if (dfn.vkCreatePipelineLayout(
+            device, &resolve_copy_pipeline_layout_create_info, nullptr,
+            &resolve_copy_native_pipeline_layout_) != VK_SUCCESS) {
+      XELOGE(
+          "VulkanRenderTargetCache: Failed to create the native resolve copy "
+          "pipeline layout");
+      Shutdown();
+      return false;
+    }
+  }
 
   // Resolve copy pipelines.
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount);
@@ -492,9 +551,30 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         kResolveCopyShaders[i];
     // Somewhat verification whether resolve_copy_shaders_ is up to date.
     assert_true(resolve_copy_shader_code.unscaled &&
-                resolve_copy_shader_code.unscaled_size_bytes &&
-                resolve_copy_shader_code.scaled &&
-                resolve_copy_shader_code.scaled_size_bytes);
+                resolve_copy_shader_code.unscaled_size_bytes);
+    if (draw_resolution_scaled) {
+      // Unscaled variant for fully native resolves.
+      VkPipeline resolve_copy_native_pipeline =
+          ui::vulkan::util::CreateComputePipeline(
+              vulkan_device, resolve_copy_native_pipeline_layout_,
+              resolve_copy_shader_code.unscaled,
+              resolve_copy_shader_code.unscaled_size_bytes);
+      if (resolve_copy_native_pipeline == VK_NULL_HANDLE) {
+        XELOGE(
+            "VulkanRenderTargetCache: Failed to create the native resolve "
+            "copy pipeline {}",
+            resolve_copy_shader_info.debug_name);
+        Shutdown();
+        return false;
+      }
+      vulkan_device->SetObjectName(VK_OBJECT_TYPE_PIPELINE,
+                                   resolve_copy_native_pipeline,
+                                   resolve_copy_shader_info.debug_name);
+      resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
+    }
+    if (draw_resolution_scaled && !resolve_copy_shader_code.scaled) {
+      continue;
+    }
     VkPipeline resolve_copy_pipeline = ui::vulkan::util::CreateComputePipeline(
         vulkan_device, resolve_copy_pipeline_layout_,
         draw_resolution_scaled ? resolve_copy_shader_code.scaled
@@ -519,8 +599,29 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   if (path_ == Path::kHostRenderTargets) {
     // Host render targets.
 
+    // Store k_8_8_8_8_GAMMA targets as linear UNORM16 for blending.
+    // Convert at EDRAM, transfer, clear, and dump boundaries. The format must
+    // be sampleable and support color attachment blending.
+    constexpr VkFormatFeatureFlags kGammaUnorm16Features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    VkFormatProperties gamma_unorm16_properties;
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device,
+                                            VK_FORMAT_R16G16B16A16_UNORM,
+                                            &gamma_unorm16_properties);
+    gamma_render_target_as_unorm16_ =
+        cvars::gamma_render_target_as_unorm16 &&
+        (gamma_unorm16_properties.optimalTilingFeatures &
+         kGammaUnorm16Features) == kGammaUnorm16Features;
+
     depth_float24_round_ = cvars::depth_float24_round;
-    gamma_render_target_as_srgb_ = cvars::gamma_render_target_as_srgb;
+    // In-PS conversion requires per-sample shading under MSAA for intersections
+    // to antialias; without sampleRateShading, fall back to transfer-time
+    // conversion so the host/PS encoding stays consistent across all draws.
+    depth_float24_convert_in_pixel_shader_ =
+        cvars::depth_float24_convert_in_pixel_shader &&
+        device_properties.sampleRateShading;
 
     // Host depth storing pipeline layout.
     VkDescriptorSetLayout host_depth_store_descriptor_set_layouts[] = {
@@ -721,11 +822,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   } else if (path_ == Path::kPixelShaderInterlock) {
     // Pixel (fragment) shader interlock.
 
-    // Blending is done in linear space directly in shaders.
-    gamma_render_target_as_srgb_ = false;
+    // Piecewise linear gamma is 8-bit with programmable blending.
+    gamma_render_target_as_unorm16_ = false;
 
-    // Always true float24 depth rounded to the nearest even.
+    // Always true float24 depth rounded to the nearest even, converted in the
+    // shader (FSI ignores depth_float24_convert_in_pixel_shader, but set it for
+    // parity with the host render target path).
     depth_float24_round_ = true;
+    depth_float24_convert_in_pixel_shader_ = true;
 
     // The pipeline layout and the pipelines for clearing the EDRAM buffer in
     // resolves.
@@ -951,6 +1055,13 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   }
   render_passes_.clear();
 
+  for (VkPipeline& resolve_copy_native_pipeline :
+       resolve_copy_native_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                           resolve_copy_native_pipeline);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         resolve_copy_native_pipeline_layout_);
   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                            resolve_copy_pipeline);
@@ -1020,13 +1131,16 @@ void VulkanRenderTargetCache::EndSubmission() {
   }
 }
 
-bool VulkanRenderTargetCache::Resolve(const Memory& memory,
-                                      VulkanSharedMemory& shared_memory,
-                                      VulkanTextureCache& texture_cache,
-                                      uint32_t& written_address_out,
-                                      uint32_t& written_length_out) {
+bool VulkanRenderTargetCache::Resolve(
+    const Memory& memory, VulkanSharedMemory& shared_memory,
+    VulkanTextureCache& texture_cache, uint32_t& written_address_out,
+    uint32_t& written_length_out, reg::RB_COPY_DEST_INFO* copy_dest_info_out,
+    bool* written_scaled_out) {
   written_address_out = 0;
   written_length_out = 0;
+  if (written_scaled_out) {
+    *written_scaled_out = false;
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1036,6 +1150,14 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
           draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
           IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
     return false;
+  }
+
+  if (copy_dest_info_out) {
+    // The destination format in it is normalized by GetResolveInfo to the
+    // xenos::TextureFormat actually used for the copy (in particular, the
+    // depth format instead of the raw guest-specified one for depth copies) -
+    // the same value the destination extent was calculated for.
+    *copy_dest_info_out = resolve_info.copy_dest_info;
   }
 
   // Nothing to copy/clear.
@@ -1050,6 +1172,37 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
   DeferredCommandBuffer& command_buffer =
       command_processor_.deferred_command_buffer();
 
+  // Copy at 1x1 if all render targets owning the source are native.
+  bool copy_native = false;
+  uint32_t dump_base = 0;
+  uint32_t dump_row_length_used = 0;
+  uint32_t dump_rows = 0;
+  uint32_t dump_pitch = 0;
+  if (resolve_info.copy_dest_extent_length &&
+      GetPath() == Path::kHostRenderTargets) {
+    resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                      dump_rows, dump_pitch);
+    copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
+                                            dump_rows, dump_pitch);
+    if (copy_native) {
+      // Redo the resolve info at 1x1 for the unscaled copy shader.
+      if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1,
+                                     1, IsFixedRG16TruncatedToMinus1To1(),
+                                     IsFixedRGBA16TruncatedToMinus1To1(),
+                                     resolve_info)) {
+        return false;
+      }
+    }
+  }
+  if (resolve_info.copy_dest_extent_length && draw_resolution_scaled &&
+      !copy_native &&
+      resolve_info.rb_copy_control.copy_command ==
+          xenos::CopyCommand::kConvertTo1111) {
+    XELOGW("Resolve copy command 2 is not supported with resolution scaling");
+    // Skip the copy, but still perform the clears.
+    resolve_info.copy_dest_extent_length = 0;
+  }
+
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
@@ -1058,20 +1211,17 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
       // range to edram_buffer_.
       // TODO(Triang3l): Direct host render target -> shared memory resolve
       // shaders for non-converting cases.
-      uint32_t dump_base;
-      uint32_t dump_row_length_used;
-      uint32_t dump_rows;
-      uint32_t dump_pitch;
-      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
-                                        dump_rows, dump_pitch);
-      DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                        copy_native);
     }
+    bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader = resolve_info.GetCopyShader(
-        draw_resolution_scale_x(), draw_resolution_scale_y(),
-        copy_shader_constants, copy_group_count_x, copy_group_count_y);
+        copy_native ? 1 : draw_resolution_scale_x(),
+        copy_native ? 1 : draw_resolution_scale_y(), copy_shader_constants,
+        copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
@@ -1090,18 +1240,28 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
-        // TODO(Triang3l): Use a single 512 MB shared memory binding if
-        // possible.
+        // Bind the whole shared memory buffer persistently when possible
+        // (passing the destination byte offset via dest_base) instead of
+        // allocating and writing a per-resolve descriptor. Scaled resolves
+        // write to separate scaled buffers, so they use transient descriptors.
+        // Decided per resolve, as native copies write to shared memory even
+        // with resolution scaling on.
+        const bool use_persistent_dest =
+            texture_cache.shared_memory_persistent_descriptor_set() !=
+                VK_NULL_HANDLE &&
+            !copy_dest_scaled;
         VkDescriptorSet descriptor_set_dest =
-            command_processor_.AllocateSingleTransientDescriptor(
-                VulkanCommandProcessor::SingleTransientDescriptorLayout ::
-                    kStorageBufferCompute);
+            use_persistent_dest
+                ? texture_cache.shared_memory_persistent_descriptor_set()
+                : command_processor_.AllocateSingleTransientDescriptor(
+                      VulkanCommandProcessor::SingleTransientDescriptorLayout ::
+                          kStorageBufferCompute);
         if (descriptor_set_dest != VK_NULL_HANDLE) {
           // Write the destination descriptor.
           VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
 
           bool scaled_buffer_ready = false;
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             // For scaled resolve, ensure the scaled buffer exists and bind to
             // it
             uint32_t dest_address = resolve_info.copy_dest_base;
@@ -1162,9 +1322,9 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             }
           }
 
-          if (!scaled_buffer_ready) {
-            // Regular unscaled resolve - write to shared memory
-            if (draw_resolution_scaled) {
+          if (!scaled_buffer_ready && !use_persistent_dest) {
+            // Write unscaled or native resolves to shared memory.
+            if (copy_dest_scaled) {
               XELOGW(
                   "Falling back to unscaled resolve at 0x{:08X} - scaled "
                   "buffer not available",
@@ -1179,22 +1339,24 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 resolve_info.copy_dest_base +
                 resolve_info.copy_dest_extent_length;
           }
-          VkWriteDescriptorSet write_descriptor_set_dest;
-          write_descriptor_set_dest.sType =
-              VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-          write_descriptor_set_dest.pNext = nullptr;
-          write_descriptor_set_dest.dstSet = descriptor_set_dest;
-          write_descriptor_set_dest.dstBinding = 0;
-          write_descriptor_set_dest.dstArrayElement = 0;
-          write_descriptor_set_dest.descriptorCount = 1;
-          write_descriptor_set_dest.descriptorType =
-              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-          write_descriptor_set_dest.pImageInfo = nullptr;
-          write_descriptor_set_dest.pBufferInfo =
-              &write_descriptor_set_dest_buffer_info;
-          write_descriptor_set_dest.pTexelBufferView = nullptr;
-          dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0,
-                                     nullptr);
+          if (!use_persistent_dest) {
+            VkWriteDescriptorSet write_descriptor_set_dest;
+            write_descriptor_set_dest.sType =
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write_descriptor_set_dest.pNext = nullptr;
+            write_descriptor_set_dest.dstSet = descriptor_set_dest;
+            write_descriptor_set_dest.dstBinding = 0;
+            write_descriptor_set_dest.dstArrayElement = 0;
+            write_descriptor_set_dest.descriptorCount = 1;
+            write_descriptor_set_dest.descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write_descriptor_set_dest.pImageInfo = nullptr;
+            write_descriptor_set_dest.pBufferInfo =
+                &write_descriptor_set_dest_buffer_info;
+            write_descriptor_set_dest.pTexelBufferView = nullptr;
+            dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0,
+                                       nullptr);
+          }
 
           // Submit the resolve.
           if (!scaled_buffer_ready) {
@@ -1229,29 +1391,39 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             }
           }
           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+          // Fully native resolves use the unscaled shader variant with the
+          // full push constant layout.
+          VkPipelineLayout copy_pipeline_layout =
+              copy_native ? resolve_copy_native_pipeline_layout_
+                          : resolve_copy_pipeline_layout_;
           command_processor_.BindExternalComputePipeline(
-              resolve_copy_pipelines_[size_t(copy_shader)]);
+              copy_native ? resolve_copy_native_pipelines_[size_t(copy_shader)]
+                          : resolve_copy_pipelines_[size_t(copy_shader)]);
           VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
           descriptor_sets[kResolveCopyDescriptorSetEdram] =
               edram_storage_buffer_descriptor_set_;
           descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
           command_buffer.CmdVkBindDescriptorSets(
-              VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
+              VK_PIPELINE_BIND_POINT_COMPUTE, copy_pipeline_layout, 0,
               uint32_t(xe::countof(descriptor_sets)), descriptor_sets, 0,
               nullptr);
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             command_buffer.CmdVkPushConstants(
-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants.dest_relative),
                 &copy_shader_constants.dest_relative);
           } else {
-            // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
-            // memory binding, or multiple shared memory bindings in case of
+            // TODO(Triang3l): Multiple shared memory bindings in case of
             // splitting due to maxStorageBufferRange overflow.
-            copy_shader_constants.dest_base -=
-                uint32_t(write_descriptor_set_dest_buffer_info.offset);
+            if (!use_persistent_dest) {
+              // The descriptor is offset to the destination, so make dest_base
+              // relative to it. With the whole buffer bound persistently,
+              // dest_base stays the absolute byte offset.
+              copy_shader_constants.dest_base -=
+                  uint32_t(write_descriptor_set_dest_buffer_info.offset);
+            }
             command_buffer.CmdVkPushConstants(
-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
           command_processor_.SubmitBarriers(true);
@@ -1280,12 +1452,16 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             }
           }
 
-          // Invalidate textures and mark the range as scaled if needed.
+          // Mark the range as scaled only if that's where the data actually
+          // went.
           texture_cache.MarkRangeAsResolved(
               resolve_info.copy_dest_extent_start,
-              resolve_info.copy_dest_extent_length);
+              resolve_info.copy_dest_extent_length, scaled_buffer_ready);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
+          if (written_scaled_out) {
+            *written_scaled_out = scaled_buffer_ready;
+          }
           copied = true;
         }
       }
@@ -1311,8 +1487,14 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 clear_transfers_[1])) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
-          clear_values[1] = resolve_info.rb_color_clear |
-                            (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+          // For 64bpp formats, RB_COLOR_CLEAR_LO is the lower 32 bits of the
+          // packed clear value. RB_COLOR_CLEAR is the upper 32 bits and, for
+          // 32bpp formats, the whole value.
+          clear_values[1] =
+              resolve_info.color_edram_info.format_is_64bpp
+                  ? resolve_info.rb_color_clear_lo |
+                        (uint64_t(resolve_info.rb_color_clear) << 32)
+                  : resolve_info.rb_color_clear;
           PerformTransfersAndResolveClears(2, clear_render_targets,
                                            clear_transfers_, clear_values,
                                            &clear_rectangle);
@@ -1384,10 +1566,11 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
 
 bool VulkanRenderTargetCache::Update(
     bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, const Shader& vertex_shader) {
-  if (!RenderTargetCache::Update(is_rasterization_done,
-                                 normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+    uint32_t normalized_color_mask, const Shader& vertex_shader,
+    int32_t window_offset_tiles) {
+  if (!RenderTargetCache::Update(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, vertex_shader, window_offset_tiles)) {
     return false;
   }
 
@@ -1407,11 +1590,6 @@ bool VulkanRenderTargetCache::Update(
                                        depth_and_color_render_targets,
                                        last_update_transfers());
 
-      uint32_t render_targets_are_srgb =
-          gamma_render_target_as_srgb_
-              ? last_update_accumulated_color_targets_are_gamma()
-              : 0;
-
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
         render_pass_key.depth_format =
@@ -1420,30 +1598,22 @@ bool VulkanRenderTargetCache::Update(
       if (depth_and_color_render_targets[1]) {
         render_pass_key.depth_and_color_used |= 1 << 1;
         render_pass_key.color_0_view_format =
-            (render_targets_are_srgb & (1 << 0))
-                ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
-                : depth_and_color_render_targets[1]->key().GetColorFormat();
+            depth_and_color_render_targets[1]->key().GetColorFormat();
       }
       if (depth_and_color_render_targets[2]) {
         render_pass_key.depth_and_color_used |= 1 << 2;
         render_pass_key.color_1_view_format =
-            (render_targets_are_srgb & (1 << 1))
-                ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
-                : depth_and_color_render_targets[2]->key().GetColorFormat();
+            depth_and_color_render_targets[2]->key().GetColorFormat();
       }
       if (depth_and_color_render_targets[3]) {
         render_pass_key.depth_and_color_used |= 1 << 3;
         render_pass_key.color_2_view_format =
-            (render_targets_are_srgb & (1 << 2))
-                ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
-                : depth_and_color_render_targets[3]->key().GetColorFormat();
+            depth_and_color_render_targets[3]->key().GetColorFormat();
       }
       if (depth_and_color_render_targets[4]) {
         render_pass_key.depth_and_color_used |= 1 << 4;
         render_pass_key.color_3_view_format =
-            (render_targets_are_srgb & (1 << 3))
-                ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
-                : depth_and_color_render_targets[4]->key().GetColorFormat();
+            depth_and_color_render_targets[4]->key().GetColorFormat();
       }
 
       const Framebuffer* framebuffer = last_update_framebuffer_;
@@ -1503,16 +1673,8 @@ bool VulkanRenderTargetCache::Update(
         VkImageLayout rt_new_layout;
         VulkanRenderTarget::GetDrawUsage(i == 0, &rt_dst_stage_mask,
                                          &rt_dst_access_mask, &rt_new_layout);
-        command_processor_.PushImageMemoryBarrier(
-            vulkan_rt.image(),
-            ui::vulkan::util::InitializeSubresourceRange(
-                i ? VK_IMAGE_ASPECT_COLOR_BIT
-                  : (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)),
-            vulkan_rt.current_stage_mask(), rt_dst_stage_mask,
-            vulkan_rt.current_access_mask(), rt_dst_access_mask,
-            vulkan_rt.current_layout(), rt_new_layout);
-        vulkan_rt.SetUsage(rt_dst_stage_mask, rt_dst_access_mask,
-                           rt_new_layout);
+        TransitionRenderTarget(vulkan_rt, rt_dst_stage_mask, rt_dst_access_mask,
+                               rt_new_layout);
       }
     } break;
 
@@ -1703,8 +1865,8 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
     case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       return VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      return gamma_render_target_as_srgb_ ? VK_FORMAT_R8G8B8A8_SRGB
-                                          : VK_FORMAT_R8G8B8A8_UNORM;
+      return gamma_render_target_as_unorm16_ ? VK_FORMAT_R16G16B16A16_UNORM
+                                             : VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
@@ -1775,9 +1937,6 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   if (view_color_transfer_separate_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_color_transfer_separate_, nullptr);
   }
-  if (view_srgb_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyImageView(device, view_srgb_, nullptr);
-  }
   if (view_stencil_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_stencil_, nullptr);
   }
@@ -1787,6 +1946,10 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
   dfn.vkFreeMemory(device, memory_, nullptr);
+}
+
+bool VulkanRenderTargetCache::IsGammaFormatHostStorageSeparate() const {
+  return gamma_render_target_as_unorm16_;
 }
 
 uint32_t VulkanRenderTargetCache::GetMaxRenderTargetWidth() const {
@@ -1817,10 +1980,10 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  image_create_info.extent.width = key.GetWidth() * draw_resolution_scale_x();
+  image_create_info.extent.width = key.GetWidth() * GetKeyScaleX(key);
   image_create_info.extent.height =
       GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
-      draw_resolution_scale_y();
+      GetKeyScaleY(key);
   image_create_info.extent.depth = 1;
   image_create_info.mipLevels = 1;
   image_create_info.arrayLayers = 1;
@@ -1838,20 +2001,21 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VkFormat transfer_format;
-  bool is_srgb_view_needed = false;
   if (key.is_depth) {
     image_create_info.format = GetDepthVulkanFormat(key.GetDepthFormat());
     transfer_format = image_create_info.format;
     image_create_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (GetSampleLocationsInfo(key.msaa_samples, true)) {
+      // Allow depth rendering at Xenos sample locations.
+      // Transitions must use the same locations to preserve compressed depth.
+      image_create_info.flags |=
+          VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+    }
   } else {
     xenos::ColorRenderTargetFormat color_format = key.GetColorFormat();
     image_create_info.format = GetColorVulkanFormat(color_format);
     transfer_format = GetColorOwnershipTransferVulkanFormat(color_format);
-    is_srgb_view_needed =
-        gamma_render_target_as_srgb_ &&
-        (color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-         color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA);
-    if (image_create_info.format != transfer_format || is_srgb_view_needed) {
+    if (image_create_info.format != transfer_format) {
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -1905,7 +2069,6 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   }
   VkImageView view_depth_stencil = VK_NULL_HANDLE;
   VkImageView view_stencil = VK_NULL_HANDLE;
-  VkImageView view_srgb = VK_NULL_HANDLE;
   VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
   if (key.is_depth) {
     view_create_info.subresourceRange.aspectMask =
@@ -1939,22 +2102,6 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
       return nullptr;
     }
   } else {
-    if (is_srgb_view_needed) {
-      view_create_info.format = VK_FORMAT_R8G8B8A8_SRGB;
-      if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
-                                &view_srgb) != VK_SUCCESS) {
-        XELOGE(
-            "VulkanRenderTarget: Failed to create an sRGB view for a {}x{} "
-            "{}xMSAA render target",
-            image_create_info.extent.width, image_create_info.extent.height,
-            uint32_t(1) << uint32_t(key.msaa_samples),
-            xenos::GetColorRenderTargetFormatName(key.GetColorFormat()));
-        dfn.vkDestroyImageView(device, view_depth_color, nullptr);
-        dfn.vkDestroyImage(device, image, nullptr);
-        dfn.vkFreeMemory(device, memory, nullptr);
-        return nullptr;
-      }
-    }
     if (transfer_format != image_create_info.format) {
       view_create_info.format = transfer_format;
       if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
@@ -1964,9 +2111,6 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
             "{}xMSAA {} render target",
             image_create_info.extent.width, image_create_info.extent.height,
             uint32_t(1) << uint32_t(key.msaa_samples), key.GetFormatName());
-        if (view_srgb != VK_NULL_HANDLE) {
-          dfn.vkDestroyImageView(device, view_srgb, nullptr);
-        }
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
         dfn.vkFreeMemory(device, memory, nullptr);
@@ -1986,9 +2130,6 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         key.is_depth ? "depth/stencil" : "color");
     if (view_color_transfer_separate != VK_NULL_HANDLE) {
       dfn.vkDestroyImageView(device, view_color_transfer_separate, nullptr);
-    }
-    if (view_srgb != VK_NULL_HANDLE) {
-      dfn.vkDestroyImageView(device, view_srgb, nullptr);
     }
     dfn.vkDestroyImageView(device, view_depth_color, nullptr);
     dfn.vkDestroyImage(device, image, nullptr);
@@ -2037,19 +2178,21 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
                              0, nullptr);
 
   return new VulkanRenderTarget(key, *this, image, memory, view_depth_color,
-                                view_depth_stencil, view_stencil, view_srgb,
+                                view_depth_stencil, view_stencil,
                                 view_color_transfer_separate,
                                 descriptor_set_index_transfer_source);
 }
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
     xenos::DepthRenderTargetFormat format) const {
-  // TODO(Triang3l): Conversion directly in shaders.
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
       return !depth_unorm24_vulkan_format_supported();
     case xenos::DepthRenderTargetFormat::kD24FS8:
-      return true;
+      // When converting in the pixel shader, the host float32 depth already
+      // holds float24-grid values, so it's the canonical encoding and the
+      // separate host depth tracking isn't needed.
+      return !depth_float24_convert_in_pixel_shader();
   }
   return false;
 }
@@ -2159,6 +2302,28 @@ void VulkanRenderTargetCache::CommitEdramBufferShaderWrites(
   PixelShaderInterlockFullEdramBarrierPlaced();
 }
 
+void VulkanRenderTargetCache::TransitionRenderTarget(
+    VulkanRenderTarget& render_target, VkPipelineStageFlags dst_stage_mask,
+    VkAccessFlags dst_access_mask, VkImageLayout new_layout) {
+  RenderTargetKey key = render_target.key();
+
+  // Use the depth's sample locations for all transitions, including those
+  // between read-only layouts.
+  command_processor_.PushImageMemoryBarrier(
+      render_target.image(),
+      ui::vulkan::util::InitializeSubresourceRange(
+          key.is_depth
+              ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+              : VK_IMAGE_ASPECT_COLOR_BIT),
+      render_target.current_stage_mask(), dst_stage_mask,
+      render_target.current_access_mask(), dst_access_mask,
+      render_target.current_layout(), new_layout, VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED, true,
+      key.is_depth ? GetSampleLocationsInfo(key.msaa_samples, true) : nullptr);
+
+  render_target.SetUsage(dst_stage_mask, dst_access_mask, new_layout);
+}
+
 const VulkanRenderTargetCache::Framebuffer*
 VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
@@ -2229,11 +2394,20 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   framebuffer_create_info.attachmentCount = attachment_count;
   framebuffer_create_info.pAttachments = attachments;
   VkExtent2D host_extent;
+  // The scale class is a function of the pitch and MSAA mode, so a
+  // framebuffer can never mix classes and the key needs no scale bit.
+  uint32_t framebuffer_scale_x = draw_resolution_scale_x();
+  uint32_t framebuffer_scale_y = draw_resolution_scale_y();
   if (pitch_tiles_at_32bpp) {
     host_extent.width = RenderTargetKey::GetWidth(pitch_tiles_at_32bpp,
                                                   render_pass_key.msaa_samples);
     host_extent.height = GetRenderTargetHeight(pitch_tiles_at_32bpp,
                                                render_pass_key.msaa_samples);
+    if (IsScaleNativeForPitch(pitch_tiles_at_32bpp,
+                              render_pass_key.msaa_samples)) {
+      framebuffer_scale_x = 1;
+      framebuffer_scale_y = 1;
+    }
   } else {
     assert_zero(render_pass_key.depth_and_color_used);
     // Still needed for occlusion queries.
@@ -2243,9 +2417,9 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   // Limiting to the device limit for the case of no attachments, for which
   // there's no limit imposed by the sizes of the attachments that have been
   // created successfully.
-  host_extent.width = std::min(host_extent.width * draw_resolution_scale_x(),
+  host_extent.width = std::min(host_extent.width * framebuffer_scale_x,
                                device_properties.maxFramebufferWidth);
-  host_extent.height = std::min(host_extent.height * draw_resolution_scale_y(),
+  host_extent.height = std::min(host_extent.height * framebuffer_scale_y,
                                 device_properties.maxFramebufferHeight);
   framebuffer_create_info.width = host_extent.width;
   framebuffer_create_info.height = host_extent.height;
@@ -2258,8 +2432,236 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   // Creates at a persistent location - safe to use pointers.
   return &framebuffers_
               .emplace(std::piecewise_construct, std::forward_as_tuple(key),
-                       std::forward_as_tuple(framebuffer, host_extent))
+                       std::forward_as_tuple(framebuffer, host_extent,
+                                             render_pass_key))
               .first->second;
+}
+
+// Decodes raw EDRAM gamma bytes to the midpoint of its linear quantization
+// range. The midpoint survives the UNORM16 round trip and re-encodes to the
+// original bytes.
+static spv::Id GammaByteToLinearMidpoint(SpirvBuilder& builder,
+                                         spv::Id byte_uint) {
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_bool = builder.makeBoolType();
+  // F = float(byte) * recip + offset, with the piece selected by the byte.
+  spv::Id recip = builder.makeFloatConstant(1.0f / 1023.0f);
+  spv::Id offset = builder.makeFloatConstant(0.5f / 1023.0f);
+  struct Piece {
+    uint32_t threshold;
+    float recip;
+    float offset;
+  };
+  static const Piece kPieces[] = {
+      {64, 1.0f / 511.5f, -31.5f / 511.5f},
+      {96, 1.0f / 255.75f, -63.5f / 255.75f},
+      {192, 1.0f / 127.875f, -127.5f / 127.875f},
+  };
+  for (const Piece& piece : kPieces) {
+    spv::Id in_piece =
+        builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, byte_uint,
+                            builder.makeUintConstant(piece.threshold));
+    recip = builder.createTriOp(spv::OpSelect, type_float, in_piece,
+                                builder.makeFloatConstant(piece.recip), recip);
+    offset =
+        builder.createTriOp(spv::OpSelect, type_float, in_piece,
+                            builder.makeFloatConstant(piece.offset), offset);
+  }
+  return builder.createBinOp(
+      spv::OpFAdd, type_float,
+      builder.createBinOp(
+          spv::OpFMul, type_float,
+          builder.createUnaryOp(spv::OpConvertUToF, type_float, byte_uint),
+          recip),
+      offset);
+}
+
+struct CanonicalSampleCoords {
+  spv::Id u_guest;
+  spv::Id v_guest;
+  // Host subpixel offsets under resolution scaling, spv::NoResult when the
+  // axis isn't scaled.
+  spv::Id sub_x;
+  spv::Id sub_y;
+};
+
+// Indices of host samples that transfer sample remap helpers use:
+// - First sample bit of 4x - horizontal sample.
+// - Second sample bit of 4x - vertical sample.
+// - 2x:
+//   - Native 2x - top sample is 1 with the standard sample locations, bottom
+//     sample is 0.
+//   - 2x as 4x - top sample is 0, bottom sample is 3.
+
+// Converts the view pixel coordinates and host sample index to canonical
+// guest sample coordinates, with the host subpixel offsets carried along in
+// case of scaling.
+static CanonicalSampleCoords CanonicalizeSample(
+    SpirvBuilder& builder, spv::Id type_uint, xenos::MsaaSamples msaa_samples,
+    bool msaa_2x_attachments_supported, spv::Id pixel_x, spv::Id pixel_y,
+    spv::Id host_sample_id, uint32_t scale_x, uint32_t scale_y) {
+  CanonicalSampleCoords result;
+  result.sub_x = spv::NoResult;
+  result.sub_y = spv::NoResult;
+  spv::Id guest_x = pixel_x;
+  spv::Id guest_y = pixel_y;
+  if (scale_x > 1) {
+    spv::Id const_scale_x = builder.makeUintConstant(scale_x);
+    guest_x =
+        builder.createBinOp(spv::OpUDiv, type_uint, pixel_x, const_scale_x);
+    result.sub_x =
+        builder.createBinOp(spv::OpUMod, type_uint, pixel_x, const_scale_x);
+  }
+  if (scale_y > 1) {
+    spv::Id const_scale_y = builder.makeUintConstant(scale_y);
+    guest_y =
+        builder.createBinOp(spv::OpUDiv, type_uint, pixel_y, const_scale_y);
+    result.sub_y =
+        builder.createBinOp(spv::OpUMod, type_uint, pixel_y, const_scale_y);
+  }
+  spv::Id const_uint_1 = builder.makeUintConstant(1);
+  spv::Id const_uint_2 = builder.makeUintConstant(2);
+  spv::Id const_uint_30 = builder.makeUintConstant(30);
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    // The guest sample index is the host sample index, bit 0 horizontal
+    // and bit 1 vertical for both.
+    // u = ((x >> 1) << 2) | ((sample & 1) << 1) | (x & 1)
+    result.u_guest = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint,
+        builder.createQuadOp(spv::OpBitFieldInsert, type_uint, guest_x,
+                             host_sample_id, const_uint_1, const_uint_1),
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, guest_x,
+                            const_uint_1),
+        const_uint_2, const_uint_30);
+    // v = ((y >> 1) << 2) | ((sample >> 1) << 1) | (y & 1)
+    result.v_guest = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint,
+        builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, guest_y,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                host_sample_id, const_uint_1),
+            const_uint_1, const_uint_1),
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, guest_y,
+                            const_uint_1),
+        const_uint_2, const_uint_30);
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    // Guest sample 0 is the top one. Native 2x has the top at host sample
+    // 1, and 2x emulated as 4x has it at host sample 0.
+    spv::Id guest_sample;
+    if (msaa_2x_attachments_supported) {
+      guest_sample = builder.createBinOp(spv::OpBitwiseXor, type_uint,
+                                         host_sample_id, const_uint_1);
+    } else {
+      guest_sample = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                         host_sample_id, const_uint_1);
+    }
+    // u = (x & ~2) | (sample << 1)
+    result.u_guest =
+        builder.createQuadOp(spv::OpBitFieldInsert, type_uint, guest_x,
+                             guest_sample, const_uint_1, const_uint_1);
+    // v = ((y >> 1) << 2) | (x & 2) | (y & 1)
+    result.v_guest = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint,
+        builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, guest_y,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint, guest_x,
+                                const_uint_1),
+            const_uint_1, const_uint_1),
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, guest_y,
+                            const_uint_1),
+        const_uint_2, const_uint_30);
+  } else {
+    result.u_guest = guest_x;
+    result.v_guest = guest_y;
+  }
+  return result;
+}
+
+// Converts the canonical guest sample coordinates, along with the subpixel
+// offsets in case of scaling, back to view pixels and host sample index.
+// host_sample_id_out remains spv::NoResult for a single sampled view.
+static void DecanonicalizeSample(SpirvBuilder& builder, spv::Id type_uint,
+                                 xenos::MsaaSamples msaa_samples,
+                                 bool msaa_2x_attachments_supported,
+                                 const CanonicalSampleCoords& coords,
+                                 uint32_t scale_x, uint32_t scale_y,
+                                 spv::Id& pixel_x_out, spv::Id& pixel_y_out,
+                                 spv::Id& host_sample_id_out) {
+  spv::Id const_uint_1 = builder.makeUintConstant(1);
+  spv::Id const_uint_2 = builder.makeUintConstant(2);
+  spv::Id const_uint_31 = builder.makeUintConstant(31);
+  spv::Id guest_x, guest_y;
+  host_sample_id_out = spv::NoResult;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    // x = ((u >> 2) << 1) | (u & 1)
+    guest_x = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint, coords.u_guest,
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, coords.u_guest,
+                            const_uint_2),
+        const_uint_1, const_uint_31);
+    // y = ((v >> 2) << 1) | (v & 1)
+    guest_y = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint, coords.v_guest,
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, coords.v_guest,
+                            const_uint_2),
+        const_uint_1, const_uint_31);
+    // The host sample index is the guest sample index.
+    // sample = ((u >> 1) & 1) | (v & 2)
+    host_sample_id_out = builder.createBinOp(
+        spv::OpBitwiseOr, type_uint,
+        builder.createTriOp(spv::OpBitFieldUExtract, type_uint, coords.u_guest,
+                            const_uint_1, const_uint_1),
+        builder.createBinOp(spv::OpBitwiseAnd, type_uint, coords.v_guest,
+                            const_uint_2));
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    // x = (u & ~3) | (v & 2) | (u & 1)
+    guest_x = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint, coords.u_guest,
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, coords.v_guest,
+                            const_uint_1),
+        const_uint_1, const_uint_1);
+    // y = ((v >> 2) << 1) | (v & 1)
+    guest_y = builder.createQuadOp(
+        spv::OpBitFieldInsert, type_uint, coords.v_guest,
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, coords.v_guest,
+                            const_uint_2),
+        const_uint_1, const_uint_31);
+    // Guest sample 0 is the top one.
+    // sample = (u >> 1) & 1
+    spv::Id guest_sample =
+        builder.createTriOp(spv::OpBitFieldUExtract, type_uint, coords.u_guest,
+                            const_uint_1, const_uint_1);
+    if (msaa_2x_attachments_supported) {
+      host_sample_id_out = builder.createBinOp(spv::OpBitwiseXor, type_uint,
+                                               guest_sample, const_uint_1);
+    } else {
+      // The guest sample 1 is the host sample 3 when 2x is emulated as 4x.
+      host_sample_id_out =
+          builder.createQuadOp(spv::OpBitFieldInsert, type_uint, guest_sample,
+                               guest_sample, const_uint_1, const_uint_1);
+    }
+  } else {
+    guest_x = coords.u_guest;
+    guest_y = coords.v_guest;
+  }
+  pixel_x_out = guest_x;
+  if (scale_x > 1) {
+    assert_true(coords.sub_x != spv::NoResult);
+    pixel_x_out = builder.createBinOp(
+        spv::OpIAdd, type_uint,
+        builder.createBinOp(spv::OpIMul, type_uint, guest_x,
+                            builder.makeUintConstant(scale_x)),
+        coords.sub_x);
+  }
+  pixel_y_out = guest_y;
+  if (scale_y > 1) {
+    assert_true(coords.sub_y != spv::NoResult);
+    pixel_y_out = builder.createBinOp(
+        spv::OpIAdd, type_uint,
+        builder.createBinOp(spv::OpIMul, type_uint, guest_y,
+                            builder.makeUintConstant(scale_y)),
+        coords.sub_y);
+  }
 }
 
 VkShaderModule VulkanRenderTargetCache::GetTransferShader(
@@ -2276,7 +2678,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
 
   std::vector<spv::Id> id_vector_temp;
   std::vector<unsigned int> uint_vector_temp;
-  SpirvBuilder builder(spv::Spv_1_5,
+  SpirvBuilder builder(spv::Spv_1_0,
                        (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
                        nullptr);
   spv::Id ext_inst_glsl_std_450 = builder.import("GLSL.std.450");
@@ -2623,10 +3025,23 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   // Working with unsigned numbers for simplicity now, bitcasting to signed will
   // be done at texture fetch.
 
-  uint32_t tile_width_samples =
-      xenos::kEdramTileWidthSamples * draw_resolution_scale_x();
-  uint32_t tile_height_samples =
-      xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+  // The two sides of the transfer may be in different scale classes. The host
+  // depth source always has the destination's scale since native render
+  // targets don't track host depth.
+  uint32_t dest_scale_x = key.dest_scale_native ? 1 : draw_resolution_scale_x();
+  uint32_t dest_scale_y = key.dest_scale_native ? 1 : draw_resolution_scale_y();
+  uint32_t source_scale_x =
+      key.source_scale_native ? 1 : draw_resolution_scale_x();
+  uint32_t source_scale_y =
+      key.source_scale_native ? 1 : draw_resolution_scale_y();
+  uint32_t dest_tile_width_samples =
+      xenos::kEdramTileWidthSamples * dest_scale_x;
+  uint32_t dest_tile_height_samples =
+      xenos::kEdramTileHeightSamples * dest_scale_y;
+  uint32_t source_tile_width_samples =
+      xenos::kEdramTileWidthSamples * source_scale_x;
+  uint32_t source_tile_height_samples =
+      xenos::kEdramTileHeightSamples * source_scale_y;
 
   // Split the destination pixel index into 32bpp tile and 32bpp-tile-relative
   // pixel index.
@@ -2648,7 +3063,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   spv::Id dest_pixel_x =
       builder.createCompositeExtract(dest_pixel_coord, type_uint, 0);
   spv::Id const_dest_tile_width_pixels = builder.makeUintConstant(
-      tile_width_samples >>
+      dest_tile_width_samples >>
       (uint32_t(dest_is_64bpp) +
        uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X)));
   spv::Id dest_tile_index_x = builder.createBinOp(
@@ -2658,7 +3073,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   spv::Id dest_pixel_y =
       builder.createCompositeExtract(dest_pixel_coord, type_uint, 1);
   spv::Id const_dest_tile_height_pixels = builder.makeUintConstant(
-      tile_height_samples >>
+      dest_tile_height_samples >>
       uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X));
   spv::Id dest_tile_index_y = builder.createBinOp(
       spv::OpUDiv, type_uint, dest_pixel_y, const_dest_tile_height_pixels);
@@ -2710,314 +3125,86 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   // - Native 2x: top is 1 in Vulkan, bottom is 0.
   // - 2x as 4x: top is 0, bottom is 3.
 
+  // If the scale classes differ, convert the tile-local pixel coordinates to
+  // the source scale space - the remappings below transform between two
+  // layouts of one scale. The destination-space coordinates are saved for the
+  // host depth source. Sample indices don't change.
+  spv::Id dest_space_tile_pixel_x = dest_tile_pixel_x;
+  spv::Id dest_space_tile_pixel_y = dest_tile_pixel_y;
+  if (key.source_scale_native != key.dest_scale_native) {
+    if (key.dest_scale_native) {
+      // Native destination reading a scaled source - take the center host
+      // pixel of each guest pixel, like memexport and the resolve downscale
+      // do.
+      dest_tile_pixel_x = builder.createBinOp(
+          spv::OpIAdd, type_uint,
+          builder.createBinOp(spv::OpIMul, type_uint, dest_tile_pixel_x,
+                              builder.makeUintConstant(source_scale_x)),
+          builder.makeUintConstant(source_scale_x >> 1));
+      dest_tile_pixel_y = builder.createBinOp(
+          spv::OpIAdd, type_uint,
+          builder.createBinOp(spv::OpIMul, type_uint, dest_tile_pixel_y,
+                              builder.makeUintConstant(source_scale_y)),
+          builder.makeUintConstant(source_scale_y >> 1));
+    } else {
+      // Scaled destination reading a native source - duplicate guest pixels.
+      dest_tile_pixel_x =
+          builder.createBinOp(spv::OpUDiv, type_uint, dest_tile_pixel_x,
+                              builder.makeUintConstant(dest_scale_x));
+      dest_tile_pixel_y =
+          builder.createBinOp(spv::OpUDiv, type_uint, dest_tile_pixel_y,
+                              builder.makeUintConstant(dest_scale_y));
+    }
+  }
+
+  // The transfer remaps the destination sample to the source sample through
+  // the canonical sample coordinates, the layout is described in
+  // XeEdramOffsetBytes in edram.xesli.
   spv::Id source_sample_id = dest_sample_id;
   spv::Id source_tile_pixel_x = dest_tile_pixel_x;
   spv::Id source_tile_pixel_y = dest_tile_pixel_y;
   spv::Id source_color_half = spv::NoResult;
-  if (!source_is_64bpp && dest_is_64bpp) {
-    // 32bpp -> 64bpp, need two samples of the source.
-    if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 32bpp -> 64bpp, 4x ->.
-      // Source has 32bpp halves in two adjacent samples.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 4x -> 4x.
-        // 1 destination horizontal sample = 2 source horizontal samples.
-        // D p0,0 s0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1,0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p0,0 s0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p0,0 s1,1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Thus destination horizontal sample -> source horizontal pixel,
-        // vertical samples are 1:1.
-        source_sample_id =
-            builder.createBinOp(spv::OpBitwiseAnd, type_uint, dest_sample_id,
-                                builder.makeUintConstant(1 << 1));
-        source_tile_pixel_x = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint, dest_sample_id, dest_tile_pixel_x,
-            builder.makeUintConstant(1), builder.makeUintConstant(31));
-      } else if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 32bpp -> 64bpp, 4x -> 2x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 s0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p1,0 s0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p1,0 s1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Pixel index can be reused. Sample 1 (for native 2x) or 0 (for 2x as
-        // 4x) should become samples 01, sample 0 or 3 should become samples 23.
-        if (msaa_2x_attachments_supported_) {
-          source_sample_id = builder.createBinOp(
-              spv::OpShiftLeftLogical, type_uint,
-              builder.createBinOp(spv::OpBitwiseXor, type_uint, dest_sample_id,
-                                  builder.makeUintConstant(1)),
-              builder.makeUintConstant(1));
-        } else {
-          source_sample_id =
-              builder.createBinOp(spv::OpBitwiseAnd, type_uint, dest_sample_id,
-                                  builder.makeUintConstant(1 << 1));
-        }
-      } else {
-        // 32bpp -> 64bpp, 4x -> 1x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // Horizontal pixel index can be reused. Vertical pixel 1 should
-        // become sample 2.
-        source_sample_id = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint, builder.makeUintConstant(0),
-            dest_tile_pixel_y, builder.makeUintConstant(1),
-            builder.makeUintConstant(1));
-        source_tile_pixel_y =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_tile_pixel_y, builder.makeUintConstant(1));
-      }
-    } else {
-      // 32bpp -> 64bpp, 1x/2x ->.
-      // Source has 32bpp halves in two adjacent pixels.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 1x/2x -> 4x.
-        // The X part.
-        // 1 destination horizontal sample = 2 source horizontal pixels.
-        source_tile_pixel_x = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint,
-            builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
-                                dest_tile_pixel_x, builder.makeUintConstant(2)),
-            dest_sample_id, builder.makeUintConstant(1),
-            builder.makeUintConstant(1));
-        // Y is handled by common code.
-      } else {
-        // 32bpp -> 64bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 1 destination horizontal pixel = 2 source horizontal pixels.
-        source_tile_pixel_x =
-            builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
-                                dest_tile_pixel_x, builder.makeUintConstant(1));
-        // Y is handled by common code.
-      }
-    }
-  } else if (source_is_64bpp && !dest_is_64bpp) {
-    // 64bpp -> 32bpp, also the half to load.
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 64bpp -> 32bpp, -> 4x.
-      // The needed half is in the destination horizontal sample index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 4x.
-        // D p0,0 s0,0 = S s0,0 low
-        // D p0,0 s1,0 = S s0,0 high
-        // D p1,0 s0,0 = S s1,0 low
-        // D p1,0 s1,0 = S s1,0 high
-        // Vertical pixel and sample (second bit) addressing is the same.
-        // However, 1 horizontal destination pixel = 1 horizontal source sample.
-        source_sample_id = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint, dest_sample_id, dest_tile_pixel_x,
-            builder.makeUintConstant(0), builder.makeUintConstant(1));
-        // 2 destination horizontal samples = 1 source horizontal sample, thus
-        // 2 destination horizontal pixels = 1 source horizontal pixel.
-        source_tile_pixel_x =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_tile_pixel_x, builder.makeUintConstant(1));
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 4x.
-        // 2 destination horizontal samples = 1 source horizontal pixel, thus
-        // 1 destination horizontal pixel = 1 source horizontal pixel. Can reuse
-        // horizontal pixel index.
-        // Y is handled by common code.
-      }
-      // Half from the destination horizontal sample index.
+  if (key.source_msaa_samples != key.dest_msaa_samples ||
+      source_is_64bpp != dest_is_64bpp) {
+    // Remap the destination view sample to the source view using the canonical
+    // coordinates (both views are in the source scale space here).
+    CanonicalSampleCoords canonical = CanonicalizeSample(
+        builder, type_uint, key.dest_msaa_samples,
+        msaa_2x_attachments_supported_, dest_tile_pixel_x, dest_tile_pixel_y,
+        dest_sample_id, source_scale_x, source_scale_y);
+    if (dest_is_64bpp && !source_is_64bpp) {
+      // The low 32bpp half of the 64bpp destination sample is obtained from
+      // the source pixel at u = 2 * u_64bpp, and the high half comes from the
+      // horizontally adjacent source pixel later.
+      canonical.u_guest =
+          builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
+                              canonical.u_guest, builder.makeUintConstant(1));
+    } else if (!dest_is_64bpp && source_is_64bpp) {
+      // The 32bpp destination sample is one half of the 64bpp source sample
+      // at u = u_32bpp >> 1.
       source_color_half =
-          builder.createBinOp(spv::OpBitwiseAnd, type_uint, dest_sample_id,
+          builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical.u_guest,
                               builder.makeUintConstant(1));
-    } else {
-      // 64bpp -> 32bpp, -> 1x/2x.
-      // The needed half is in the destination horizontal pixel index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 1x/2x.
-        // (Destination horizontal pixel >> 1) & 1 = source horizontal sample
-        // (first bit).
-        source_sample_id = builder.createTriOp(
-            spv::OpBitFieldUExtract, type_uint, dest_tile_pixel_x,
-            builder.makeUintConstant(1), builder.makeUintConstant(1));
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // 64bpp -> 32bpp, 4x -> 2x.
-          // Destination vertical samples (1/0 in the first bit for native 2x or
-          // 0/1 in the second bit for 2x as 4x) = source vertical samples
-          // (second bit).
-          if (msaa_2x_attachments_supported_) {
-            source_sample_id = builder.createQuadOp(
-                spv::OpBitFieldInsert, type_uint, source_sample_id,
-                builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                    dest_sample_id,
-                                    builder.makeUintConstant(1)),
-                builder.makeUintConstant(1), builder.makeUintConstant(1));
-          } else {
-            source_sample_id = builder.createQuadOp(
-                spv::OpBitFieldInsert, type_uint, dest_sample_id,
-                source_sample_id, builder.makeUintConstant(0),
-                builder.makeUintConstant(1));
-          }
-        } else {
-          // 64bpp -> 32bpp, 4x -> 1x.
-          // 1 destination vertical pixel = 1 source vertical sample.
-          source_sample_id = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, source_sample_id,
-              source_tile_pixel_y, builder.makeUintConstant(1),
-              builder.makeUintConstant(1));
-          source_tile_pixel_y = builder.createBinOp(
-              spv::OpShiftRightLogical, type_uint, dest_tile_pixel_y,
-              builder.makeUintConstant(1));
-        }
-        // 2 destination horizontal pixels = 1 source horizontal sample.
-        // 4 destination horizontal pixels = 1 source horizontal pixel.
-        source_tile_pixel_x =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_tile_pixel_x, builder.makeUintConstant(2));
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 2 destination horizontal pixels = 1 destination source pixel.
-        source_tile_pixel_x =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_tile_pixel_x, builder.makeUintConstant(1));
-        // Y is handled by common code.
-      }
-      // Half from the destination horizontal pixel index.
-      source_color_half =
-          builder.createBinOp(spv::OpBitwiseAnd, type_uint, dest_tile_pixel_x,
-                              builder.makeUintConstant(1));
+      canonical.u_guest =
+          builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                              canonical.u_guest, builder.makeUintConstant(1));
     }
-    assert_true(source_color_half != spv::NoResult);
-  } else {
-    // Same bit count.
-    if (key.source_msaa_samples != key.dest_msaa_samples) {
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // Same BPP, 4x -> 1x/2x.
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // Same BPP, 4x -> 2x.
-          // Horizontal pixels to samples. Vertical sample (1/0 in the first bit
-          // for native 2x or 0/1 in the second bit for 2x as 4x) to second
-          // sample bit.
-          if (msaa_2x_attachments_supported_) {
-            source_sample_id = builder.createQuadOp(
-                spv::OpBitFieldInsert, type_uint, dest_tile_pixel_x,
-                builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                    dest_sample_id,
-                                    builder.makeUintConstant(1)),
-                builder.makeUintConstant(1), builder.makeUintConstant(31));
-          } else {
-            source_sample_id = builder.createQuadOp(
-                spv::OpBitFieldInsert, type_uint, dest_sample_id,
-                dest_tile_pixel_x, builder.makeUintConstant(0),
-                builder.makeUintConstant(1));
-          }
-          source_tile_pixel_x = builder.createBinOp(
-              spv::OpShiftRightLogical, type_uint, dest_tile_pixel_x,
-              builder.makeUintConstant(1));
-        } else {
-          // Same BPP, 4x -> 1x.
-          // Pixels to samples.
-          source_sample_id = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint,
-              builder.createBinOp(spv::OpBitwiseAnd, type_uint,
-                                  dest_tile_pixel_x,
-                                  builder.makeUintConstant(1)),
-              dest_tile_pixel_y, builder.makeUintConstant(1),
-              builder.makeUintConstant(1));
-          source_tile_pixel_x = builder.createBinOp(
-              spv::OpShiftRightLogical, type_uint, dest_tile_pixel_x,
-              builder.makeUintConstant(1));
-          source_tile_pixel_y = builder.createBinOp(
-              spv::OpShiftRightLogical, type_uint, dest_tile_pixel_y,
-              builder.makeUintConstant(1));
-        }
-      } else {
-        // Same BPP, 1x/2x -> 1x/2x/4x (as long as they're different).
-        // Only the X part - Y is handled by common code.
-        if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-          // Horizontal samples to pixels.
-          source_tile_pixel_x = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, dest_sample_id,
-              dest_tile_pixel_x, builder.makeUintConstant(1),
-              builder.makeUintConstant(31));
-        }
-      }
+    spv::Id source_host_sample_id;
+    DecanonicalizeSample(builder, type_uint, key.source_msaa_samples,
+                         msaa_2x_attachments_supported_, canonical,
+                         source_scale_x, source_scale_y, source_tile_pixel_x,
+                         source_tile_pixel_y, source_host_sample_id);
+    if (source_host_sample_id != spv::NoResult) {
+      source_sample_id = source_host_sample_id;
     }
   }
-  // Common source Y and sample index for 1x/2x AA sources, independent of bits
-  // per sample.
-  if (key.source_msaa_samples < xenos::MsaaSamples::k4X &&
-      key.source_msaa_samples != key.dest_msaa_samples) {
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 1x/2x -> 4x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 4x.
-        // Vertical samples (second bit) of 4x destination to vertical sample
-        // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 2x source.
-        source_sample_id =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_sample_id, builder.makeUintConstant(1));
-        if (msaa_2x_attachments_supported_) {
-          source_sample_id = builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                                 source_sample_id,
-                                                 builder.makeUintConstant(1));
-        } else {
-          source_sample_id = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, source_sample_id,
-              source_sample_id, builder.makeUintConstant(1),
-              builder.makeUintConstant(1));
-        }
-      } else {
-        // 1x -> 4x.
-        // Vertical samples (second bit) to Y pixels.
-        source_tile_pixel_y = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint,
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_sample_id, builder.makeUintConstant(1)),
-            dest_tile_pixel_y, builder.makeUintConstant(1),
-            builder.makeUintConstant(31));
-      }
-    } else {
-      // 1x/2x -> different 1x/2x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 1x.
-        // Vertical pixels of 2x destination to vertical samples (1, 0 for
-        // native 2x, or 0, 3 for 2x as 4x) of 1x source.
-        source_sample_id =
-            builder.createBinOp(spv::OpBitwiseAnd, type_uint, dest_tile_pixel_y,
-                                builder.makeUintConstant(1));
-        if (msaa_2x_attachments_supported_) {
-          source_sample_id = builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                                 source_sample_id,
-                                                 builder.makeUintConstant(1));
-        } else {
-          source_sample_id = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, source_sample_id,
-              source_sample_id, builder.makeUintConstant(1),
-              builder.makeUintConstant(1));
-        }
-        source_tile_pixel_y =
-            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                dest_tile_pixel_y, builder.makeUintConstant(1));
-      } else {
-        // 1x -> 2x.
-        // Vertical samples (1/0 in the first bit for native 2x or 0/1 in the
-        // second bit for 2x as 4x) of 2x destination to vertical pixels of 1x
-        // source.
-        if (msaa_2x_attachments_supported_) {
-          source_tile_pixel_y = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint,
-              builder.createBinOp(spv::OpBitwiseXor, type_uint, dest_sample_id,
-                                  builder.makeUintConstant(1)),
-              dest_tile_pixel_y, builder.makeUintConstant(1),
-              builder.makeUintConstant(31));
-        } else {
-          source_tile_pixel_y = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint,
-              builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                  dest_sample_id, builder.makeUintConstant(1)),
-              dest_tile_pixel_y, builder.makeUintConstant(1),
-              builder.makeUintConstant(31));
-        }
-      }
-    }
-  }
+  assert_true((source_color_half != spv::NoResult) ==
+              (source_is_64bpp && !dest_is_64bpp));
+
+  // Source coordinates are done. The host depth path below needs the
+  // destination space coordinates back.
+  dest_tile_pixel_x = dest_space_tile_pixel_x;
+  dest_tile_pixel_y = dest_space_tile_pixel_y;
 
   uint32_t source_pixel_width_dwords_log2 =
       uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k4X) +
@@ -3027,7 +3214,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
     // Copying between color and depth / stencil - swap 40-32bpp-sample columns
     // in the pixel index within the source 32bpp tile.
     uint32_t source_32bpp_tile_half_pixels =
-        tile_width_samples >> (1 + source_pixel_width_dwords_log2);
+        source_tile_width_samples >> (1 + source_pixel_width_dwords_log2);
     source_tile_pixel_x = builder.createUnaryOp(
         spv::OpBitcast, type_uint,
         builder.createBinOp(
@@ -3045,24 +3232,28 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                     -int32_t(source_32bpp_tile_half_pixels)))));
   }
 
-  // Transform the destination 32bpp tile index into the source. After the
-  // addition, it may be negative - in which case, the transfer is done across
-  // EDRAM addressing wrapping, and xenos::kEdramTileCount must be added to it,
-  // but `& (xenos::kEdramTileCount - 1)` handles that regardless of the sign.
+  // Transform the destination 32bpp tile index into the source, wrapped, the
+  // base difference is stored wrapped too. Sources in the next period hold
+  // their tiles a period of rows down.
   spv::Id source_tile_index = builder.createBinOp(
-      spv::OpBitwiseAnd, type_uint,
-      builder.createUnaryOp(
-          spv::OpBitcast, type_uint,
+      spv::OpIAdd, type_uint,
+      builder.createBinOp(
+          spv::OpBitwiseAnd, type_uint,
           builder.createBinOp(
-              spv::OpIAdd, type_int,
-              builder.createUnaryOp(spv::OpBitcast, type_int, dest_tile_index),
+              spv::OpIAdd, type_uint, dest_tile_index,
               builder.createTriOp(
-                  spv::OpBitFieldSExtract, type_int,
-                  builder.createUnaryOp(spv::OpBitcast, type_int,
-                                        address_constant),
+                  spv::OpBitFieldUExtract, type_uint, address_constant,
                   builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
-                  builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
-      builder.makeUintConstant(xenos::kEdramTileCount - 1));
+                  builder.makeUintConstant(xenos::kEdramBaseTilesBits))),
+          builder.makeUintConstant(xenos::kEdramTileCount - 1)),
+      builder.createBinOp(
+          spv::OpIMul, type_uint,
+          builder.createTriOp(
+              spv::OpBitFieldUExtract, type_uint, address_constant,
+              builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2 +
+                                       xenos::kEdramBaseTilesBits),
+              builder.makeUintConstant(1)),
+          builder.makeUintConstant(xenos::kEdramTileCount)));
   // Split the source 32bpp tile index into X and Y tile index within the source
   // image.
   spv::Id source_pitch_tiles = builder.createTriOp(
@@ -3080,7 +3271,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           spv::OpIAdd, type_uint,
           builder.createBinOp(
               spv::OpIMul, type_uint,
-              builder.makeUintConstant(tile_width_samples >>
+              builder.makeUintConstant(source_tile_width_samples >>
                                        source_pixel_width_dwords_log2),
               source_tile_index_x),
           source_tile_pixel_x));
@@ -3091,7 +3282,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           builder.createBinOp(
               spv::OpIMul, type_uint,
               builder.makeUintConstant(
-                  tile_height_samples >>
+                  source_tile_height_samples >>
                   uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
               source_tile_index_y),
           source_tile_pixel_y));
@@ -3112,24 +3303,20 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   } else {
     source_texture_parameters.lod = builder.makeIntConstant(0);
   }
-  // Go to the next sample or pixel along X if need to load two dwords.
-  bool source_load_is_two_32bpp_samples = !source_is_64bpp && dest_is_64bpp;
-  if (source_load_is_two_32bpp_samples) {
-    if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-      source_coordinates[1] = source_coordinates[0];
-      source_sample_ids_int[1] = builder.createBinOp(
-          spv::OpBitwiseOr, type_int, source_sample_ids_int[0],
-          builder.makeIntConstant(1));
-    } else {
-      id_vector_temp.clear();
-      id_vector_temp.push_back(builder.createBinOp(spv::OpBitwiseOr, type_int,
-                                                   source_pixel_x_int,
-                                                   builder.makeIntConstant(1)));
-      id_vector_temp.push_back(source_pixel_y_int);
-      source_coordinates[1] =
-          builder.createCompositeConstruct(type_int2, id_vector_temp);
-      source_sample_ids_int[1] = source_sample_ids_int[0];
-    }
+  // The high 32bpp half of a 64bpp destination sample is identical to the
+  // sample of the horizontally adjacent source pixel since each canonical
+  // sample column of a single 64bpp value decodes to the same sample of two
+  // horizontally adjacent pixels, regardless of sample count.
+  bool source_load_is_two_32bpp_halves = !source_is_64bpp && dest_is_64bpp;
+  if (source_load_is_two_32bpp_halves) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(
+        builder.createBinOp(spv::OpIAdd, type_int, source_pixel_x_int,
+                            builder.makeIntConstant(int32_t(source_scale_x))));
+    id_vector_temp.push_back(source_pixel_y_int);
+    source_coordinates[1] =
+        builder.createCompositeConstruct(type_int2, id_vector_temp);
+    source_sample_ids_int[1] = source_sample_ids_int[0];
   }
   spv::Id source_color[2][4] = {};
   if (source_color_texture != spv::NoResult) {
@@ -3138,7 +3325,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
     assert_true(source_color_component_type != spv::NoType);
     spv::Id source_color_vec4_type =
         builder.makeVectorType(source_color_component_type, 4);
-    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_samples); ++i) {
+    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_halves); ++i) {
       source_texture_parameters.coords = source_coordinates[i];
       source_texture_parameters.sample = source_sample_ids_int[i];
       spv::Id source_color_vec4 = builder.createTextureCall(
@@ -3162,7 +3349,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   if (source_depth_texture != spv::NoResult) {
     source_texture_parameters.sampler =
         builder.createLoad(source_depth_texture, spv::NoPrecision);
-    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_samples); ++i) {
+    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_halves); ++i) {
       source_texture_parameters.coords = source_coordinates[i];
       source_texture_parameters.sample = source_sample_ids_int[i];
       source_depth_float[i] = builder.createCompositeExtract(
@@ -3176,7 +3363,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   if (source_stencil_texture != spv::NoResult) {
     source_texture_parameters.sampler =
         builder.createLoad(source_stencil_texture, spv::NoPrecision);
-    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_samples); ++i) {
+    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_halves); ++i) {
       source_texture_parameters.coords = source_coordinates[i];
       source_texture_parameters.sample = source_sample_ids_int[i];
       source_stencil[i] = builder.createCompositeExtract(
@@ -3232,6 +3419,20 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
       switch (source_color_format) {
         case xenos::ColorRenderTargetFormat::k_8_8_8_8:
         case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+          if (source_color_format ==
+              xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+            // Gamma sources store linear RGB.
+            // Encode loaded components before packing.
+            for (uint32_t i = 0; i < 2; ++i) {
+              for (uint32_t j = 0; j < 3; ++j) {
+                if (source_color[i][j] == spv::NoResult) {
+                  continue;
+                }
+                source_color[i][j] = SpirvShaderTranslator::LinearToPWLGamma(
+                    &builder, source_color[i][j], true, ext_inst_glsl_std_450);
+              }
+            }
+          }
           spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
           spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
           spv::Id component_width = builder.makeUintConstant(8);
@@ -3432,8 +3633,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                builder, source_depth_float[i], depth_float24_round(), true,
-                ext_inst_glsl_std_450);
+                builder, source_depth_float[i],
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true, ext_inst_glsl_std_450);
           } break;
         }
         // Merge depth and stencil.
@@ -3500,15 +3703,39 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
               (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                dest_color_format ==
                    xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
-            // Same format - passthrough.
+            // Same layout, but converts RGB when exactly one side is gamma.
+            // Alpha is unchanged.
             id_vector_temp.clear();
             for (uint32_t i = 0; i < 4; ++i) {
-              id_vector_temp.push_back(source_color[0][i]);
+              spv::Id component = source_color[0][i];
+              if (i < 3 && dest_color_format != source_color_format) {
+                if (dest_color_format ==
+                    xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                  component = SpirvShaderTranslator::LinearToPWLGamma(
+                      &builder, component, true, ext_inst_glsl_std_450);
+                } else {
+                  component = SpirvShaderTranslator::PWLGammaToLinear(
+                      &builder, component, true, ext_inst_glsl_std_450);
+                }
+              }
+              id_vector_temp.push_back(component);
             }
             builder.createStore(builder.createCompositeConstruct(
                                     type_fragment_data, id_vector_temp),
                                 output_fragment_data);
           } else {
+            if (source_color_format ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              // Gamma sources store linear RGB.
+              // Encode loaded components before packing the raw value.
+              for (uint32_t j = 0; j < 3; ++j) {
+                if (source_color[0][j] == spv::NoResult) {
+                  continue;
+                }
+                source_color[0][j] = SpirvShaderTranslator::LinearToPWLGamma(
+                    &builder, source_color[0][j], true, ext_inst_glsl_std_450);
+              }
+            }
             spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
             spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
             uint32_t packed_component_offset = 0;
@@ -3714,8 +3941,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             packed = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                builder, source_depth_float[0], depth_float24_round(), true,
-                ext_inst_glsl_std_450);
+                builder, source_depth_float[0],
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true, ext_inst_glsl_std_450);
           } break;
         }
         if (mode.output == TransferOutput::kDepth) {
@@ -3740,18 +3969,27 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8:
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+              // Gamma destinations store linear RGB.
+              // Decode raw bytes before writing the image. Alpha stays linear.
+              bool is_gamma = dest_color_format ==
+                              xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
               spv::Id component_width = builder.makeUintConstant(8);
               spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
               id_vector_temp.clear();
               for (uint32_t i = 0; i < 4; ++i) {
-                id_vector_temp.push_back(builder.createBinOp(
-                    spv::OpFMul, type_float,
-                    builder.createUnaryOp(
-                        spv::OpConvertUToF, type_float,
-                        builder.createTriOp(
-                            spv::OpBitFieldUExtract, type_uint, packed,
-                            builder.makeUintConstant(8 * i), component_width)),
-                    unorm_scale));
+                spv::Id byte_uint = builder.createTriOp(
+                    spv::OpBitFieldUExtract, type_uint, packed,
+                    builder.makeUintConstant(8 * i), component_width);
+                if (is_gamma && i < 3) {
+                  id_vector_temp.push_back(
+                      GammaByteToLinearMidpoint(builder, byte_uint));
+                } else {
+                  id_vector_temp.push_back(builder.createBinOp(
+                      spv::OpFMul, type_float,
+                      builder.createUnaryOp(spv::OpConvertUToF, type_float,
+                                            byte_uint),
+                      unorm_scale));
+                }
               }
               builder.createStore(builder.createCompositeConstruct(
                                       type_fragment_data, id_vector_temp),
@@ -3860,153 +4098,27 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           spv::Id host_depth32 = spv::NoResult;
           if (host_depth_source_texture != spv::NoResult) {
             // Convert position and sample index from within the destination
-            // tile to within the host depth source tile, like for the guest
-            // render target, but for 32bpp -> 32bpp only.
+            // tile to within the host depth source tile by remapping through
+            // the canonical coordinates. Both views are 32bpp and use the
+            // destination scale.
             spv::Id host_depth_source_sample_id = dest_sample_id;
             spv::Id host_depth_source_tile_pixel_x = dest_tile_pixel_x;
             spv::Id host_depth_source_tile_pixel_y = dest_tile_pixel_y;
             if (key.host_depth_source_msaa_samples != key.dest_msaa_samples) {
-              if (key.host_depth_source_msaa_samples >=
-                  xenos::MsaaSamples::k4X) {
-                // 4x -> 1x/2x.
-                if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-                  // 4x -> 2x.
-                  // Horizontal pixels to samples. Vertical sample (1/0 in the
-                  // first bit for native 2x or 0/1 in the second bit for 2x as
-                  // 4x) to second sample bit.
-                  if (msaa_2x_attachments_supported_) {
-                    host_depth_source_sample_id = builder.createQuadOp(
-                        spv::OpBitFieldInsert, type_uint, dest_tile_pixel_x,
-                        builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                            dest_sample_id,
-                                            builder.makeUintConstant(1)),
-                        builder.makeUintConstant(1),
-                        builder.makeUintConstant(31));
-                  } else {
-                    host_depth_source_sample_id = builder.createQuadOp(
-                        spv::OpBitFieldInsert, type_uint, dest_sample_id,
-                        dest_tile_pixel_x, builder.makeUintConstant(0),
-                        builder.makeUintConstant(1));
-                  }
-                  host_depth_source_tile_pixel_x = builder.createBinOp(
-                      spv::OpShiftRightLogical, type_uint, dest_tile_pixel_x,
-                      builder.makeUintConstant(1));
-                } else {
-                  // 4x -> 1x.
-                  // Pixels to samples.
-                  host_depth_source_sample_id = builder.createQuadOp(
-                      spv::OpBitFieldInsert, type_uint,
-                      builder.createBinOp(spv::OpBitwiseAnd, type_uint,
-                                          dest_tile_pixel_x,
-                                          builder.makeUintConstant(1)),
-                      dest_tile_pixel_y, builder.makeUintConstant(1),
-                      builder.makeUintConstant(1));
-                  host_depth_source_tile_pixel_x = builder.createBinOp(
-                      spv::OpShiftRightLogical, type_uint, dest_tile_pixel_x,
-                      builder.makeUintConstant(1));
-                  host_depth_source_tile_pixel_y = builder.createBinOp(
-                      spv::OpShiftRightLogical, type_uint, dest_tile_pixel_y,
-                      builder.makeUintConstant(1));
-                }
-              } else {
-                // 1x/2x -> 1x/2x/4x (as long as they're different).
-                // Only the X part - Y is handled by common code.
-                if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // Horizontal samples to pixels.
-                  host_depth_source_tile_pixel_x = builder.createQuadOp(
-                      spv::OpBitFieldInsert, type_uint, dest_sample_id,
-                      dest_tile_pixel_x, builder.makeUintConstant(1),
-                      builder.makeUintConstant(31));
-                }
-              }
-              // Host depth source Y and sample index for 1x/2x AA sources.
-              if (key.host_depth_source_msaa_samples <
-                  xenos::MsaaSamples::k4X) {
-                if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // 1x/2x -> 4x.
-                  if (key.host_depth_source_msaa_samples ==
-                      xenos::MsaaSamples::k2X) {
-                    // 2x -> 4x.
-                    // Vertical samples (second bit) of 4x destination to
-                    // vertical sample (1, 0 for native 2x, or 0, 3 for 2x as
-                    // 4x) of 2x source.
-                    host_depth_source_sample_id = builder.createBinOp(
-                        spv::OpShiftRightLogical, type_uint, dest_sample_id,
-                        builder.makeUintConstant(1));
-                    if (msaa_2x_attachments_supported_) {
-                      host_depth_source_sample_id =
-                          builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                              host_depth_source_sample_id,
-                                              builder.makeUintConstant(1));
-                    } else {
-                      host_depth_source_sample_id =
-                          builder.createQuadOp(spv::OpBitFieldInsert, type_uint,
-                                               host_depth_source_sample_id,
-                                               host_depth_source_sample_id,
-                                               builder.makeUintConstant(1),
-                                               builder.makeUintConstant(1));
-                    }
-                  } else {
-                    // 1x -> 4x.
-                    // Vertical samples (second bit) to Y pixels.
-                    host_depth_source_tile_pixel_y = builder.createQuadOp(
-                        spv::OpBitFieldInsert, type_uint,
-                        builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                            dest_sample_id,
-                                            builder.makeUintConstant(1)),
-                        dest_tile_pixel_y, builder.makeUintConstant(1),
-                        builder.makeUintConstant(31));
-                  }
-                } else {
-                  // 1x/2x -> different 1x/2x.
-                  if (key.host_depth_source_msaa_samples ==
-                      xenos::MsaaSamples::k2X) {
-                    // 2x -> 1x.
-                    // Vertical pixels of 2x destination to vertical samples (1,
-                    // 0 for native 2x, or 0, 3 for 2x as 4x) of 1x source.
-                    host_depth_source_sample_id = builder.createBinOp(
-                        spv::OpBitwiseAnd, type_uint, dest_tile_pixel_y,
-                        builder.makeUintConstant(1));
-                    if (msaa_2x_attachments_supported_) {
-                      host_depth_source_sample_id =
-                          builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                              host_depth_source_sample_id,
-                                              builder.makeUintConstant(1));
-                    } else {
-                      host_depth_source_sample_id =
-                          builder.createQuadOp(spv::OpBitFieldInsert, type_uint,
-                                               host_depth_source_sample_id,
-                                               host_depth_source_sample_id,
-                                               builder.makeUintConstant(1),
-                                               builder.makeUintConstant(1));
-                    }
-                    host_depth_source_tile_pixel_y = builder.createBinOp(
-                        spv::OpShiftRightLogical, type_uint, dest_tile_pixel_y,
-                        builder.makeUintConstant(1));
-                  } else {
-                    // 1x -> 2x.
-                    // Vertical samples (1/0 in the first bit for native 2x or
-                    // 0/1 in the second bit for 2x as 4x) of 2x destination to
-                    // vertical pixels of 1x source.
-                    if (msaa_2x_attachments_supported_) {
-                      host_depth_source_tile_pixel_y = builder.createQuadOp(
-                          spv::OpBitFieldInsert, type_uint,
-                          builder.createBinOp(spv::OpBitwiseXor, type_uint,
-                                              dest_sample_id,
-                                              builder.makeUintConstant(1)),
-                          dest_tile_pixel_y, builder.makeUintConstant(1),
-                          builder.makeUintConstant(31));
-                    } else {
-                      host_depth_source_tile_pixel_y = builder.createQuadOp(
-                          spv::OpBitFieldInsert, type_uint,
-                          builder.createBinOp(spv::OpShiftRightLogical,
-                                              type_uint, dest_sample_id,
-                                              builder.makeUintConstant(1)),
-                          dest_tile_pixel_y, builder.makeUintConstant(1),
-                          builder.makeUintConstant(31));
-                    }
-                  }
-                }
+              CanonicalSampleCoords host_depth_canonical = CanonicalizeSample(
+                  builder, type_uint, key.dest_msaa_samples,
+                  msaa_2x_attachments_supported_, dest_tile_pixel_x,
+                  dest_tile_pixel_y, dest_sample_id, dest_scale_x,
+                  dest_scale_y);
+              spv::Id host_depth_remapped_sample_id;
+              DecanonicalizeSample(
+                  builder, type_uint, key.host_depth_source_msaa_samples,
+                  msaa_2x_attachments_supported_, host_depth_canonical,
+                  dest_scale_x, dest_scale_y, host_depth_source_tile_pixel_x,
+                  host_depth_source_tile_pixel_y,
+                  host_depth_remapped_sample_id);
+              if (host_depth_remapped_sample_id != spv::NoResult) {
+                host_depth_source_sample_id = host_depth_remapped_sample_id;
               }
             }
             assert_true(push_constants_member_host_depth_address != UINT32_MAX);
@@ -4017,28 +4129,18 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                 builder.createAccessChain(spv::StorageClassPushConstant,
                                           push_constants, id_vector_temp),
                 spv::NoPrecision);
-            // Transform the destination tile index into the host depth source.
-            // After the addition, it may be negative - in which case, the
-            // transfer is done across EDRAM addressing wrapping, and
-            // xenos::kEdramTileCount must be added to it, but
-            // `& (xenos::kEdramTileCount - 1)` handles that regardless of the
-            // sign.
+            // Transform the destination tile index into the host depth source,
+            // wrapped.
             spv::Id host_depth_source_tile_index = builder.createBinOp(
                 spv::OpBitwiseAnd, type_uint,
-                builder.createUnaryOp(
-                    spv::OpBitcast, type_uint,
-                    builder.createBinOp(
-                        spv::OpIAdd, type_int,
-                        builder.createUnaryOp(spv::OpBitcast, type_int,
-                                              dest_tile_index),
-                        builder.createTriOp(
-                            spv::OpBitFieldSExtract, type_int,
-                            builder.createUnaryOp(spv::OpBitcast, type_int,
-                                                  host_depth_address_constant),
-                            builder.makeUintConstant(
-                                xenos::kEdramPitchTilesBits * 2),
-                            builder.makeUintConstant(
-                                xenos::kEdramBaseTilesBits + 1)))),
+                builder.createBinOp(
+                    spv::OpIAdd, type_uint, dest_tile_index,
+                    builder.createTriOp(
+                        spv::OpBitFieldUExtract, type_uint,
+                        host_depth_address_constant,
+                        builder.makeUintConstant(xenos::kEdramPitchTilesBits *
+                                                 2),
+                        builder.makeUintConstant(xenos::kEdramBaseTilesBits))),
                 builder.makeUintConstant(xenos::kEdramTileCount - 1));
             // Split the host depth source tile index into X and Y tile index
             // within the source image.
@@ -4059,7 +4161,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
                                         builder.makeUintConstant(
-                                            tile_width_samples >>
+                                            dest_tile_width_samples >>
                                             uint32_t(key.source_msaa_samples >=
                                                      xenos::MsaaSamples::k4X)),
                                         host_depth_source_tile_index_x),
@@ -4070,7 +4172,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
                                         builder.makeUintConstant(
-                                            tile_height_samples >>
+                                            dest_tile_height_samples >>
                                             uint32_t(key.source_msaa_samples >=
                                                      xenos::MsaaSamples::k2X)),
                                         host_depth_source_tile_index_y),
@@ -4138,14 +4240,14 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                 spv::OpIAdd, type_uint,
                 builder.createBinOp(
                     spv::OpIMul, type_uint,
-                    builder.makeUintConstant(tile_width_samples *
-                                             tile_height_samples),
+                    builder.makeUintConstant(dest_tile_width_samples *
+                                             dest_tile_height_samples),
                     dest_tile_index),
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(
                         spv::OpIMul, type_uint,
-                        builder.makeUintConstant(tile_width_samples),
+                        builder.makeUintConstant(dest_tile_width_samples),
                         dest_tile_sample_y),
                     dest_tile_sample_x));
             id_vector_temp.clear();
@@ -4185,8 +4287,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
               } break;
               case xenos::DepthRenderTargetFormat::kD24FS8: {
                 host_depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                    builder, host_depth32, depth_float24_round(), true,
-                    ext_inst_glsl_std_450);
+                    builder, host_depth32,
+                    !depth_float24_convert_in_pixel_shader() &&
+                        depth_float24_round(),
+                    true, ext_inst_glsl_std_450);
               } break;
             }
             assert_true(host_depth24 != spv::NoResult);
@@ -4464,6 +4568,18 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
       multisample_state.pSampleMask = &sample_mask;
     }
   }
+  // The destination's sample locations.
+  VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_state;
+  const VkSampleLocationsInfoEXT* sample_locations_info =
+      GetSampleLocationsInfo(key.shader_key.dest_msaa_samples, true);
+  if (sample_locations_info) {
+    sample_locations_state.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT;
+    sample_locations_state.pNext = nullptr;
+    sample_locations_state.sampleLocationsEnable = VK_TRUE;
+    sample_locations_state.sampleLocationsInfo = *sample_locations_info;
+    multisample_state.pNext = &sample_locations_state;
+  }
 
   // Whether the depth / stencil state is used depends on the presence of a
   // depth attachment in the render pass - but not making assumptions about
@@ -4614,16 +4730,27 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
+    // All render targets of one resolve clear share the pitch and thus the
+    // scale class - take the scale from whichever is there.
+    uint32_t resolve_clear_scale_x = draw_resolution_scale_x();
+    uint32_t resolve_clear_scale_y = draw_resolution_scale_y();
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        resolve_clear_scale_x = GetKeyScaleX(render_targets[i]->key());
+        resolve_clear_scale_y = GetKeyScaleY(render_targets[i]->key());
+        break;
+      }
+    }
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
     resolve_clear_rect.rect.offset.x =
-        int32_t(resolve_clear_rectangle->x_pixels * draw_resolution_scale_x());
+        int32_t(resolve_clear_rectangle->x_pixels * resolve_clear_scale_x);
     resolve_clear_rect.rect.offset.y =
-        int32_t(resolve_clear_rectangle->y_pixels * draw_resolution_scale_y());
+        int32_t(resolve_clear_rectangle->y_pixels * resolve_clear_scale_y);
     resolve_clear_rect.rect.extent.width =
-        resolve_clear_rectangle->width_pixels * draw_resolution_scale_x();
+        resolve_clear_rectangle->width_pixels * resolve_clear_scale_x;
     resolve_clear_rect.rect.extent.height =
-        resolve_clear_rectangle->height_pixels * draw_resolution_scale_y();
+        resolve_clear_rectangle->height_pixels * resolve_clear_scale_y;
     resolve_clear_rect.baseArrayLayer = 0;
     resolve_clear_rect.layerCount = 1;
   }
@@ -4646,6 +4773,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
+      assert_false(dest_rt_key.scale_native);
       if (!host_depth_store_set_up) {
         // Pipeline.
         command_processor_.BindExternalComputePipeline(
@@ -4678,26 +4806,16 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         UseEdramBuffer(EdramBufferUsage::kComputeWrite);
         // Always transitioning both depth and stencil, not storing separate
         // usage flags for depth and stencil.
-        command_processor_.PushImageMemoryBarrier(
-            dest_vulkan_rt.image(),
-            ui::vulkan::util::InitializeSubresourceRange(
-                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT),
-            dest_vulkan_rt.current_stage_mask(),
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            dest_vulkan_rt.current_access_mask(), VK_ACCESS_SHADER_READ_BIT,
-            dest_vulkan_rt.current_layout(),
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        dest_vulkan_rt.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_ACCESS_SHADER_READ_BIT,
-                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        TransitionRenderTarget(dest_vulkan_rt,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_SHADER_READ_BIT,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         host_depth_store_set_up = true;
       }
       Transfer::Rectangle
           transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
       uint32_t transfer_rectangle_count = transfer.GetRectangles(
-          dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp,
-          dest_rt_key.msaa_samples, false, transfer_rectangles,
-          resolve_clear_rectangle);
+          dest_rt_key, transfer_rectangles, resolve_clear_rectangle);
       assert_not_zero(transfer_rectangle_count);
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
@@ -4759,17 +4877,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       VkImageLayout dest_new_layout;
       dest_vulkan_rt.GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask,
                                   &dest_new_layout);
-      command_processor_.PushImageMemoryBarrier(
-          dest_vulkan_rt.image(),
-          ui::vulkan::util::InitializeSubresourceRange(
-              dest_vulkan_rt.key().is_depth
-                  ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                  : VK_IMAGE_ASPECT_COLOR_BIT),
-          dest_vulkan_rt.current_stage_mask(), dest_dst_stage_mask,
-          dest_vulkan_rt.current_access_mask(), dest_dst_access_mask,
-          dest_vulkan_rt.current_layout(), dest_new_layout);
-      dest_vulkan_rt.SetUsage(dest_dst_stage_mask, dest_dst_access_mask,
-                              dest_new_layout);
+      TransitionRenderTarget(dest_vulkan_rt, dest_dst_stage_mask,
+                             dest_dst_access_mask, dest_new_layout);
     }
     // Transition the sources, only if not going to be used as destinations
     // earlier.
@@ -4791,17 +4900,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       if (!source_previously_used_as_dest) {
         auto& source_vulkan_rt =
             *static_cast<VulkanRenderTarget*>(transfer.source);
-        command_processor_.PushImageMemoryBarrier(
-            source_vulkan_rt.image(),
-            ui::vulkan::util::InitializeSubresourceRange(
-                source_vulkan_rt.key().is_depth
-                    ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                    : VK_IMAGE_ASPECT_COLOR_BIT),
-            source_vulkan_rt.current_stage_mask(), kSourceStageMask,
-            source_vulkan_rt.current_access_mask(), kSourceAccessMask,
-            source_vulkan_rt.current_layout(), kSourceLayout);
-        source_vulkan_rt.SetUsage(kSourceStageMask, kSourceAccessMask,
-                                  kSourceLayout);
+        TransitionRenderTarget(source_vulkan_rt, kSourceStageMask,
+                               kSourceAccessMask, kSourceLayout);
       }
       // transfer.host_depth_source == dest_rt means the EDRAM buffer will be
       // used instead, no need to transition.
@@ -4809,16 +4909,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           !host_depth_source_previously_used_as_dest) {
         auto& host_depth_source_vulkan_rt =
             *static_cast<VulkanRenderTarget*>(transfer.host_depth_source);
-        command_processor_.PushImageMemoryBarrier(
-            host_depth_source_vulkan_rt.image(),
-            ui::vulkan::util::InitializeSubresourceRange(
-                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT),
-            host_depth_source_vulkan_rt.current_stage_mask(), kSourceStageMask,
-            host_depth_source_vulkan_rt.current_access_mask(),
-            kSourceAccessMask, host_depth_source_vulkan_rt.current_layout(),
-            kSourceLayout);
-        host_depth_source_vulkan_rt.SetUsage(kSourceStageMask,
-                                             kSourceAccessMask, kSourceLayout);
+        TransitionRenderTarget(host_depth_source_vulkan_rt, kSourceStageMask,
+                               kSourceAccessMask, kSourceLayout);
       }
     }
   }
@@ -4862,17 +4954,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       VkImageLayout dest_new_layout;
       dest_vulkan_rt.GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask,
                                   &dest_new_layout);
-      command_processor_.PushImageMemoryBarrier(
-          dest_vulkan_rt.image(),
-          ui::vulkan::util::InitializeSubresourceRange(
-              dest_rt_key.is_depth
-                  ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                  : VK_IMAGE_ASPECT_COLOR_BIT),
-          dest_vulkan_rt.current_stage_mask(), dest_dst_stage_mask,
-          dest_vulkan_rt.current_access_mask(), dest_dst_access_mask,
-          dest_vulkan_rt.current_layout(), dest_new_layout);
-      dest_vulkan_rt.SetUsage(dest_dst_stage_mask, dest_dst_access_mask,
-                              dest_new_layout);
+      TransitionRenderTarget(dest_vulkan_rt, dest_dst_stage_mask,
+                             dest_dst_access_mask, dest_new_layout);
     }
 
     // Get the objects needed for transfers to the destination.
@@ -4915,7 +4998,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
     if (!current_transfers.empty()) {
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
-      bool dest_is_64bpp = dest_rt_key.Is64bpp();
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
@@ -4930,6 +5012,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format =
           dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_scale_native = dest_rt_key.scale_native;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -4968,6 +5051,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format =
               source_rt_key.resource_format;
+          new_transfer_shader_key.source_scale_native =
+              source_rt_key.scale_native;
+          assert_true(!host_depth_source_vulkan_rt ||
+                      host_depth_source_vulkan_rt->key().scale_native ==
+                          dest_rt_key.scale_native);
           bool host_depth_source_is_copy =
               host_depth_source_vulkan_rt == &dest_vulkan_rt;
           // The host depth copy buffer has only raw samples.
@@ -4979,10 +5067,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             new_transfer_shader_key.mode =
                 source_rt_key.is_depth ? TransferMode::kDepthToStencilBit
                                        : TransferMode::kColorToStencilBit;
-            stencil_clear_rectangle_count +=
-                transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                       dest_rt_key.msaa_samples, dest_is_64bpp,
-                                       nullptr, resolve_clear_rectangle);
+            stencil_clear_rectangle_count += transfer.GetRectangles(
+                dest_rt_key, nullptr, resolve_clear_rectangle);
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_vulkan_rt) {
@@ -5024,17 +5110,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         assert_not_null(it->transfer.source);
         auto& source_vulkan_rt =
             *static_cast<VulkanRenderTarget*>(it->transfer.source);
-        command_processor_.PushImageMemoryBarrier(
-            source_vulkan_rt.image(),
-            ui::vulkan::util::InitializeSubresourceRange(
-                source_vulkan_rt.key().is_depth
-                    ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                    : VK_IMAGE_ASPECT_COLOR_BIT),
-            source_vulkan_rt.current_stage_mask(), kSourceStageMask,
-            source_vulkan_rt.current_access_mask(), kSourceAccessMask,
-            source_vulkan_rt.current_layout(), kSourceLayout);
-        source_vulkan_rt.SetUsage(kSourceStageMask, kSourceAccessMask,
-                                  kSourceLayout);
+        TransitionRenderTarget(source_vulkan_rt, kSourceStageMask,
+                               kSourceAccessMask, kSourceLayout);
         auto host_depth_source_vulkan_rt =
             static_cast<VulkanRenderTarget*>(it->transfer.host_depth_source);
         if (host_depth_source_vulkan_rt) {
@@ -5047,17 +5124,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             UseEdramBuffer(EdramBufferUsage::kFragmentRead);
           } else {
             // Reading host depth from the texture.
-            command_processor_.PushImageMemoryBarrier(
-                host_depth_source_vulkan_rt->image(),
-                ui::vulkan::util::InitializeSubresourceRange(
-                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT),
-                host_depth_source_vulkan_rt->current_stage_mask(),
-                kSourceStageMask,
-                host_depth_source_vulkan_rt->current_access_mask(),
-                kSourceAccessMask,
-                host_depth_source_vulkan_rt->current_layout(), kSourceLayout);
-            host_depth_source_vulkan_rt->SetUsage(
-                kSourceStageMask, kSourceAccessMask, kSourceLayout);
+            TransitionRenderTarget(*host_depth_source_vulkan_rt,
+                                   kSourceStageMask, kSourceAccessMask,
+                                   kSourceLayout);
           }
         }
       }
@@ -5081,8 +5150,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_stencil_clear_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count =
-              transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                     dest_rt_key.msaa_samples, dest_is_64bpp,
+              transfer.GetRectangles(dest_rt_key,
                                      transfer_stencil_clear_rectangles,
                                      resolve_clear_rectangle);
           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count;
@@ -5090,15 +5158,15 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->rect.offset.x = int32_t(
-                stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                stencil_clear_rectangle.x_pixels * GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->rect.offset.y = int32_t(
-                stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                stencil_clear_rectangle.y_pixels * GetKeyScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->rect.extent.width =
                 stencil_clear_rectangle.width_pixels *
-                draw_resolution_scale_x();
+                GetKeyScaleX(dest_rt_key);
             stencil_clear_rect_write_ptr->rect.extent.height =
                 stencil_clear_rectangle.height_pixels *
-                draw_resolution_scale_y();
+                GetKeyScaleY(dest_rt_key);
             stencil_clear_rect_write_ptr->baseArrayLayer = 0;
             stencil_clear_rect_write_ptr->layerCount = 1;
             ++stencil_clear_rect_write_ptr;
@@ -5120,12 +5188,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       transfer_viewport.minDepth = 0.0f;
       transfer_viewport.maxDepth = 1.0f;
       command_processor_.SetViewport(transfer_viewport);
-      // GetRectangles returns coordinates in guest pixels, so scale
-      // pixels_to_ndc to convert guest pixels to NDC correctly.
+      // GetRectangles returns guest pixels - scale to the destination's host
+      // pixels.
       float pixels_to_ndc_x =
-          2.0f / transfer_viewport.width * draw_resolution_scale_x();
+          2.0f / transfer_viewport.width * GetKeyScaleX(dest_rt_key);
       float pixels_to_ndc_y =
-          2.0f / transfer_viewport.height * draw_resolution_scale_y();
+          2.0f / transfer_viewport.height * GetKeyScaleY(dest_rt_key);
       VkRect2D transfer_scissor;
       transfer_scissor.offset.x = 0;
       transfer_scissor.offset.y = 0;
@@ -5139,18 +5207,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         auto it_merged_first = it, it_merged_last = it;
         uint32_t transfer_rectangle_count =
             transfer_invocation_first.transfer.GetRectangles(
-                dest_rt_key.base_tiles, dest_pitch_tiles,
-                dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-                resolve_clear_rectangle);
+                dest_rt_key, nullptr, resolve_clear_rectangle);
         for (auto it_merge = std::next(it_merged_first);
              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
             break;
           }
           transfer_rectangle_count += it_merge->transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles,
-              dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-              resolve_clear_rectangle);
+              dest_rt_key, nullptr, resolve_clear_rectangle);
           it_merged_last = it_merge;
         }
         assert_not_zero(transfer_rectangle_count);
@@ -5194,10 +5258,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_invocation_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count =
-              it_merged->transfer.GetRectangles(
-                  dest_rt_key.base_tiles, dest_pitch_tiles,
-                  dest_rt_key.msaa_samples, dest_is_64bpp,
-                  transfer_invocation_rectangles, resolve_clear_rectangle);
+              it_merged->transfer.GetRectangles(dest_rt_key,
+                                                transfer_invocation_rectangles,
+                                                resolve_clear_rectangle);
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle =
@@ -5307,8 +5370,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           host_depth_address_constant.source_pitch =
               host_depth_source_rt_key.GetPitchTiles();
           host_depth_address_constant.source_to_dest =
-              int32_t(dest_rt_key.base_tiles) -
-              int32_t(host_depth_source_rt_key.base_tiles);
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(host_depth_source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
           if (last_host_depth_address_constant != host_depth_address_constant) {
             last_host_depth_address_constant = host_depth_address_constant;
             transfer_push_constants_set &=
@@ -5321,8 +5385,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           TransferAddressConstant address_constant;
           address_constant.dest_pitch = dest_pitch_tiles;
           address_constant.source_pitch = source_rt_key.GetPitchTiles();
-          address_constant.source_to_dest = int32_t(dest_rt_key.base_tiles) -
-                                            int32_t(source_rt_key.base_tiles);
+          address_constant.source_to_dest =
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
+          address_constant.source_next_period = source_rt_key.next_period;
           if (last_address_constant != address_constant) {
             last_address_constant = address_constant;
             transfer_push_constants_set &=
@@ -5469,6 +5536,15 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               resolve_clear_attachment.clearValue.color.float32[j] =
                   ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
             }
+            if (dest_rt_key.GetColorFormat() ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              // Gamma clear values are stored linearly in the host target.
+              for (uint32_t j = 0; j < 3; ++j) {
+                resolve_clear_attachment.clearValue.color.float32[j] =
+                    xenos::PWLGammaToLinear(
+                        resolve_clear_attachment.clearValue.color.float32[j]);
+              }
+            }
           } break;
           case xenos::ColorRenderTargetFormat::k_2_10_10_10:
           case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
@@ -5541,7 +5617,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
 
   std::vector<spv::Id> id_vector_temp;
 
-  SpirvBuilder builder(spv::Spv_1_5,
+  SpirvBuilder builder(spv::Spv_1_0,
                        (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
                        nullptr);
   spv::Id ext_inst_glsl_std_450 = builder.import("GLSL.std.450");
@@ -5666,9 +5742,13 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createLoad(input_global_invocation_id, spv::NoPrecision);
   spv::Id rectangle_sample_x =
       builder.createCompositeExtract(global_invocation_id, type_uint, 0);
+  // Dumps for fully native resolves address the EDRAM buffer with the plain
+  // 1x1 tile layout.
+  uint32_t layout_scale_x = key.native_layout ? 1 : draw_resolution_scale_x();
+  uint32_t layout_scale_y = key.native_layout ? 1 : draw_resolution_scale_y();
   uint32_t tile_width =
       (xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp)) *
-      draw_resolution_scale_x();
+      layout_scale_x;
   spv::Id const_tile_width = builder.makeUintConstant(tile_width);
   spv::Id rectangle_tile_index_x = builder.createBinOp(
       spv::OpUDiv, type_uint, rectangle_sample_x, const_tile_width);
@@ -5676,8 +5756,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       spv::OpUMod, type_uint, rectangle_sample_x, const_tile_width);
   spv::Id rectangle_sample_y =
       builder.createCompositeExtract(global_invocation_id, type_uint, 1);
-  uint32_t tile_height =
-      xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+  uint32_t tile_height = xenos::kEdramTileHeightSamples * layout_scale_y;
   spv::Id const_tile_height = builder.makeUintConstant(tile_height);
   spv::Id rectangle_tile_index_y = builder.createBinOp(
       spv::OpUDiv, type_uint, rectangle_sample_y, const_tile_height);
@@ -5712,12 +5791,12 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createAccessChain(spv::StorageClassPushConstant, push_constants,
                                 id_vector_temp),
       spv::NoPrecision);
-  spv::Id const_edram_base_tiles_bits_plus_1 =
-      builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1);
+  spv::Id const_edram_base_tiles_bits_plus_2 =
+      builder.makeUintConstant(xenos::kEdramBaseTilesBits + 2);
   spv::Id edram_tile_index_non_wrapped = builder.createBinOp(
       spv::OpIAdd, type_uint,
       builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
-                          const_uint_0, const_edram_base_tiles_bits_plus_1),
+                          const_uint_0, const_edram_base_tiles_bits_plus_2),
       rectangle_tile_index);
 
   // Combine the tile sample index and the tile index, wrapping the tile
@@ -5758,7 +5837,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       spv::OpISub, type_uint, edram_tile_index_non_wrapped,
       builder.createTriOp(
           spv::OpBitFieldUExtract, type_uint, offsets_constant,
-          const_edram_base_tiles_bits_plus_1,
+          const_edram_base_tiles_bits_plus_2,
           builder.makeUintConstant(xenos::kEdramBaseTilesBits)));
   // Split the linear tile index in the source texture into X and Y in tiles.
   spv::Id source_pitch_tiles = builder.createTriOp(
@@ -5783,34 +5862,112 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   spv::Id source_pixel_x = source_sample_x, source_pixel_y = source_sample_y;
   spv::Id source_sample_id = spv::NoResult;
   if (source_is_multisampled) {
+    // source_sample_x/y hold the canonical sample coordinates within the
+    // EDRAM layout. Convert them into the pixel and the sample of the
+    // multisampled view using the canonical layout formulas, at guest pixel
+    // granularity when the layout is scaled.
+    uint32_t layout_scale_x = key.native_layout ? 1 : draw_resolution_scale_x();
+    uint32_t layout_scale_y = key.native_layout ? 1 : draw_resolution_scale_y();
+    bool layout_scaled = layout_scale_x > 1 || layout_scale_y > 1;
     spv::Id const_uint_1 = builder.makeUintConstant(1);
-    source_pixel_y = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                         source_sample_y, const_uint_1);
+    spv::Id const_uint_2 = builder.makeUintConstant(2);
+    spv::Id canonical_u = source_sample_x;
+    spv::Id canonical_v = source_sample_y;
+    spv::Id subpixel_x = spv::NoResult, subpixel_y = spv::NoResult;
+    spv::Id const_layout_scale_x = spv::NoResult;
+    spv::Id const_layout_scale_y = spv::NoResult;
+    if (layout_scaled) {
+      const_layout_scale_x = builder.makeUintConstant(layout_scale_x);
+      const_layout_scale_y = builder.makeUintConstant(layout_scale_y);
+      canonical_u = builder.createBinOp(spv::OpUDiv, type_uint, source_sample_x,
+                                        const_layout_scale_x);
+      subpixel_x = builder.createBinOp(spv::OpUMod, type_uint, source_sample_x,
+                                       const_layout_scale_x);
+      canonical_v = builder.createBinOp(spv::OpUDiv, type_uint, source_sample_y,
+                                        const_layout_scale_y);
+      subpixel_y = builder.createBinOp(spv::OpUMod, type_uint, source_sample_y,
+                                       const_layout_scale_y);
+    }
     if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-      source_pixel_x = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                           source_sample_x, const_uint_1);
       // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1 for
-      // vertical.
+      // vertical, same as the canonical layout.
+      // sample = ((u >> 1) & 1) | (((v >> 1) & 1) << 1)
       source_sample_id = builder.createQuadOp(
           spv::OpBitFieldInsert, type_uint,
-          builder.createBinOp(spv::OpBitwiseAnd, type_uint, source_sample_x,
-                              const_uint_1),
-          source_sample_y, const_uint_1, const_uint_1);
+          builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_u,
+                              const_uint_1, const_uint_1),
+          builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_v,
+                              const_uint_1, const_uint_1),
+          const_uint_1, const_uint_1);
+      // Guest pixel per axis = ((c >> 2) << 1) | (c & 1).
+      source_pixel_x = builder.createQuadOp(
+          spv::OpBitFieldInsert, type_uint, canonical_u,
+          builder.createBinOp(spv::OpShiftRightLogical, type_uint, canonical_u,
+                              const_uint_2),
+          const_uint_1, builder.makeUintConstant(31));
+      source_pixel_y = builder.createQuadOp(
+          spv::OpBitFieldInsert, type_uint, canonical_v,
+          builder.createBinOp(spv::OpShiftRightLogical, type_uint, canonical_v,
+                              const_uint_2),
+          const_uint_1, builder.makeUintConstant(31));
     } else {
-      // 2x MSAA source texture sample index - convert from the guest to
-      // the Vulkan standard sample locations.
+      // At 2x the guest sample sits in canonical U bit 1 and one guest pixel
+      // X bit sits in canonical V bit 1. Convert the guest sample index to
+      // the Vulkan standard sample order.
       source_sample_id = builder.createTriOp(
           spv::OpSelect, type_uint,
-          builder.createBinOp(
-              spv::OpINotEqual, builder.makeBoolType(),
-              builder.createBinOp(spv::OpBitwiseAnd, type_uint, source_sample_y,
-                                  const_uint_1),
-              const_uint_0),
+          builder.createBinOp(spv::OpINotEqual, builder.makeBoolType(),
+                              builder.createBinOp(spv::OpBitwiseAnd, type_uint,
+                                                  canonical_u, const_uint_2),
+                              const_uint_0),
           builder.makeUintConstant(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
               1, msaa_2x_attachments_supported_)),
           builder.makeUintConstant(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
               0, msaa_2x_attachments_supported_)));
+      // Guest pixel X = (u & ~2) | (v & 2).
+      source_pixel_x = builder.createBinOp(
+          spv::OpBitwiseOr, type_uint,
+          builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_u,
+                              builder.makeUintConstant(~uint32_t(2))),
+          builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                              const_uint_2));
+      // Guest pixel Y = ((v & ~3) >> 1) | (v & 1).
+      source_pixel_y = builder.createBinOp(
+          spv::OpBitwiseOr, type_uint,
+          builder.createBinOp(
+              spv::OpShiftRightLogical, type_uint,
+              builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                  builder.makeUintConstant(~uint32_t(3))),
+              const_uint_1),
+          builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                              const_uint_1));
     }
+    if (!key.source_scale_native && layout_scaled) {
+      // Scaled source in the scaled layout. Restore the subpixel position.
+      source_pixel_x = builder.createBinOp(
+          spv::OpIAdd, type_uint,
+          builder.createBinOp(spv::OpIMul, type_uint, source_pixel_x,
+                              const_layout_scale_x),
+          subpixel_x);
+      source_pixel_y = builder.createBinOp(
+          spv::OpIAdd, type_uint,
+          builder.createBinOp(spv::OpIMul, type_uint, source_pixel_y,
+                              const_layout_scale_y),
+          subpixel_y);
+    }
+    // With a native source and a scaled layout, the guest pixel position comes
+    // directly from the source texture position, and all the scaled sample
+    // slots covering one guest sample receive its value.
+  } else if (key.source_scale_native && !key.native_layout &&
+             IsDrawResolutionScaled()) {
+    // Native single sampled source dumped to the scaled EDRAM layout.
+    // Duplicate each pixel into all the scaled sample slots covering it.
+    source_pixel_x = builder.createBinOp(
+        spv::OpUDiv, type_uint, source_pixel_x,
+        builder.makeUintConstant(draw_resolution_scale_x()));
+    source_pixel_y = builder.createBinOp(
+        spv::OpUDiv, type_uint, source_pixel_y,
+        builder.makeUintConstant(draw_resolution_scale_y()));
   }
 
   // Load the source, and pack the value into one or two 32-bit integers.
@@ -5861,8 +6018,9 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       } break;
       case xenos::DepthRenderTargetFormat::kD24FS8: {
         packed[0] = SpirvShaderTranslator::PreClampedDepthTo20e4(
-            builder, source_depth32, depth_float24_round(), true,
-            ext_inst_glsl_std_450);
+            builder, source_depth32,
+            !depth_float24_convert_in_pixel_shader() && depth_float24_round(),
+            true, ext_inst_glsl_std_450);
       } break;
     }
     packed[0] = builder.createQuadOp(
@@ -5872,19 +6030,32 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     switch (key.GetColorFormat()) {
       case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+        // Gamma targets store linear RGB. Encode RGB before packing the dump.
+        // Alpha stays linear.
+        bool is_gamma = key.GetColorFormat() ==
+                        xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
         spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
         spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
+        spv::Id source_red =
+            builder.createCompositeExtract(source_vec4, type_float, 0);
+        if (is_gamma) {
+          source_red = SpirvShaderTranslator::LinearToPWLGamma(
+              &builder, source_red, true, ext_inst_glsl_std_450);
+        }
         packed[0] = builder.createUnaryOp(
             spv::OpConvertFToU, type_uint,
-            builder.createBinOp(
-                spv::OpFAdd, type_float,
-                builder.createBinOp(
-                    spv::OpFMul, type_float,
-                    builder.createCompositeExtract(source_vec4, type_float, 0),
-                    unorm_scale),
-                unorm_round_offset));
+            builder.createBinOp(spv::OpFAdd, type_float,
+                                builder.createBinOp(spv::OpFMul, type_float,
+                                                    source_red, unorm_scale),
+                                unorm_round_offset));
         spv::Id component_width = builder.makeUintConstant(8);
         for (uint32_t i = 1; i < 4; ++i) {
+          spv::Id source_component =
+              builder.createCompositeExtract(source_vec4, type_float, i);
+          if (is_gamma && i < 3) {
+            source_component = SpirvShaderTranslator::LinearToPWLGamma(
+                &builder, source_component, true, ext_inst_glsl_std_450);
+          }
           packed[0] = builder.createQuadOp(
               spv::OpBitFieldInsert, type_uint, packed[0],
               builder.createUnaryOp(
@@ -5892,9 +6063,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
                   builder.createBinOp(
                       spv::OpFAdd, type_float,
                       builder.createBinOp(spv::OpFMul, type_float,
-                                          builder.createCompositeExtract(
-                                              source_vec4, type_float, i),
-                                          unorm_scale),
+                                          source_component, unorm_scale),
                       unorm_round_offset)),
               builder.makeUintConstant(8 * i), component_width);
         }
@@ -6058,7 +6227,8 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
 void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                 uint32_t dump_row_length_used,
                                                 uint32_t dump_rows,
-                                                uint32_t dump_pitch) {
+                                                uint32_t dump_pitch,
+                                                bool native_layout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
@@ -6087,25 +6257,20 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
     auto& vulkan_rt =
         *static_cast<VulkanRenderTarget*>(rectangle.render_target);
     RenderTargetKey rt_key = vulkan_rt.key();
-    command_processor_.PushImageMemoryBarrier(
-        vulkan_rt.image(),
-        ui::vulkan::util::InitializeSubresourceRange(
-            rt_key.is_depth
-                ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                : VK_IMAGE_ASPECT_COLOR_BIT),
-        vulkan_rt.current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        vulkan_rt.current_access_mask(), VK_ACCESS_SHADER_READ_BIT,
-        vulkan_rt.current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    vulkan_rt.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_SHADER_READ_BIT,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    TransitionRenderTarget(vulkan_rt, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_SHADER_READ_BIT,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (vulkan_rt.temporary_sort_index() == UINT32_MAX) {
       vulkan_rt.SetTemporarySortIndex(rt_sort_index++);
     }
+    // Native layout is only for resolves with ALL native sources.
+    assert_true(!native_layout || rt_key.scale_native);
     DumpPipelineKey pipeline_key;
     pipeline_key.msaa_samples = rt_key.msaa_samples;
     pipeline_key.resource_format = rt_key.resource_format;
     pipeline_key.is_depth = rt_key.is_depth;
+    pipeline_key.source_scale_native = rt_key.scale_native;
+    pipeline_key.native_layout = uint32_t(native_layout);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
 
@@ -6178,7 +6343,8 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      offsets.dispatch_first_tile =
+          rt_key.GetNonWrappedTileIndex(dump_base + dispatch.offset);
       if (last_offsets != offsets) {
         last_offsets = offsets;
         offsets_bound = false;
@@ -6191,14 +6357,15 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
             &last_offsets);
       }
       command_processor_.SubmitBarriers(true);
+      // The native layout has a 1x1 footprint.
       command_buffer.CmdVkDispatch(
-          (draw_resolution_scale_x() *
+          ((native_layout ? 1 : draw_resolution_scale_x()) *
                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
                dispatch.width_tiles +
            (kDumpSamplesPerGroupX - 1)) /
               kDumpSamplesPerGroupX,
-          (draw_resolution_scale_y() * xenos::kEdramTileHeightSamples *
-               dispatch.height_tiles +
+          ((native_layout ? 1 : draw_resolution_scale_y()) *
+               xenos::kEdramTileHeightSamples * dispatch.height_tiles +
            (kDumpSamplesPerGroupY - 1)) /
               kDumpSamplesPerGroupY,
           1);

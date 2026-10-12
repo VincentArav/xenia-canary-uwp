@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "xenia/cpu/backend/x64/x64_op.h"
+#include "xenia/cpu/backend/x64/x64_util.h"
 
 // For OPCODE_PACK/OPCODE_UNPACK
 #include "third_party/half/include/half.hpp"
@@ -103,11 +104,11 @@ struct VECTOR_CONVERT_F2I
         Opmask mask = e.k1;
         // Mask non-negative, non-NaN values (ordered, >= 0)
         // _CMP_GE_OQ
-        e.vcmpps(mask, i.src1, e.GetXmmConstPtr(XMMZero), 0x1D);
+        e.vcmpps(mask, src1, e.GetXmmConstPtr(XMMZero), 0x1D);
 
         // vcvttps2udq will saturate overflowing positive values to UINT_MAX.
         // Zero-masking writes zero for negative values and NaN
-        e.vcvttps2udq(i.dest.reg() | mask | e.T_z, i.src1);
+        e.vcvttps2udq(i.dest.reg() | mask | e.T_z, src1);
         return;
       }
 
@@ -159,6 +160,17 @@ struct VECTOR_DENORMFLUSH
     : Sequence<VECTOR_DENORMFLUSH,
                I<OPCODE_VECTOR_DENORMFLUSH, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho | kX64EmitAVX512DQ)) {
+      const Xbyak::Opmask denormal_mask = e.k1;
+      e.vptestnmd(denormal_mask, i.src1,
+                  e.GetXmmConstPtr(XMMSingleDenormalMask));
+      e.vxorps(e.xmm1, e.xmm1, e.xmm1);
+      e.vmovaps(i.dest, i.src1);
+      e.vrangeps(i.dest.reg() | denormal_mask, i.dest, e.xmm1,
+                 FpRangeSelect::AbsMin | FpRangeSign::OperandA);
+      return;
+    }
+
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
     e.vxorps(e.xmm1, e.xmm1, e.xmm1);  // 0.25 P0123
 
@@ -446,21 +458,23 @@ struct VECTOR_COMPARE_SGE_V128
                 break;
             }
           } else {
+            // Not xmm0: EmitAssociativeBinaryXmmOp materializes a constant
+            // operand there, and both compares read it.
             switch (i.instr->flags) {
               case INT8_TYPE:
-                e.vpcmpeqb(e.xmm0, src1, src2);
+                e.vpcmpeqb(e.xmm1, src1, src2);
                 e.vpcmpgtb(dest, src1, src2);
-                e.vpor(dest, e.xmm0);
+                e.vpor(dest, e.xmm1);
                 break;
               case INT16_TYPE:
-                e.vpcmpeqw(e.xmm0, src1, src2);
+                e.vpcmpeqw(e.xmm1, src1, src2);
                 e.vpcmpgtw(dest, src1, src2);
-                e.vpor(dest, e.xmm0);
+                e.vpor(dest, e.xmm1);
                 break;
               case INT32_TYPE:
-                e.vpcmpeqd(e.xmm0, src1, src2);
+                e.vpcmpeqd(e.xmm1, src1, src2);
                 e.vpcmpgtd(dest, src1, src2);
-                e.vpor(dest, e.xmm0);
+                e.vpor(dest, e.xmm1);
                 break;
               case FLOAT32_TYPE:
                 e.ChangeMxcsrMode(MXCSRMode::Vmx);
@@ -922,21 +936,60 @@ struct VECTOR_SHL_V128
   static void EmitInt8(X64Emitter& e, const EmitArgType& i) {
     // TODO(benvanik): native version (with shift magic).
 
+    // gf2p8mulb's "x8 + x4 + x3 + x + 1"-polynomial-reduction only
+    // applies when the multiplication overflows. Masking away any bits
+    // that would have overflowed turns the polynomial-multiplication into
+    // regular modulo-multiplication
+    const uint64_t gfni_shift_mask = UINT64_C(0x01'03'07'0f'1f'3f'7f'ff);
+    // n << 0 == n * 1 | n << 1 == n * 2 | n << 2 == n * 4 | etc
+    const uint64_t gfni_multiply_table = UINT64_C(0x80'40'20'10'08'04'02'01);
+
     if (e.IsFeatureEnabled(kX64EmitAVX2)) {
       if (!i.src2.is_constant) {
+        if (e.IsFeatureEnabled(kX64EmitGFNI | kX64EmitAVX512Ortho |
+                               kX64EmitAVX512VBMI)) {
+          e.LoadConstantXmm(e.xmm0, vec128q(gfni_shift_mask, gfni_shift_mask));
+          e.vpermb(e.xmm0, i.src2, e.xmm0);
+          e.vpand(e.xmm0, i.src1, e.xmm0);
+
+          e.LoadConstantXmm(e.xmm1,
+                            vec128q(gfni_multiply_table, gfni_multiply_table));
+          e.vpermb(e.xmm1, i.src2, e.xmm1);
+
+          e.vgf2p8mulb(i.dest, e.xmm0, e.xmm1);
+          return;
+        } else if (e.IsFeatureEnabled(kX64EmitGFNI)) {
+          // Only use the lower 4 bits
+          // This also protects from vpshufb from writing zero when the MSB is
+          // set
+          e.LoadConstantXmm(e.xmm0, vec128b(0x0F));
+          e.vpand(e.xmm2, i.src2, e.xmm0);
+
+          e.LoadConstantXmm(e.xmm0, vec128q(gfni_shift_mask, gfni_shift_mask));
+          e.vpshufb(e.xmm0, e.xmm0, e.xmm2);
+          e.vpand(e.xmm0, i.src1, e.xmm0);
+
+          e.LoadConstantXmm(e.xmm1,
+                            vec128q(gfni_multiply_table, gfni_multiply_table));
+          e.vpshufb(e.xmm1, e.xmm1, e.xmm2);
+
+          e.vgf2p8mulb(i.dest, e.xmm0, e.xmm1);
+          return;
+        }
+
+        // Mask the shift counts to 3 bits before widening so the scratch
+        // stays inside xmm0-3 (since ymm4 aliases an allocatable register)
+        e.vpand(e.xmm2, i.src2, e.GetXmmConstPtr(XMMXOPByteShiftMask));
+
         // get high 8 bytes
         e.vpunpckhqdq(e.xmm1, i.src1, i.src1);
-        e.vpunpckhqdq(e.xmm3, i.src2, i.src2);
+        e.vpunpckhqdq(e.xmm3, e.xmm2, e.xmm2);
 
         e.vpmovzxbd(e.ymm0, i.src1);
         e.vpmovzxbd(e.ymm1, e.xmm1);
 
-        e.vpmovzxbd(e.ymm2, i.src2);
+        e.vpmovzxbd(e.ymm2, e.xmm2);
         e.vpmovzxbd(e.ymm3, e.xmm3);
-
-        e.vpbroadcastd(e.ymm4, e.GetXmmConstPtr(XMMXOPByteShiftMask));
-        e.vpand(e.ymm2, e.ymm2, e.ymm4);
-        e.vpand(e.ymm3, e.ymm3, e.ymm4);
 
         e.vpsllvd(e.ymm0, e.ymm0, e.ymm2);
         e.vpsllvd(e.ymm1, e.ymm1, e.ymm3);
@@ -967,6 +1020,15 @@ struct VECTOR_SHL_V128
           }
         }
         if (all_same) {
+          if (e.IsFeatureEnabled(kX64EmitGFNI)) {
+            // Every count is the same, so we can use gf2p8affineqb.
+            const uint8_t shift_amount = seenvalue & 0b111;
+            const uint64_t shift_matrix =
+                UINT64_C(0x0102040810204080) >> (shift_amount * 8);
+            e.vgf2p8affineqb(i.dest, i.src1,
+                             e.StashConstantXmm(0, vec128q(shift_matrix)), 0);
+            return;
+          }
           e.vpmovzxbw(e.ymm0, i.src1);
           e.vpsllw(e.ymm0, e.ymm0, seenvalue);
           e.vextracti128(e.xmm1, e.ymm0, 1);
@@ -978,6 +1040,39 @@ struct VECTOR_SHL_V128
 
         } else {
           e.LoadConstantXmm(e.xmm2, constmask);
+
+          if (e.IsFeatureEnabled(kX64EmitGFNI | kX64EmitAVX512Ortho |
+                                 kX64EmitAVX512VBMI)) {
+            e.LoadConstantXmm(e.xmm0,
+                              vec128q(gfni_shift_mask, gfni_shift_mask));
+            e.vpermb(e.xmm0, e.xmm2, e.xmm0);
+            e.vpand(e.xmm0, i.src1, e.xmm0);
+
+            e.LoadConstantXmm(
+                e.xmm1, vec128q(gfni_multiply_table, gfni_multiply_table));
+            e.vpermb(e.xmm1, e.xmm2, e.xmm1);
+
+            e.vgf2p8mulb(i.dest, e.xmm0, e.xmm1);
+            return;
+          } else if (e.IsFeatureEnabled(kX64EmitGFNI)) {
+            // Only use the lower 4 bits
+            // This also protects from vpshufb from writing zero when the MSB is
+            // set
+            e.LoadConstantXmm(e.xmm0, vec128b(0x0F));
+            e.vpand(e.xmm2, e.xmm2, e.xmm0);
+
+            e.LoadConstantXmm(e.xmm0,
+                              vec128q(gfni_shift_mask, gfni_shift_mask));
+            e.vpshufb(e.xmm0, e.xmm0, e.xmm2);
+            e.vpand(e.xmm0, i.src1, e.xmm0);
+
+            e.LoadConstantXmm(
+                e.xmm1, vec128q(gfni_multiply_table, gfni_multiply_table));
+            e.vpshufb(e.xmm1, e.xmm1, e.xmm2);
+
+            e.vgf2p8mulb(i.dest, e.xmm0, e.xmm1);
+            return;
+          }
 
           e.vpunpckhqdq(e.xmm1, i.src1, i.src1);
           e.vpunpckhqdq(e.xmm3, e.xmm2, e.xmm2);
@@ -1032,7 +1127,8 @@ struct VECTOR_SHL_V128
 
     e.L(looper);
     e.movzx(e.ecx, e.byte[e.rsp + stack_offset_src2 + e.rdx]);
-    e.and_(e.ecx, 7);
+    e.and_(e.cl, 7);  // Mask shift count to 3 bits (0-7) for byte shifts
+
     e.shl(e.byte[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
     if (e.IsFeatureEnabled(kX64FlagsIndependentVars)) {
@@ -2112,13 +2208,16 @@ struct EXTRACT_I8
     : Sequence<EXTRACT_I8, I<OPCODE_EXTRACT, I8Op, V128Op, I8Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant) {
-      e.vpextrb(i.dest.reg().cvt32(), i.src1, VEC128_B(i.src2.constant()));
+      Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+      e.vpextrb(i.dest.reg().cvt32(), src1, VEC128_B(i.src2.constant()));
     } else {
+      // Not xmm0: that holds the shuffle control below.
+      Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm1);
       e.mov(e.eax, 0x00000003);
       e.xor_(e.al, i.src2);
       e.and_(e.al, 0x1F);
       e.vmovd(e.xmm0, e.eax);
-      e.vpshufb(e.xmm0, i.src1, e.xmm0);
+      e.vpshufb(e.xmm0, src1, e.xmm0);
       e.vmovd(i.dest.reg().cvt32(), e.xmm0);
       e.and_(i.dest, uint8_t(0xFF));
     }
@@ -2128,15 +2227,18 @@ struct EXTRACT_I16
     : Sequence<EXTRACT_I16, I<OPCODE_EXTRACT, I16Op, V128Op, I8Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant) {
-      e.vpextrw(i.dest.reg().cvt32(), i.src1, VEC128_W(i.src2.constant()));
+      Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+      e.vpextrw(i.dest.reg().cvt32(), src1, VEC128_W(i.src2.constant()));
     } else {
+      // Not xmm0: that holds the shuffle control below.
+      Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm1);
       e.mov(e.al, i.src2);
       e.xor_(e.al, 0x01);
       e.shl(e.al, 1);
       e.mov(e.ah, e.al);
       e.add(e.ah, 1);
       e.vmovd(e.xmm0, e.eax);
-      e.vpshufb(e.xmm0, i.src1, e.xmm0);
+      e.vpshufb(e.xmm0, src1, e.xmm0);
       e.vmovd(i.dest.reg().cvt32(), e.xmm0);
       e.and_(i.dest.reg().cvt32(), 0xFFFFu);
     }
@@ -2329,6 +2431,10 @@ struct PERMUTE_I32
         e.LoadConstantXmm(src3, i.src3.constant());
       } else {
         src3 = i.src3;
+      }
+      if (control == MakePermuteMask(0, 2, 0, 3, 1, 0, 1, 1)) {
+        e.vshufps(i.dest, src2, src3, MakeSwizzleMask(2, 3, 0, 1));
+        return;
       }
       if (i.dest != src3) {
         e.vpshufd(i.dest, src2, src_control);
@@ -2927,7 +3033,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
         if (IsPackOutSaturate(flags)) {
           // unsigned -> unsigned + saturate
           auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
-          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
 
 #if XE_PLATFORM_WIN32
           // Windows x64 ABI: __m128i is passed by implicit pointer
@@ -2945,7 +3051,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
         } else {
           // unsigned -> unsigned
           auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
-          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
 
 #if XE_PLATFORM_WIN32
           // Windows x64 ABI: __m128i is passed by implicit pointer
