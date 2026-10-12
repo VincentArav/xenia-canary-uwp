@@ -3380,7 +3380,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                                     ImVec4(0, 0, 0, 0));
               ImGui::PushStyleColor(ImGuiCol_HeaderActive,
                                     ImVec4(0, 0, 0, 0));
-              ImGui::PushStyleColor(ImGuiCol_NavHighlight,
+              ImGui::PushStyleColor(ImGuiCol_NavCursor,
                                     ImVec4(0, 0, 0, 0));
               if (ImGui::Selectable("##game_row", is_selected,
                                    row_selectable_flags,
@@ -3855,7 +3855,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                                       ImVec4(0, 0, 0, 0));
                 ImGui::PushStyleColor(ImGuiCol_HeaderActive,
                                       ImVec4(0, 0, 0, 0));
-                ImGui::PushStyleColor(ImGuiCol_NavHighlight,
+                ImGui::PushStyleColor(ImGuiCol_NavCursor,
                                       ImVec4(0, 0, 0, 0));
                 if (ImGui::Selectable("##search_row", is_selected, 0,
                                       ImVec2(card_width, row_height))) {
@@ -5071,9 +5071,10 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
               ImGui::IsKeyPressed(ImGuiKey_UpArrow, false);
 
           if (ImGui::BeginChild("##pergame_editor_plane",
-                                ImVec2(0.0f, -reduced_footer_height), true,
-                                ImGuiWindowFlags_NavFlattened |
-                                    ImGuiWindowFlags_NoNavFocus)) {
+                                ImVec2(0.0f, -reduced_footer_height),
+                                ImGuiChildFlags_Borders |
+                                    ImGuiChildFlags_NavFlattened,
+                                ImGuiWindowFlags_NoNavFocus)) {
             if (ImGui::BeginTable("##pergame_layout", 3,
                                   ImGuiTableFlags_SizingStretchProp)) {
               ImGui::TableSetupColumn("##pergame_left_col",
