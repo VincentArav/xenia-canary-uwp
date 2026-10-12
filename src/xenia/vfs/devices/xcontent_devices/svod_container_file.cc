@@ -30,7 +30,9 @@ size_t SvodContainerFile::Read(std::span<uint8_t> buffer, size_t offset,
   }
 
   const size_t bytes_to_read = std::min(buffer.size(), file->size() - offset);
-  std::memcpy(buffer.data(), file->data() + offset, bytes_to_read);
+  if (!ReadSvodFragment(*file, offset, buffer.data(), bytes_to_read)) {
+    return 0;
+  }
   return bytes_to_read;
 }
 

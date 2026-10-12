@@ -6104,56 +6104,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             tooltip = c_controller_hotkeys->description();
           }
 
-          auto c_user_language = dynamic_cast<cvar::ConfigVar<int32_t>*>(
-              cvar::ConfigVars->find("user_language")->second);
-          int32_t user_language = c_user_language->GetTypedConfigValue();
-          struct LanguageOption {
-            int32_t value;
-            const char* label;
-          };
-          static constexpr LanguageOption kLanguageOptions[] = {
-              {1, "English"},
-              {2, "Japanese"},
-              {3, "German"},
-              {4, "French"},
-              {5, "Spanish"},
-              {6, "Italian"},
-              {7, "Korean"},
-              {8, "Traditional Chinese"},
-              {9, "Portuguese"},
-              {10, "Simplified Chinese"},
-              {11, "Polish"},
-              {12, "Russian"},
-          };
-          const char* user_language_preview = "English";
-          for (const auto& option : kLanguageOptions) {
-            if (option.value == user_language) {
-              user_language_preview = option.label;
-              break;
-            }
-          }
-          {
-            ScopedAccentComboStyle accent_combo_style;
-            if (ImGui::BeginCombo("Language", user_language_preview)) {
-              for (const auto& option : kLanguageOptions) {
-                const bool is_selected = user_language == option.value;
-                if (ImGui::Selectable(option.label, is_selected)) {
-                  c_user_language->SetConfigValue(option.value);
-                  config::SaveConfig();
-                  user_language = option.value;
-                }
-                if (is_selected) {
-                  ImGui::SetItemDefaultFocus();
-                }
-              }
-              ImGui::EndCombo();
-            }
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_user_language->description();
-          }
-
+          // Language moved from the user_language cvar to XConfig in Canary.
           ImGui::Spacing();
           if (DrawTextEffectButton("Open Profile Menu")) {
             emulator_window_.ToggleProfilesConfigDialog();
@@ -6582,17 +6533,6 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             tooltip = c_dxbc_switch->description();
           }
 
-          auto c2xmsaa = dynamic_cast<cvar::ConfigVar<bool>*>(
-              cvar::ConfigVars->find("native_2x_msaa")->second);
-          if (ImGui::Checkbox("Native 2X MSAA", c2xmsaa->current_value())) {
-            c2xmsaa->SetConfigValue(!c2xmsaa->GetTypedConfigValue());
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c2xmsaa->description();
-          }
-
           auto c_vsync = dynamic_cast<cvar::ConfigVar<bool>*>(
               cvar::ConfigVars->find("vsync")->second);
           if (ImGui::Checkbox("V-Sync", c_vsync->current_value())) {
@@ -6669,44 +6609,6 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
           if (ImGui::IsItemFocused()) {
             tooltip = c_render_target_path->description();
-          }
-
-          auto c_gamma_rt = dynamic_cast<cvar::ConfigVar<bool>*>(
-              cvar::ConfigVars->find("gamma_render_target_as_srgb")->second);
-          if (ImGui::Checkbox("Gamma Render Target As sRGB",
-                              c_gamma_rt->current_value())) {
-            c_gamma_rt->SetConfigValue(!c_gamma_rt->GetTypedConfigValue());
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_gamma_rt->description();
-          }
-
-          auto c_query_lower = dynamic_cast<cvar::ConfigVar<int32_t>*>(
-              cvar::ConfigVars->find("query_occlusion_sample_lower_threshold")
-                  ->second);
-          int query_lower = c_query_lower->GetTypedConfigValue();
-          if (ImGui::InputInt("Query Occlusion Lower Threshold", &query_lower)) {
-            c_query_lower->SetConfigValue(query_lower);
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_query_lower->description();
-          }
-
-          auto c_query_upper = dynamic_cast<cvar::ConfigVar<int32_t>*>(
-              cvar::ConfigVars->find("query_occlusion_sample_upper_threshold")
-                  ->second);
-          int query_upper = c_query_upper->GetTypedConfigValue();
-          if (ImGui::InputInt("Query Occlusion Upper Threshold", &query_upper)) {
-            c_query_upper->SetConfigValue(query_upper);
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_query_upper->description();
           }
 
           auto c_fuzzy_alpha = dynamic_cast<cvar::ConfigVar<bool>*>(
@@ -7546,97 +7448,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         }
 
         if (settings_selected_section == 9) {
-          auto c_internal_resolution = dynamic_cast<cvar::ConfigVar<uint32_t>*>(
-              cvar::ConfigVars->find("internal_display_resolution")->second);
-          uint32_t resolution_value = c_internal_resolution->GetTypedConfigValue();
-          const char* resolution_labels[] = {
-              "640x480",   "640x576",   "720x480",   "720x576",  "800x600",
-              "848x480",   "1024x768",  "1152x864",  "1280x720", "1280x768",
-              "1280x960",  "1280x1024", "1360x768",  "1440x900", "1680x1050",
-              "1920x540",  "1920x1080"};
-          const uint32_t max_resolution_index = 17;
-          uint32_t ui_index = resolution_value;
-          if (ui_index > max_resolution_index) {
-            ui_index = max_resolution_index;
-          }
-          const char* resolution_preview =
-              ui_index == 17 ? "Custom" : resolution_labels[ui_index];
-          {
-            ScopedAccentComboStyle accent_combo_style;
-            if (ImGui::BeginCombo("Internal Display Resolution", resolution_preview)) {
-              for (uint32_t i = 0; i <= 16; ++i) {
-                if (ImGui::Selectable(resolution_labels[i], ui_index == i)) {
-                  c_internal_resolution->SetConfigValue(i);
-                  config::SaveConfig();
-                }
-              }
-              if (ImGui::Selectable("Custom", ui_index == 17)) {
-                c_internal_resolution->SetConfigValue(17);
-                config::SaveConfig();
-              }
-              ImGui::EndCombo();
-            }
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_internal_resolution->description();
-          }
-
-          if (c_internal_resolution->GetTypedConfigValue() == 17) {
-            auto c_internal_resolution_x =
-                dynamic_cast<cvar::ConfigVar<uint32_t>*>(
-                    cvar::ConfigVars->find("internal_display_resolution_x")
-                        ->second);
-            auto c_internal_resolution_y =
-                dynamic_cast<cvar::ConfigVar<uint32_t>*>(
-                    cvar::ConfigVars->find("internal_display_resolution_y")
-                        ->second);
-
-            int custom_x =
-                static_cast<int>(c_internal_resolution_x->GetTypedConfigValue());
-            if (ImGui::InputInt("Custom Resolution Width", &custom_x)) {
-              if (custom_x < 1) custom_x = 1;
-              if (custom_x > 1920) custom_x = 1920;
-              c_internal_resolution_x->SetConfigValue(
-                  static_cast<uint32_t>(custom_x));
-              config::SaveConfig();
-            }
-
-            int custom_y =
-                static_cast<int>(c_internal_resolution_y->GetTypedConfigValue());
-            if (ImGui::InputInt("Custom Resolution Height", &custom_y)) {
-              if (custom_y < 1) custom_y = 1;
-              if (custom_y > 1080) custom_y = 1080;
-              c_internal_resolution_y->SetConfigValue(
-                  static_cast<uint32_t>(custom_y));
-              config::SaveConfig();
-            }
-          }
-
-          auto c_widescreen = dynamic_cast<cvar::ConfigVar<bool>*>(
-              cvar::ConfigVars->find("widescreen")->second);
-          if (ImGui::Checkbox("Widescreen", c_widescreen->current_value())) {
-            c_widescreen->SetConfigValue(!c_widescreen->GetTypedConfigValue());
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_widescreen->description();
-          }
-
-          auto c_use_50hz_mode = dynamic_cast<cvar::ConfigVar<bool>*>(
-              cvar::ConfigVars->find("use_50Hz_mode")->second);
-          if (ImGui::Checkbox("Use 50Hz Video Mode",
-                              c_use_50hz_mode->current_value())) {
-            c_use_50hz_mode->SetConfigValue(
-                !c_use_50hz_mode->GetTypedConfigValue());
-            config::SaveConfig();
-          }
-
-          if (ImGui::IsItemFocused()) {
-            tooltip = c_use_50hz_mode->description();
-          }
-
+          // Resolution, widescreen and 50Hz moved from cvars to XConfig in Canary.
           auto c_interlaced = dynamic_cast<cvar::ConfigVar<bool>*>(
               cvar::ConfigVars->find("interlaced")->second);
           if (ImGui::Checkbox("Interlaced Video Mode",

@@ -35,8 +35,8 @@ namespace xam {
 #if XE_PLATFORM_WINRT
 namespace {
 
-// UWP can fail to map files outside of the app container (e.g. on external
-// drives), so packages are read into memory instead.
+// Memory-mapping files can fail on UWP, so packages are read into memory
+// instead.
 class BufferedMappedMemory : public MappedMemory {
  public:
   explicit BufferedMappedMemory(std::vector<uint8_t> buffer)

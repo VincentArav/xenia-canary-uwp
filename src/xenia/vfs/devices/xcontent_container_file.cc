@@ -52,6 +52,10 @@ X_STATUS XContentContainerFile::ReadSync(std::span<uint8_t> buffer,
 
     *out_bytes_read += num_read;
     p += num_read;
+    if (num_read != read_length) {
+      // Don't place the following records' data at the wrong offsets.
+      break;
+    }
     src_offset += record.length;
     remaining_length -= read_length;
     if (remaining_length == 0) {

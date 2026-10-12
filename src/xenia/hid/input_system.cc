@@ -8,6 +8,7 @@
  */
 
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
 
 #include "xenia/hid/input_system.h"
 
@@ -41,9 +42,10 @@ DEFINE_double(
     "HID");
 
 InputSystem::InputSystem(xe::ui::Window* window) : window_(window) {
-#ifdef XE_PLATFORM_WIN32
+  // libusb device enumeration isn't available inside the UWP app container.
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
   portal_ = std::make_unique<HardwarePortal>();
-#endif  // XE_PLATFORM_WIN32
+#endif  // XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
 }
 
 InputSystem::~InputSystem() = default;

@@ -58,7 +58,19 @@ SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles(
     auto& fragment = fragment_files.at(i);
     auto path = fragment.path / fragment.name;
 
-    auto file = MappedMemory::Open(path, MappedMemory::Mode::kRead);
+    std::unique_ptr<MappedMemory> file =
+        MappedMemory::Open(path, MappedMemory::Mode::kRead);
+#if XE_PLATFORM_WINRT
+    if (!file) {
+      auto handle = filesystem::FileHandle::OpenExisting(
+          path, filesystem::FileAccess::kGenericRead);
+      if (handle) {
+        XELOGW("Falling back to file reads for SVOD file {} on UWP.", path);
+        file = std::make_unique<SvodFileFragment>(std::move(handle),
+                                                  fragment.total_size);
+      }
+    }
+#endif  // XE_PLATFORM_WINRT
 
     if (!file) {
       XELOGI("Failed to map SVOD file {}.", path);
@@ -97,12 +109,17 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   };
   static_assert_size(root_data, 0x10);
 
-  const auto root_d =
-      reinterpret_cast<root_data*>(svod_header->data() + magic_offset + 0x14);
+  root_data root_d;
+  if (!ReadSvodFragment(*svod_header, magic_offset + 0x14, &root_d,
+                        sizeof(root_d))) {
+    XELOGE("ReadSVOD failed to read root block data at 0x{:016X}",
+           magic_offset + 0x14);
+    return Result::kReadError;
+  }
   // Parse the root directory
 
   const uint64_t root_creation_timestamp =
-      decode_fat_timestamp(root_d->creation_date, root_d->creation_time);
+      decode_fat_timestamp(root_d.creation_date, root_d.creation_time);
 
   auto root_entry = new SvodContainerEntry(this, nullptr, "", &files_);
   root_entry->attributes_ = kFileAttributeDirectory;
@@ -112,7 +129,7 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
   // Traverse all child entries
-  return ReadEntry(root_d->block, 0, root_entry);
+  return ReadEntry(root_d.block, 0, root_entry);
 }
 
 SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
@@ -151,12 +168,19 @@ SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
     return Result::kReadError;
   }
 
-  std::memcpy(&dir_entry, file->data() + entry_address, sizeof(dir_entry));
+  if (!ReadSvodFragment(*file, entry_address, &dir_entry, sizeof(dir_entry))) {
+    XELOGE("ReadEntrySVOD failed to read directory entry at {:016X}",
+           entry_address);
+    return Result::kReadError;
+  }
 
   auto name_buffer = std::make_unique<char[]>(dir_entry.name_length);
-  std::memcpy(name_buffer.get(),
-              file->data() + entry_address + sizeof(dir_entry),
-              dir_entry.name_length);
+  if (!ReadSvodFragment(*file, entry_address + sizeof(dir_entry),
+                        name_buffer.get(), dir_entry.name_length)) {
+    XELOGE("ReadEntrySVOD failed to read directory entry name at {:016X}",
+           entry_address);
+    return Result::kReadError;
+  }
 
   // Filename is stored as Windows-1252, convert it to UTF-8.
   auto ansi_name = std::string(name_buffer.get(), dir_entry.name_length);
@@ -272,7 +296,10 @@ XContentContainerDevice::Result SvodContainerDevice::SetLayout(
 XContentContainerDevice::Result SvodContainerDevice::SetEDGFLayout(
     size_t& magic_offset) {
   uint8_t magic_buf[20];
-  std::memcpy(&magic_buf, files_.at(0)->data() + 0x2000, countof(magic_buf));
+  if (!ReadSvodFragment(*files_.at(0), 0x2000, magic_buf, countof(magic_buf))) {
+    XELOGE("ReadSVOD failed to read SVOD magic at 0x2000");
+    return Result::kReadError;
+  }
 
   if (std::memcmp(magic_buf, MEDIA_MAGIC.data(), countof(magic_buf)) != 0) {
     XELOGE("SVOD uses an EGDF layout, but the magic block was not found.");
@@ -288,7 +315,10 @@ XContentContainerDevice::Result SvodContainerDevice::SetEDGFLayout(
 
 bool SvodContainerDevice::IsXSFLayout() const {
   uint8_t magic_buf[20];
-  std::memcpy(&magic_buf, files_.at(0)->data() + 0x12000, countof(magic_buf));
+  if (!ReadSvodFragment(*files_.at(0), 0x12000, magic_buf,
+                        countof(magic_buf))) {
+    return false;
+  }
   return std::memcmp(magic_buf, MEDIA_MAGIC.data(), countof(magic_buf)) == 0;
 }
 
@@ -297,7 +327,10 @@ XContentContainerDevice::Result SvodContainerDevice::SetXSFLayout(
   uint8_t magic_buf[20];
   const char* XSF_MAGIC = "XSF";
 
-  std::memcpy(&magic_buf, files_.at(0)->data() + 0x2000, countof(magic_buf));
+  if (!ReadSvodFragment(*files_.at(0), 0x2000, magic_buf, countof(magic_buf))) {
+    XELOGE("ReadSVOD failed to read SVOD magic at 0x2000");
+    return Result::kReadError;
+  }
 
   svod_base_offset_ = 0x10000;
   magic_offset = 0x12000;
@@ -320,7 +353,11 @@ XContentContainerDevice::Result SvodContainerDevice::SetNormalLayout(
   uint8_t magic_buf[20];
 
   const uint32_t magic_pos = data_file_count_ == 1 ? 0xD000 : 0x2000;
-  std::memcpy(&magic_buf, files_.at(0)->data() + magic_pos, countof(magic_buf));
+  if (!ReadSvodFragment(*files_.at(0), magic_pos, magic_buf,
+                        countof(magic_buf))) {
+    XELOGE("ReadSVOD failed to read SVOD magic at 0x{:X}", magic_pos);
+    return Result::kReadError;
+  }
 
   if (std::memcmp(magic_buf, MEDIA_MAGIC.data(), MEDIA_MAGIC.size()) != 0) {
     XELOGE("Could not locate SVOD magic block.");
