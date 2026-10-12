@@ -1,0 +1,149 @@
+name: UWP (Xbox x64)
+
+on:
+  push:
+    branches: [blades-uwp-canary]
+    paths-ignore: ['*.md', 'docs/**', 'LICENSE']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  uwp:
+    # Same image as Canary's Windows build: VS 2026 (v145) and Windows SDK
+    # 10.0.26100. The CMake libraries are built with /GL, so they and the UWP
+    # app must use the same compiler: build both in this job.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 150
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+      UWP_TOOLSET: v145
+      UWP_SDK: 10.0.26100.0
+      # Install next to an existing Xenia UWP instead of replacing it.
+      SIDE_BY_SIDE: 'true'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Toolchain info
+        run: |
+          Get-PSDrive -PSProvider FileSystem
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationVersion
+          cmake --version
+          ninja --version
+          python --version
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Name
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $fxc) { throw 'fxc.exe not found' }
+          $fxc.FullName
+
+      - name: Download submodules
+        run: |
+          $SUBMODULES = (Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
+          git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
+
+      - name: Build core static libraries (CMake)
+        env:
+          # Canary's CMake adds /WX to every xenia target; the WinRT-only code
+          # was never built with it. cl.exe appends _CL_ last, so /WX- wins.
+          _CL_: /WX-
+        run: |
+          # Only the libraries the UWP app links. Never build xenia-app: with
+          # XE_PLATFORM_WINRT hardcoded it needs symbols from the UWP project.
+          $targets = @(
+            'xenia-apu', 'xenia-apu-nop', 'xenia-apu-xaudio2', 'xenia-base',
+            'xenia-core', 'xenia-cpu', 'xenia-cpu-backend-x64', 'xenia-debug-ui',
+            'xenia-gpu', 'xenia-gpu-d3d12', 'xenia-hid', 'xenia-hid-nop',
+            'xenia-hid-portal', 'xenia-hid-xinput', 'xenia-kernel',
+            'xenia-patcher', 'xenia-ui', 'xenia-ui-d3d12', 'xenia-vfs',
+            'aes_128', 'capstone', 'dxbc', 'fmt', 'glslang-spirv', 'imgui',
+            'libavcodec', 'libavformat', 'libavutil', 'libusb', 'mspack',
+            'pugixml', 'snappy', 'xxhash', 'zarchive', 'zlib-ng', 'zstd')
+          python xenia-build.py build --config=Release `
+            --cmake-define CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
+            @($targets | ForEach-Object { "--target=$_" })
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not (Test-Path build\version.h)) { throw 'build\version.h was not generated' }
+          Get-ChildItem build\obj\Windows\Release\*.lib | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Restore C++/WinRT NuGet package
+        run: nuget restore xenia-canary-uwp\packages.config -PackagesDirectory build\packages -NonInteractive
+
+      - name: Side-by-side package identity
+        if: env.SIDE_BY_SIDE == 'true'
+        run: |
+          $path = 'xenia-canary-uwp\Package.appxmanifest'
+          $text = [IO.File]::ReadAllText($path)
+          $text = $text -replace 'Name="27d6ba69-e4f1-4b69-b391-8238bab5a431"', 'Name="XeniaCanaryUWP.Merge"'
+          $text = $text -replace 'PhoneProductId="27d6ba69-e4f1-4b69-b391-8238bab5a431"', 'PhoneProductId="6f1c3a52-8f0e-4c55-9b9e-2a4d7c1e5b10"'
+          $text = $text -replace 'Version="1\.1\.7\.1"', "Version=`"1.2.${{ github.run_number }}.0`""
+          $text = $text -replace '<DisplayName>xenia-canary-uwp</DisplayName>', '<DisplayName>xenia-canary-uwp-merge</DisplayName>'
+          $text = $text -replace 'uap:VisualElements DisplayName="Xenia Canary"', 'uap:VisualElements DisplayName="Xenia Canary (Merge)"'
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($true))
+          Select-String -Path $path -Pattern 'Name=|Version=|DisplayName' | ForEach-Object { $_.Line.Trim() }
+
+      - name: Signing certificate
+        env:
+          PFX_BASE64: ${{ secrets.UWP_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.UWP_PFX_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'xenia-uwp.pfx'
+          if ($env:PFX_BASE64) {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+            $pw = $env:PFX_PASSWORD
+          } else {
+            # The subject must match the manifest publisher.
+            $publisher = ([xml](Get-Content xenia-canary-uwp\Package.appxmanifest)).Package.Identity.Publisher
+            $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher -KeyUsage DigitalSignature `
+              -CertStoreLocation Cert:\CurrentUser\My -FriendlyName 'Xenia UWP CI' `
+              -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+            $pw = [guid]::NewGuid().ToString()
+            Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pw -AsPlainText -Force) | Out-Null
+          }
+          Write-Output "::add-mask::$pw"
+          "UWP_PFX=$pfx" >> $env:GITHUB_ENV
+          "UWP_PFX_PASSWORD=$pw" >> $env:GITHUB_ENV
+
+      - uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
+      - name: Build and package UWP app
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $msbuild_args = @(
+            'xenia-canary-uwp\xenia-canary-uwp.vcxproj', '/m', '/nologo', '/v:minimal',
+            '/p:Configuration=Release', '/p:Platform=x64',
+            "/p:PlatformToolset=$env:UWP_TOOLSET",
+            "/p:WindowsTargetPlatformVersion=$env:UWP_SDK",
+            "/p:SolutionDir=$ws\build\",
+            '/p:UapAppxPackageBuildMode=SideloadOnly',
+            "/p:AppxPackageDir=$ws\out\AppxPackages\",
+            '/p:AppxPackageSigningEnabled=true',
+            "/p:PackageCertificateKeyFile=$env:UWP_PFX",
+            "/p:PackageCertificatePassword=$env:UWP_PFX_PASSWORD",
+            '/p:PackageCertificateThumbprint=',
+            '/p:GenerateAppInstallerFile=false')
+          msbuild @msbuild_args
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Locate package
+        id: pkg
+        run: |
+          $dir = Get-ChildItem out\AppxPackages -Recurse -Directory -Filter '*_Test' | Select-Object -First 1
+          if (-not $dir) { throw 'No _Test package folder was produced' }
+          Get-ChildItem $dir.FullName -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          "dir=$($dir.FullName)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xenia-canary-uwp-x64-${{ github.run_number }}
+          path: ${{ steps.pkg.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 14

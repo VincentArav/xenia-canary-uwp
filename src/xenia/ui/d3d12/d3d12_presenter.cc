@@ -22,8 +22,9 @@
 #include "xenia/ui/d3d12/d3d12_util.h"
 #include "xenia/ui/surface_win.h"
 
-#include <winrt/Windows.UI.Core.h>
-#include <winrt/Windows.Foundation.h>
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/UWPUtil.h"
+#endif  // XE_PLATFORM_WINRT
 
 
 DEFINE_bool(
@@ -334,12 +335,16 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
 #endif
 #if XE_PLATFORM_WINRT
       case Surface::kTypeIndex_UWPCore: {
-        winrt::Windows::UI::Core::CoreWindow window =
-            winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
-        ::IUnknown* abi = static_cast<::IUnknown*>(winrt::get_abi(window));
-        if (FAILED(dxgi_factory->CreateSwapChainForCoreWindow(
-                direct_queue, abi, &swap_chain_desc, nullptr, &swap_chain_1))) {
-          XELOGE("D3D12Presenter: Failed to create a swap chain for the HWND");
+        Microsoft::WRL::ComPtr<::IUnknown> core_window;
+        core_window.Attach(
+            static_cast<::IUnknown*>(UWP::DetachCurrentCoreWindow()));
+        if (!core_window ||
+            FAILED(dxgi_factory->CreateSwapChainForCoreWindow(
+                direct_queue, core_window.Get(), &swap_chain_desc, nullptr,
+                &swap_chain_1))) {
+          XELOGE(
+              "D3D12Presenter: Failed to create a swap chain for the "
+              "CoreWindow");
           return SurfacePaintConnectResult::kFailure;
         }
       } break;

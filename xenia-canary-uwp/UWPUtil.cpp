@@ -160,6 +160,11 @@ std::string GetLocalState() {
       winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path());
 }
 
+void* DetachCurrentCoreWindow() {
+  auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+  return winrt::detach_abi(window);
+}
+
 int GetCoreDPI() { return m_DPI; }
 
 void SetAutomaticLaunch(std::string game_path) { m_game_path = game_path; }
@@ -438,7 +443,7 @@ static bool TryExtractExecutionInfoFromXexData(
   for (uint32_t i = 0; i < header_count; ++i) {
     const auto& opt_header = header->headers[i];
     const uint32_t key = opt_header.key;
-    if (key != xe::XEX_HEADER_EXECUTION_INFO) {
+    if (key != XEX_HEADER_EXECUTION_INFO) {
       continue;
     }
 

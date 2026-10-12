@@ -43,6 +43,9 @@ void SelectFiles(std::function<void(std::vector<std::string>)> callback);
 bool TestPathPermissions(std::string path);
 std::string GetLocalCache();
 std::string GetLocalState();
+// Returns the current thread's CoreWindow as an AddRef'd IUnknown*, or
+// nullptr. The caller releases it. Keeps C++/WinRT out of the core libraries.
+void* DetachCurrentCoreWindow();
 int GetCoreDPI();
 void SetAutomaticLaunch(std::string game_path);
 void SetDPI(int DPI);
