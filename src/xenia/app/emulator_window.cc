@@ -6104,7 +6104,58 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             tooltip = c_controller_hotkeys->description();
           }
 
-          // Language moved from the user_language cvar to XConfig in Canary.
+          // The console language moved from the user_language cvar to XConfig.
+          if (auto* kernel_state = emulator_window_.emulator()->kernel_state();
+              kernel_state && kernel_state->xconfig()) {
+            kernel::XConfig* xconfig = kernel_state->xconfig();
+            kernel::XConfigData xconfig_data = *xconfig->GetXConfig();
+            struct LanguageOption {
+              uint32_t value;
+              const char* label;
+            };
+            static constexpr LanguageOption kLanguageOptions[] = {
+                {1, "English"},     {2, "Japanese"},
+                {3, "German"},      {4, "French"},
+                {5, "Spanish"},     {6, "Italian"},
+                {7, "Korean"},      {8, "Traditional Chinese"},
+                {9, "Portuguese"},  {11, "Polish"},
+                {12, "Russian"},    {13, "Swedish"},
+                {14, "Turkish"},    {15, "Norwegian"},
+                {16, "Dutch"},      {17, "Simplified Chinese"},
+            };
+            const uint32_t language = xconfig_data.user.language.get();
+            const char* language_preview = "Unknown";
+            for (const auto& option : kLanguageOptions) {
+              if (option.value == language) {
+                language_preview = option.label;
+                break;
+              }
+            }
+            // XConfig is read when a title starts.
+            ImGui::BeginDisabled(emulator_window_.emulator()->is_title_open());
+            {
+              ScopedAccentComboStyle accent_combo_style;
+              if (ImGui::BeginCombo("Language", language_preview)) {
+                for (const auto& option : kLanguageOptions) {
+                  const bool is_selected = language == option.value;
+                  if (ImGui::Selectable(option.label, is_selected)) {
+                    xconfig_data.user.language = option.value;
+                    xconfig->WriteXConfig(&xconfig_data);
+                  }
+                  if (is_selected) {
+                    ImGui::SetItemDefaultFocus();
+                  }
+                }
+                ImGui::EndCombo();
+              }
+            }
+            ImGui::EndDisabled();
+
+            if (ImGui::IsItemFocused()) {
+              tooltip = "Console language reported to games.";
+            }
+          }
+
           ImGui::Spacing();
           if (DrawTextEffectButton("Open Profile Menu")) {
             emulator_window_.ToggleProfilesConfigDialog();
@@ -7448,7 +7499,119 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         }
 
         if (settings_selected_section == 9) {
-          // Resolution, widescreen and 50Hz moved from cvars to XConfig in Canary.
+          // Resolution, widescreen and 50Hz moved from cvars to XConfig.
+          if (auto* kernel_state = emulator_window_.emulator()->kernel_state();
+              kernel_state && kernel_state->xconfig()) {
+            kernel::XConfig* xconfig = kernel_state->xconfig();
+            kernel::XConfigData xconfig_data = *xconfig->GetXConfig();
+            bool xconfig_changed = false;
+            const uint32_t widescreen_flag =
+                static_cast<uint32_t>(kernel::X_VIDEO_FLAGS::Widescreen);
+
+            // XConfig is read when a title starts.
+            ImGui::BeginDisabled(emulator_window_.emulator()->is_title_open());
+
+            const kernel::Resolution current_resolution(
+                static_cast<uint32_t>(xconfig_data.user.av_pack_hdmi_sz.get()));
+            {
+              ScopedAccentComboStyle accent_combo_style;
+              if (ImGui::BeginCombo("Resolution",
+                                    current_resolution.name_.c_str())) {
+                for (const auto& option : kernel::XVGAResolution) {
+                  const bool is_selected =
+                      option.to_host() == current_resolution.to_host();
+                  if (ImGui::Selectable(option.name_.c_str(), is_selected)) {
+                    xconfig_data.user.av_pack_hdmi_sz =
+                        static_cast<int32_t>(option.to_host());
+                    if (option.is_widescreen()) {
+                      xconfig_data.user.video_flags =
+                          xconfig_data.user.video_flags.get() | widescreen_flag;
+                    } else {
+                      xconfig_data.user.video_flags =
+                          xconfig_data.user.video_flags.get() & ~widescreen_flag;
+                    }
+                    xconfig_changed = true;
+                  }
+                  if (is_selected) {
+                    ImGui::SetItemDefaultFocus();
+                  }
+                }
+                ImGui::EndCombo();
+              }
+            }
+
+            if (ImGui::IsItemFocused()) {
+              tooltip = "Display resolution reported to games.";
+            }
+
+            // Widescreen resolutions always report widescreen.
+            bool widescreen =
+                (xconfig_data.user.video_flags.get() & widescreen_flag) != 0;
+            ImGui::BeginDisabled(
+                kernel::Resolution(static_cast<uint32_t>(
+                                       xconfig_data.user.av_pack_hdmi_sz.get()))
+                    .is_widescreen());
+            if (ImGui::Checkbox("Widescreen", &widescreen)) {
+              xconfig_data.user.video_flags =
+                  widescreen
+                      ? xconfig_data.user.video_flags.get() | widescreen_flag
+                      : xconfig_data.user.video_flags.get() & ~widescreen_flag;
+              xconfig_changed = true;
+            }
+            ImGui::EndDisabled();
+
+            if (ImGui::IsItemFocused()) {
+              tooltip = "Report a 16:9 display to games at 4:3 resolutions.";
+            }
+
+            struct AvRegionOption {
+              uint32_t value;
+              const char* label;
+            };
+            static constexpr AvRegionOption kAvRegionOptions[] = {
+                {kernel::X_AV_REGION::NTSCM, "NTSC"},
+                {kernel::X_AV_REGION::NTSCJ, "NTSC-J"},
+                {kernel::X_AV_REGION::PAL, "PAL"},
+                {kernel::X_AV_REGION::PAL_50, "PAL 50Hz"},
+            };
+            const uint32_t av_region = xconfig_data.secured.av_region.get();
+            const char* av_region_preview = "Unknown";
+            for (const auto& option : kAvRegionOptions) {
+              if (option.value == av_region) {
+                av_region_preview = option.label;
+                break;
+              }
+            }
+            {
+              ScopedAccentComboStyle accent_combo_style;
+              if (ImGui::BeginCombo("AV Region", av_region_preview)) {
+                for (const auto& option : kAvRegionOptions) {
+                  const bool is_selected = av_region == option.value;
+                  if (ImGui::Selectable(option.label, is_selected)) {
+                    xconfig_data.secured.av_region = option.value;
+                    xconfig_changed = true;
+                  }
+                  if (is_selected) {
+                    ImGui::SetItemDefaultFocus();
+                  }
+                }
+                ImGui::EndCombo();
+              }
+            }
+
+            if (ImGui::IsItemFocused()) {
+              tooltip =
+                  "Video standard reported to games. PAL 50Hz replaces the old "
+                  "50Hz video mode option.";
+            }
+
+            ImGui::EndDisabled();
+
+            if (xconfig_changed) {
+              xconfig->WriteXConfig(&xconfig_data);
+            }
+          }
+
           auto c_interlaced = dynamic_cast<cvar::ConfigVar<bool>*>(
               cvar::ConfigVars->find("interlaced")->second);
           if (ImGui::Checkbox("Interlaced Video Mode",
